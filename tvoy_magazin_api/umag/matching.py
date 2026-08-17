@@ -4,11 +4,15 @@
 цена. Штрихкода нет или его нет в кабинете — ищем кандидатов по названию и
 просим модель выбрать, какой товар тот же самый.
 
-Уверенный выбор модель вписывает в строку сама — штрихкод берётся из карточки
-UMAG, и дальше строка сопоставляется уже по нему, как будто он был в бумаге.
-Там, где модель сомневается, она только предлагает: подставить или нет, решает
-человек. Порог не формальность — неверный товар молча уедет в приёмку и
-испортит остатки.
+Модель тут работает дважды: сначала говорит, каким куском названия искать —
+в строке накладной товар перемешан с фасовкой, и что из этого главное, видно
+только по смыслу, — а потом выбирает товар из найденного.
+
+Выбор модель вписывает в строку сама — штрихкод берётся из карточки UMAG, и
+дальше строка сопоставляется уже по нему, как будто он был в бумаге. Порог
+один и невысокий: где модель уверена хотя бы наполовину, пусть подставляет.
+Проверять всё равно человеку, а пустая строка помогает ему меньше, чем
+заполненная с пометкой, что цифру дала модель.
 
 Сам выбор хранится в строке накладной, поэтому повторная проверка не гоняет
 модель второй раз. Правка названия или штрихкода его сбрасывает.
@@ -16,10 +20,12 @@ UMAG, и дальше строка сопоставляется уже по не
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 
-from invoices.openrouter import OpenRouterError, match_products
+from invoices.openrouter import OpenRouterError, match_products, search_terms
 
+from . import catalog
 from .client import UmagError
 
 logger = logging.getLogger(__name__)
@@ -30,14 +36,17 @@ CANDIDATES = 12
 # Столько поисков по названию на строку максимум: каждый — ходка в UMAG.
 QUERIES = 3
 
+# Во столько потоков доспрашиваем кабинет о строках, которых нет в копии.
+LOOKUP_THREADS = 6
+
 # Слова короче ищут пол-магазина: «1 л», «шт», «*12».
 WORD = 4
 
-# Ниже этого модель сама себе не верит — такую догадку не показываем вовсе.
-CONFIDENCE = 0.7
-
-# А отсюда и выше штрихкод вписывается в строку сам, без кнопки.
-AUTO = 0.85
+# Порог один: уверена наполовину и выше — штрихкод идёт прямо в строку, ниже
+# — выбор не принимаем совсем. Раньше между ними была полоса «только подсказка»,
+# но подсказка, которую надо подтверждать руками, экономит меньше, чем стоит
+# лишний шаг: строку человек всё равно сверяет с бумагой перед отправкой.
+CONFIDENCE = 0.5
 
 # Товары, а не услуги и не тара: тем же типом ищет приёмка в кабинете.
 PRODUCT_TYPE = 0
@@ -68,23 +77,47 @@ def suggest(invoice, matches: list[dict], client) -> set[int]:
     lines = {line.pk: line for line in invoice.lines.all()}
     filled: set[int] = set()
     ask = []
+    todo = []
 
     for match in pending:
         line = lines.get(match['id'])
         if line is None:
             continue
 
-        # Товар уже выбирали — второй раз не платим.
-        if line.umag_product_id and line.umag_barcode:
+        # Товар уже выбирали — второй раз не платим. Номера товара при выборе
+        # из нашей копии номенклатуры нет, поэтому смотрим на штрихкод: он и
+        # есть результат выбора.
+        if line.umag_barcode:
             if _accept(line, line.umag_barcode, line.umag_confidence):
                 filled.add(line.pk)
             else:
                 _apply(match, line.umag_product_name, line.umag_barcode, line.umag_confidence)
             continue
 
-        found = candidates(line.name, client)
+        todo.append((line, match))
+
+    # Своя копия номенклатуры ищет лучше кабинета и без сети. Её нет — идём в
+    # UMAG по подстроке, и тогда слово для поиска выбирает модель.
+    search = catalog.finder(client.store_id)
+    terms = {} if search else _terms(invoice, [line for line, _ in todo])
+
+    misses = []
+
+    for line, match in todo:
+        found = (
+            search.find(line.name)
+            if search
+            else candidates(line.name, client, terms.get(line.pk, ''))
+        )
+
         if found:
             ask.append({'line': line, 'match': match, 'candidates': found})
+        elif search:
+            misses.append((line, match))
+
+    # В копии не нашлось — спрашиваем кабинет живьём: в отчёт, из которого она
+    # собрана, не попадает товар, не двигавшийся три месяца.
+    ask.extend(_lookup(client, misses))
 
     if ask:
         filled |= _guess(invoice, ask)
@@ -92,12 +125,16 @@ def suggest(invoice, matches: list[dict], client) -> set[int]:
     return filled
 
 
-def candidates(name: str, client) -> list[dict]:
-    """Товары кабинета, похожие названием на строку накладной."""
+def candidates(name: str, client, term: str = '') -> list[dict]:
+    """Товары кабинета, похожие названием на строку накладной.
+
+    `term` — чем искать по мнению модели. Не нашлось по нему — идём своими
+    правилами: без кандидатов строка осталась бы несопоставленной вовсе.
+    """
 
     found: dict[int, dict] = {}
 
-    for query in _queries(name):
+    for query in _queries(name, term):
         try:
             body = client.get(
                 'nom/product/by-part',
@@ -119,6 +156,9 @@ def candidates(name: str, client) -> list[dict]:
             if product_id and barcode and product_id not in found:
                 found[product_id] = {
                     'id': product_id,
+                    # Тут номер карточки известен сразу, а при поиске по нашей
+                    # копии номенклатуры его нет — поле общее, значение разное.
+                    'product_id': product_id,
                     'name': (product.get('name') or '').strip(),
                     'barcode': barcode,
                 }
@@ -130,8 +170,12 @@ def candidates(name: str, client) -> list[dict]:
     return list(found.values())[:CANDIDATES]
 
 
-def _queries(name: str) -> list[str]:
+def _queries(name: str, term: str = '') -> list[str]:
     """Запросы к поиску — от точного к общему.
+
+    Первым идёт то, что выбрала модель: она видит, где в строке товар, а где
+    фасовка. Дальше — наши правила, на случай когда модель промолчала или её
+    слово ничего не нашло.
 
     Карточка в кабинете называется короче строки в накладной («Пряник
     шоколадный сайрам нан» против «Пряник шоколадный 450гр Сайрам нан 1*14»),
@@ -149,12 +193,63 @@ def _queries(name: str) -> list[str]:
 
     words = [word for word in re.split(r'[\s,;/*]+', cleaned) if len(word) >= WORD]
 
-    if not words:
+    queries = [term.strip()] if term and term.strip() else []
+
+    if words:
+        queries += [' '.join(words[:2]), words[0], max(words, key=len)]
+
+    return list(dict.fromkeys(query for query in queries if query))[:QUERIES]
+
+
+def _lookup(client, misses: list) -> list[dict]:
+    """Спрашивает кабинет о строках, которых не нашлось в копии.
+
+    Копия обновляется раз в сутки, а товар в кабинете могли завести сегодня.
+    Строк таких немного, но каждая — несколько запросов, поэтому идём в
+    несколько потоков: они ждут сеть, а не процессор.
+    """
+
+    if not misses:
         return []
 
-    queries = [' '.join(words[:2]), words[0], max(words, key=len)]
+    with ThreadPoolExecutor(max_workers=LOOKUP_THREADS) as pool:
+        found = pool.map(lambda item: catalog.lookup(client, client.store_id, item[0].name), misses)
 
-    return list(dict.fromkeys(queries))[:QUERIES]
+    return [
+        {'line': line, 'match': match, 'candidates': candidates}
+        for (line, match), candidates in zip(misses, found)
+        if candidates
+    ]
+
+
+def _terms(invoice, lines: list) -> dict[int, str]:
+    """Спрашивает модель, чем искать каждую строку в номенклатуре.
+
+    Одна ходка на всю накладную, до похода в кабинет. Не ответила — вернём
+    пусто, и поиск пойдёт по своим правилам: молчание модели не повод
+    оставлять строки несопоставленными.
+    """
+
+    if not lines:
+        return {}
+
+    try:
+        answer = search_terms([{'id': line.pk, 'name': line.name} for line in lines])
+    except OpenRouterError as error:
+        logger.warning('Модель не выбрала слова для поиска (%s): %s', invoice.pk, error)
+        return {}
+
+    _charge(invoice, answer.cost)
+
+    chosen: dict[int, str] = {}
+
+    for row in answer.data.get('queries') or []:
+        line_id = _int(row.get('line_id')) if isinstance(row, dict) else None
+
+        if line_id is not None:
+            chosen[line_id] = str(row.get('query') or '').strip()[:100]
+
+    return chosen
 
 
 def _guess(invoice, ask: list[dict]) -> set[int]:
@@ -191,9 +286,9 @@ def _guess(invoice, ask: list[dict]) -> set[int]:
         if not row:
             continue
 
-        product_id = _int(row.get('product_id'))
+        chosen_id = _int(row.get('product_id'))
         product = next(
-            (candidate for candidate in item['candidates'] if candidate['id'] == product_id),
+            (candidate for candidate in item['candidates'] if candidate['id'] == chosen_id),
             None,
         )
         confidence = _confidence(row.get('confidence'))
@@ -202,7 +297,15 @@ def _guess(invoice, ask: list[dict]) -> set[int]:
         if product is None or confidence < CONFIDENCE:
             continue
 
-        _remember(item['line'], product_id, product['name'], product['barcode'], confidence)
+        # Номер карточки знаем не всегда: при выборе из нашей копии его нет.
+        # Он появится сам, когда строка сопоставится по подставленному штрихкоду.
+        _remember(
+            item['line'],
+            product.get('product_id'),
+            product['name'],
+            product['barcode'],
+            confidence,
+        )
 
         if _accept(item['line'], product['barcode'], confidence):
             filled.add(item['line'].pk)
@@ -238,7 +341,7 @@ def _accept(line, barcode: str, confidence) -> bool:
     с бумаги: с ценой, остатком и карточкой товара.
     """
 
-    if (confidence or 0) < AUTO or not barcode:
+    if (confidence or 0) < CONFIDENCE or not barcode:
         return False
 
     if line.barcode != barcode:

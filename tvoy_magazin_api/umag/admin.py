@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import SupplierLink, UmagAccount
+from .models import SupplierLink, UmagAccount, UmagProduct
 
 
 @admin.register(UmagAccount)
@@ -9,6 +9,13 @@ class UmagAccountAdmin(admin.ModelAdmin):
     search_fields = ('user__email', 'phone', 'store_name')
     # Токен видеть незачем: он равен доступу в чужой кабинет.
     exclude = ('token',)
+
+
+@admin.register(UmagProduct)
+class UmagProductAdmin(admin.ModelAdmin):
+    list_display = ('name', 'barcode', 'measure', 'store_id', 'updated_at')
+    search_fields = ('name', 'barcode')
+    list_filter = ('store_id',)
 
 
 @admin.register(SupplierLink)

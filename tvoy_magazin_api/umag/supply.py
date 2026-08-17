@@ -10,7 +10,7 @@ from datetime import datetime, time
 
 from django.utils import timezone
 
-from . import matching
+from . import catalog, matching
 from .client import UmagClient, UmagError
 from .models import SupplierLink, UmagAccount
 
@@ -93,6 +93,9 @@ def match_lines(invoice) -> None:
     Ходит в кабинет от имени того, кто загрузил накладную: штрихкоды с бумаги
     превращаются в карточки товаров, а строкам без штрихкода его подбирает
     модель. К моменту, когда человек откроет накладную, позиции уже сведены.
+
+    Заодно поддерживает свежесть копии номенклатуры: первая накладная за сутки
+    ищет по вчерашней и запускает обновление, следующие идут уже по новой.
     """
 
     account = UmagAccount.objects.filter(user=invoice.created_by).first()
@@ -104,6 +107,10 @@ def match_lines(invoice) -> None:
     client = UmagClient(account, invoice.umag_store_id)
     matches = [_match_line(line, client) for line in invoice.lines.all()]
     matching.suggest(invoice, matches, client)
+
+    # Копия номенклатуры, по которой всё это искалось, стареет — обновляем её
+    # после сопоставления, в фоне. Расписания снаружи для этого не нужно.
+    catalog.refresh_later(account)
 
 
 def normalize(name: str) -> str:

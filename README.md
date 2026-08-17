@@ -37,7 +37,8 @@ uv run python tvoy_magazin_api/manage.py parse_invoice ~/Downloads/nakladnaya.jp
 окружения важнее файла.
 
 | `OPENROUTER_API_KEY` | — | Ключ OpenRouter, без него разбор падает с ошибкой |
-| `OPENROUTER_VISION_MODEL` | `qwen/qwen3-vl-32b-instruct` | Модель распознавания |
+| `OPENROUTER_VISION_MODEL` | `openai/gpt-5.6-luna` | Модель распознавания накладной с фото |
+| `OPENROUTER_MATCH_MODEL` | `deepseek/deepseek-v4-flash` | Модель сопоставления позиций и поставщиков |
 | `OPENROUTER_FALLBACK_MODELS` | — | Запасные модели через запятую, если основная занята |
 | `OPENROUTER_TIMEOUT` | `120` | Таймаут запроса к модели, секунды |
 | `INVOICE_PARSE_CONCURRENCY` | `1` | Сколько накладных разбирается одновременно |

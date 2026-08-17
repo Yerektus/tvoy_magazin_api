@@ -18,7 +18,7 @@ from django.utils import timezone
 
 from umag import supply
 
-from . import preview, suppliers
+from . import barcodes, preview, suppliers
 from .models import Invoice, InvoiceLine
 from .openrouter import OpenRouterError, Parsed, parse_invoice
 
@@ -72,8 +72,8 @@ def run(invoice_id: int) -> None:
         _make_preview(invoice)
 
         try:
-            with invoice.image.open('rb') as image:
-                parsed = parse_invoice(image.read(), content_type_for(invoice.image.name))
+            image, content_type = _for_model(invoice)
+            parsed = parse_invoice(image, content_type)
 
             _save(invoice, parsed)
             # БИН на фото читается не всегда: если поставщик знакомый, берём
@@ -88,6 +88,21 @@ def run(invoice_id: int) -> None:
         except Exception as error:  # noqa: BLE001 — иначе поток умрёт молча
             logger.exception('Не удалось разобрать накладную %s', invoice_id)
             _fail(invoice, f'Внутренняя ошибка: {error}')
+
+
+def _for_model(invoice: Invoice) -> tuple[bytes, str]:
+    """Чем кормить модель: снимок с айфона сначала переводим в JPEG.
+
+    HEIC понимают не все — модели OpenAI отвечают на него «это не картинка».
+    Превью для браузера уже сделано выше, оно же идёт и в модель.
+    """
+
+    if invoice.preview:
+        with invoice.preview.open('rb') as jpeg:
+            return jpeg.read(), 'image/jpeg'
+
+    with invoice.image.open('rb') as image:
+        return image.read(), content_type_for(invoice.image.name)
 
 
 def _make_preview(invoice: Invoice) -> None:
@@ -116,7 +131,7 @@ def content_type_for(name: str) -> str:
     if lowered.endswith('.webp'):
         return 'image/webp'
     if lowered.endswith(('.heic', '.heif')):
-        # Разжимать не нужно: провайдер принимает HEIC как есть.
+        # Запасной путь: конвертировать оказалось нечем, отправляем как есть.
         return 'image/heic'
     if lowered.endswith('.pdf'):
         return 'application/pdf'
@@ -193,12 +208,26 @@ def _line(invoice: Invoice, position: int, line: dict) -> InvoiceLine:
         invoice=invoice,
         position=position,
         name=_text(line.get('name'), 255) or 'Без названия',
-        barcode=_text(line.get('barcode'), 64),
+        barcode=_barcode(line.get('barcode')),
         quantity=quantity,
         unit=_text(line.get('unit'), 32),
         price=price,
         total=total,
     )
+
+
+def _barcode(value) -> str:
+    """Штрихкод, если контрольная цифра сходится. Иначе — пусто.
+
+    Модель нет-нет да и примет за штрихкод номенклатурный номер из соседней
+    колонки. Такую строку честнее оставить без кода: её сопоставят по названию,
+    а неверный код молча привёл бы в приёмку чужой товар. Прочитанное с фото
+    никуда не пропадает — оно остаётся в `raw_response`.
+    """
+
+    code = _text(value, 64)
+
+    return code if barcodes.valid(code) else ''
 
 
 def _total(lines: list[InvoiceLine]):

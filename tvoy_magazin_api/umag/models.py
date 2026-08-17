@@ -39,6 +39,40 @@ class UmagAccount(models.Model):
         return bool(self.token and self.store_id)
 
 
+class UmagProduct(models.Model):
+    """Своя копия номенклатуры магазина — по ней ищем товар для строки накладной.
+
+    В API UMAG нет метода «отдай всё»: есть только поиск по подстроке, а он
+    молчит, когда в накладной написано чуть иначе, чем на карточке («Ассорти
+    ЧИЗ» против «Сыр Ассорти»). Поэтому раз в сутки выгружаем товарный отчёт —
+    он отдаёт название, штрихкод и единицу по всему магазину, — и ищем у себя,
+    нечётко и без сети.
+
+    Номера товара в отчёте нет, но он и не нужен: как только штрихкод попал в
+    строку, карточка находится по нему, вместе с id, ценой и остатком.
+    """
+
+    store_id = models.PositiveIntegerField('магазин')
+    barcode = models.CharField('штрихкод', max_length=64)
+    name = models.CharField('товар', max_length=255)
+    measure = models.CharField('единица', max_length=32, blank=True)
+    # Название, приведённое к виду для сравнения: считать его на каждый поиск
+    # по шести тысячам строк — впустую.
+    search_name = models.CharField('название для поиска', max_length=255, blank=True)
+    updated_at = models.DateTimeField('обновлено', auto_now=True)
+
+    class Meta:
+        verbose_name = 'товар в UMAG'
+        verbose_name_plural = 'номенклатура UMAG'
+        constraints = [
+            models.UniqueConstraint(fields=('store_id', 'barcode'), name='unique_store_product'),
+        ]
+        indexes = [models.Index(fields=('store_id',))]
+
+    def __str__(self):
+        return f'{self.name} ({self.barcode})'
+
+
 class SupplierLink(models.Model):
     """Какой контрагент UMAG стоит за поставщиком из накладной.
 

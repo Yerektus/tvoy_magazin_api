@@ -189,6 +189,120 @@ class InvoiceTests(APITestCase):
 
         self.assertIsNone(Invoice.objects.get(pk=response.data['id']).umag_store_id)
 
+    def test_barcode_that_does_not_add_up_is_dropped(self):
+        """Номенклатурный номер из соседней колонки штрихкодом не считается."""
+
+        parsed = Parsed(
+            {
+                **PARSED,
+                'lines': [
+                    # 80843519 — номер поставщика: контрольная цифра не сходится.
+                    {**PARSED['lines'][0], 'barcode': '80843519'},
+                    {**PARSED['lines'][1], 'barcode': '4870145005545'},
+                ],
+            },
+            'openai/gpt-5.6-luna',
+            0.0017,
+        )
+
+        with patch('invoices.tasks.parse_invoice', return_value=parsed):
+            response = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        lines = list(Invoice.objects.get(pk=response.data['id']).lines.all())
+        # Строка не пропала — она просто пойдёт сопоставляться по названию.
+        self.assertEqual(lines[0].barcode, '')
+        self.assertEqual(lines[1].barcode, '4870145005545')
+        # Прочитанное с фото сохранилось: с ним человеку сверяться.
+        self.assertEqual(response.data['id'], Invoice.objects.get(pk=response.data['id']).pk)
+
+    def test_heic_goes_to_model_as_jpeg(self):
+        """Снимок с айфона отдаём моделью уже переведённым: HEIC читают не все."""
+
+        heic = SimpleUploadedFile('IMG_0051.HEIC', b'\x00\x00\x00\x18ftypheic', content_type='image/heic')
+
+        with (
+            patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT) as model,
+            patch('invoices.preview.to_jpeg', return_value=b'\xff\xd8\xff\xdb converted'),
+        ):
+            self.client.post('/api/invoices/', {'image': heic}, format='multipart')
+
+        image, content_type = model.call_args.args
+        self.assertEqual(content_type, 'image/jpeg')
+        self.assertEqual(image, b'\xff\xd8\xff\xdb converted')
+
+    def test_heic_goes_as_is_when_there_is_nothing_to_convert_with(self):
+        """Утилиты для конвертации нет — отправляем оригинал, а не падаем."""
+
+        heic = SimpleUploadedFile('IMG_0052.HEIC', b'\x00\x00\x00\x18ftypheic', content_type='image/heic')
+
+        with (
+            patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT) as model,
+            patch('invoices.preview.to_jpeg', return_value=None),
+        ):
+            self.client.post('/api/invoices/', {'image': heic}, format='multipart')
+
+        self.assertEqual(model.call_args.args[1], 'image/heic')
+
+    def test_list_shows_only_invoices_of_chosen_store(self):
+        """Магазин переключают в шапке — список документов меняется вместе с ним."""
+
+        UmagAccount.objects.create(
+            user=self.user,
+            phone='7474419654',
+            token='u33577.token',
+            store_id=17795,
+            store_name='Каратал Ерентал',
+        )
+
+        mine = Invoice.objects.create(
+            created_by=self.user,
+            image='invoices/moya.jpg',
+            umag_store_id=17795,
+        )
+        # Завели до подключения UMAG: спрятать её некуда, видна в любом магазине.
+        nobodys = Invoice.objects.create(created_by=self.user, image='invoices/nichya.jpg')
+        Invoice.objects.create(
+            created_by=self.user,
+            image='invoices/chuzhaya.jpg',
+            umag_store_id=17796,
+        )
+
+        response = self.client.get('/api/invoices/')
+
+        self.assertEqual(
+            {item['id'] for item in response.data['results']},
+            {mine.pk, nobodys.pk},
+        )
+        self.assertEqual(self.client.get('/api/invoices/counts/').data['all'], 2)
+
+    def test_list_keeps_every_invoice_without_umag(self):
+        """UMAG не подключён — отбирать не по чему, список остаётся общим."""
+
+        Invoice.objects.create(created_by=self.user, image='invoices/odna.jpg', umag_store_id=17795)
+        Invoice.objects.create(created_by=self.user, image='invoices/dve.jpg', umag_store_id=17796)
+
+        self.assertEqual(self.client.get('/api/invoices/').data['count'], 2)
+
+    def test_invoice_of_another_store_stays_open(self):
+        """Открытую накладную дочитывают и правят, даже если магазин переключили."""
+
+        UmagAccount.objects.create(
+            user=self.user,
+            phone='7474419654',
+            token='u33577.token',
+            store_id=17795,
+            store_name='Каратал Ерентал',
+        )
+        other = Invoice.objects.create(
+            created_by=self.user,
+            image='invoices/chuzhaya.jpg',
+            status=Invoice.Status.DONE,
+            umag_store_id=17796,
+        )
+
+        self.assertEqual(self.client.get(f'/api/invoices/{other.pk}/').status_code, 200)
+        self.assertEqual(self.client.post(f'/api/invoices/{other.pk}/check/').status_code, 200)
+
     def test_failed_parsing_is_reported(self):
         with patch('invoices.tasks.parse_invoice', side_effect=OpenRouterError('OpenRouter ответил 402')):
             response = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')

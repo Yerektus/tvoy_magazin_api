@@ -1,4 +1,4 @@
-from django.db.models import Sum
+from django.db.models import Q, Sum
 from rest_framework import generics, status
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
@@ -19,6 +19,12 @@ from .serializers import (
 
 
 class InvoiceQuerysetMixin:
+    """Накладные сотрудника — все, независимо от выбранного магазина.
+
+    По магазину отбирается только список: открытую накладную чужого магазина
+    нужно и дочитать, и поправить, даже если в шапке уже переключились.
+    """
+
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
@@ -27,6 +33,9 @@ class InvoiceQuerysetMixin:
 
 class InvoiceListCreateView(InvoiceQuerysetMixin, generics.ListCreateAPIView):
     """GET /api/invoices/?tab=… — список; POST — загрузка фото накладной.
+
+    Список — по магазину, выбранному в шапке: приёмки из него уедут в свой
+    кабинет, и держать документы разных магазинов в одной куче незачем.
 
     Вкладки списка: `pending` — ещё не проверенные, `checked` — проверенные,
     `deleted` — удалённые (они лежат в базе, просто скрыты). Без параметра —
@@ -42,12 +51,15 @@ class InvoiceListCreateView(InvoiceQuerysetMixin, generics.ListCreateAPIView):
         tab = self.request.query_params.get('tab')
 
         if tab == 'deleted':
-            return Invoice.all_objects.filter(
-                created_by=self.request.user,
-                deleted_at__isnull=False,
+            return _of_store(
+                Invoice.all_objects.filter(
+                    created_by=self.request.user,
+                    deleted_at__isnull=False,
+                ),
+                self.request.user,
             )
 
-        queryset = super().get_queryset()
+        queryset = _of_store(super().get_queryset(), self.request.user)
 
         if tab == 'pending':
             return queryset.exclude(status=Invoice.Status.CHECKED)
@@ -64,20 +76,25 @@ class InvoiceListCreateView(InvoiceQuerysetMixin, generics.ListCreateAPIView):
 
 
 class InvoiceCountsView(InvoiceQuerysetMixin, APIView):
-    """GET /api/invoices/counts/ — сколько накладных в каждой вкладке списка."""
+    """GET /api/invoices/counts/ — сколько накладных в каждой вкладке списка.
+
+    Считаем по тому же магазину, что и список: числа у вкладок должны сходиться
+    с тем, что под ними лежит.
+    """
 
     def get(self, request):
-        alive = self.get_queryset()
+        alive = _of_store(self.get_queryset(), request.user)
+        deleted = _of_store(
+            Invoice.all_objects.filter(created_by=request.user, deleted_at__isnull=False),
+            request.user,
+        )
 
         return Response(
             {
                 'all': alive.count(),
                 'pending': alive.exclude(status=Invoice.Status.CHECKED).count(),
                 'checked': alive.filter(status=Invoice.Status.CHECKED).count(),
-                'deleted': Invoice.all_objects.filter(
-                    created_by=request.user,
-                    deleted_at__isnull=False,
-                ).count(),
+                'deleted': deleted.count(),
             }
         )
 
@@ -158,12 +175,32 @@ def _store(user) -> dict:
     возьмётся тот, что будет выбран тогда.
     """
 
-    account = UmagAccount.objects.filter(user=user).first()
+    account = _account(user)
 
     if account is None or not account.store_id:
         return {}
 
     return {'umag_store_id': account.store_id, 'umag_store_name': account.store_name}
+
+
+def _of_store(queryset, user):
+    """Оставляет накладные выбранного магазина.
+
+    UMAG не подключён — фильтровать не по чему, отдаём всё. Накладные без
+    магазина видны в любом: их завели до подключения, и спрятать их значит
+    потерять — открыть их будет неоткуда.
+    """
+
+    account = _account(user)
+
+    if account is None or not account.store_id:
+        return queryset
+
+    return queryset.filter(Q(umag_store_id=account.store_id) | Q(umag_store_id__isnull=True))
+
+
+def _account(user):
+    return UmagAccount.objects.filter(user=user).first()
 
 
 def _refresh_total(invoice):

@@ -204,13 +204,18 @@ CORS_ALLOWED_ORIGINS = os.environ.get(
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
 OPENROUTER_VISION_MODEL = os.environ.get(
     'OPENROUTER_VISION_MODEL',
-    'qwen/qwen3.7-plus',
+    'openai/gpt-5.6-luna',
 )
 OPENROUTER_TIMEOUT = int(os.environ.get('OPENROUTER_TIMEOUT', '120'))
 
-# Сопоставление позиций с номенклатурой UMAG — задача текстовая, но модель
-# та же: отдельную заводить незачем, пока эта справляется.
-OPENROUTER_MATCH_MODEL = os.environ.get('OPENROUTER_MATCH_MODEL', OPENROUTER_VISION_MODEL)
+# Сопоставление позиций с номенклатурой UMAG и поставщиков между собой.
+# Задача текстовая: выбрать нужное из десятка кандидатов, которые подобрал наш
+# код. Зрение и рассуждения тут ни к чему, поэтому модель дешевле той, что
+# читает фотографии. Не задана — берём ту же, что и для распознавания.
+OPENROUTER_MATCH_MODEL = os.environ.get(
+    'OPENROUTER_MATCH_MODEL',
+    'deepseek/deepseek-v4-flash',
+)
 
 # Запасные модели на случай, когда основная занята: OpenRouter пройдёт по списку.
 OPENROUTER_FALLBACK_MODELS = [
