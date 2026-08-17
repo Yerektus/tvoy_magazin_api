@@ -5,6 +5,7 @@ from unittest.mock import patch
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
 from django.test import override_settings
 from rest_framework.test import APITestCase
 
@@ -191,6 +192,29 @@ class InvoiceTests(APITestCase):
             response = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
 
         self.assertIsNone(Invoice.objects.get(pk=response.data['id']).umag_store_id)
+
+    def test_missing_previews_are_made_up(self):
+        """Накладные, загруженные без утилиты конвертации, догоняют потом."""
+
+        heic = SimpleUploadedFile('IMG_0039.HEIC', b'\x00\x00\x00\x18ftypheic', content_type='image/heic')
+
+        # Утилиты не было: накладная разобралась, а превью не появилось.
+        with (
+            patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT),
+            patch('invoices.preview.to_jpeg', return_value=None),
+        ):
+            response = self.client.post('/api/invoices/', {'image': heic}, format='multipart')
+
+        invoice = Invoice.objects.get(pk=response.data['id'])
+        self.assertFalse(invoice.preview)
+
+        # Утилита появилась — команда проходит по таким накладным ещё раз.
+        with patch('invoices.preview.to_jpeg', return_value=b'\xff\xd8\xff\xdb converted'):
+            call_command('make_previews')
+
+        invoice.refresh_from_db()
+        self.assertTrue(invoice.preview)
+        self.assertEqual(invoice.preview.read(), b'\xff\xd8\xff\xdb converted')
 
     def test_photo_is_served_with_debug_off(self):
         """В проде отладка выключена, а фотографию просмотрщик всё равно берёт."""

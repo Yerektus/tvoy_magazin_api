@@ -32,8 +32,22 @@ def _magick(source: Path, target: Path) -> list[str]:
     return ['magick', str(source), '-resize', f'{PREVIEW_SIZE}x{PREVIEW_SIZE}>', str(target)]
 
 
-# sips есть на macOS, остальные два — то, что обычно стоит на Linux.
-CONVERTERS = (('sips', _sips), ('heif-convert', _heif_convert), ('magick', _magick))
+def _convert(source: Path, target: Path) -> list[str]:
+    """ImageMagick 6: там та же работа делается командой `convert`."""
+
+    return ['convert', str(source), '-resize', f'{PREVIEW_SIZE}x{PREVIEW_SIZE}>', str(target)]
+
+
+# Порядок — по качеству результата: первые три уменьшают картинку, а
+# `heif-convert` только переводит формат, поэтому он идёт последним. Все они
+# перебираются по очереди: наличие команды не значит, что она справится —
+# ImageMagick без плагина libheif открыть HEIC не сможет.
+CONVERTERS = (
+    ('sips', _sips),
+    ('magick', _magick),
+    ('convert', _convert),
+    ('heif-convert', _heif_convert),
+)
 
 
 def needed_for(name: str) -> bool:
@@ -41,14 +55,25 @@ def needed_for(name: str) -> bool:
 
 
 def to_jpeg(source: Path) -> bytes | None:
-    """Возвращает JPEG или None, если конвертировать нечем."""
+    """Возвращает JPEG или None, если конвертировать нечем и некем."""
 
-    command = next(((name, build) for name, build in CONVERTERS if shutil.which(name)), None)
-    if command is None:
+    available = [(name, build) for name, build in CONVERTERS if shutil.which(name)]
+
+    if not available:
         logger.info('Нет утилиты для конвертации %s — превью не будет', source.name)
         return None
 
-    name, build = command
+    for name, build in available:
+        jpeg = _run(name, build, source)
+
+        if jpeg is not None:
+            return jpeg
+
+    return None
+
+
+def _run(name: str, build, source: Path) -> bytes | None:
+    """Одна попытка конвертации. Не вышло — пусть попробует следующая утилита."""
 
     with tempfile.TemporaryDirectory() as directory:
         target = Path(directory) / 'preview.jpg'
