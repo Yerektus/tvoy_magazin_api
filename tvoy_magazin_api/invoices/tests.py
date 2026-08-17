@@ -1,3 +1,4 @@
+import io
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -6,12 +7,14 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
-from django.test import override_settings
+from django.test import SimpleTestCase, override_settings
+from PIL import Image
 from rest_framework.test import APITestCase
 
 from umag.models import UmagAccount
 from umag.tests import FakeUmag
 
+from . import preview
 from .models import Invoice
 from .openrouter import OpenRouterError, Parsed
 
@@ -79,6 +82,40 @@ class AuthTests(APITestCase):
 
     def test_me_requires_token(self):
         self.assertEqual(self.client.get('/api/auth/me/').status_code, 401)
+
+
+class PreviewTests(SimpleTestCase):
+    """Настоящая конвертация, без заглушек: на ней держится и просмотр, и разбор."""
+
+    def heic(self, directory: str, size=(3000, 2000)) -> Path:
+        path = Path(directory) / 'IMG_0033.HEIC'
+        Image.new('RGB', size, 'white').save(path, format='HEIF')
+
+        return path
+
+    def test_heic_becomes_a_jpeg_the_browser_can_show(self):
+        with tempfile.TemporaryDirectory() as directory:
+            jpeg = preview.to_jpeg(self.heic(directory))
+
+        self.assertIsNotNone(jpeg)
+
+        with Image.open(io.BytesIO(jpeg)) as image:
+            self.assertEqual(image.format, 'JPEG')
+            # Длинная сторона ужата: оригинал с телефона тяжелее вчетверо, а
+            # за размер картинки мы платим ещё и токенами при разборе.
+            self.assertEqual(max(image.size), preview.PREVIEW_SIZE)
+
+    def test_broken_file_does_not_break_the_parse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            broken = Path(directory) / 'IMG_0034.HEIC'
+            broken.write_bytes(b'\x00\x00\x00\x18ftypheic')
+
+            self.assertIsNone(preview.to_jpeg(broken))
+
+    def test_only_heic_needs_a_preview(self):
+        self.assertTrue(preview.needed_for('IMG_0033.HEIC'))
+        self.assertTrue(preview.needed_for('foto.heif'))
+        self.assertFalse(preview.needed_for('nakladnaya.jpg'))
 
 
 @override_settings(INVOICE_PARSE_INLINE=True)
