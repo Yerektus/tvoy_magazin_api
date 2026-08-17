@@ -1,5 +1,8 @@
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
@@ -188,6 +191,22 @@ class InvoiceTests(APITestCase):
             response = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
 
         self.assertIsNone(Invoice.objects.get(pk=response.data['id']).umag_store_id)
+
+    def test_photo_is_served_with_debug_off(self):
+        """В проде отладка выключена, а фотографию просмотрщик всё равно берёт."""
+
+        self.assertFalse(settings.DEBUG)
+
+        with tempfile.TemporaryDirectory() as directory:
+            photo_path = Path(directory) / 'invoices'
+            photo_path.mkdir()
+            (photo_path / 'nakladnaya.jpg').write_bytes(b'\xff\xd8\xff\xdb fake jpeg')
+
+            with override_settings(MEDIA_ROOT=directory):
+                response = self.client.get('/media/invoices/nakladnaya.jpg')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(b''.join(response.streaming_content), b'\xff\xd8\xff\xdb fake jpeg')
 
     def test_barcode_that_does_not_add_up_is_dropped(self):
         """Номенклатурный номер из соседней колонки штрихкодом не считается."""

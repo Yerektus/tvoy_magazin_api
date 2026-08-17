@@ -53,10 +53,24 @@ SECRET_KEY = os.environ.get(
     'django-insecure--p@@fpie5ee%yq_e-k-(zz19&b#h#*w$@9kuy_1o5b7$m7y0zx',
 )
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+# Отладка выключена по умолчанию: включённой она отдаёт трейсбек со всеми
+# настройками — ключом OpenRouter и паролем базы в том числе. Для разработки
+# ставится в .env строкой DJANGO_DEBUG=1.
+DEBUG = os.environ.get('DJANGO_DEBUG') == '1'
 
 ALLOWED_HOSTS = os.environ.get('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',')
+
+# За обратным прокси Django видит запрос как http и на этом основании
+# отвергает вход в админку. Хостинг говорит настоящую схему этим заголовком.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+# Домены, с которых принимаются формы админки. Без них вход по https
+# заканчивается «CSRF verification failed».
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',')
+    if origin.strip()
+]
 
 
 # Application definition
@@ -163,6 +177,11 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
 STATIC_URL = 'static/'
+
+# Сюда `collectstatic` складывает оформление админки. С выключенной отладкой
+# Django перестаёт искать файлы по приложениям, и без этой папки админка
+# открывается голым текстом.
+STATIC_ROOT = Path(os.environ.get('DJANGO_STATIC_ROOT') or BASE_DIR / 'staticfiles')
 
 
 # Email

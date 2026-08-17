@@ -25,6 +25,13 @@ uv run python tvoy_magazin_api/manage.py createsuperuser   # спросит по
 uv run python tvoy_magazin_api/manage.py runserver
 ```
 
+Фотографии накладных и оформление админки раздаёт сам Django (nginx перед
+ним нет), поэтому при деплое нужен `collectstatic`:
+
+```bash
+uv run python tvoy_magazin_api/manage.py collectstatic --noinput
+```
+
 Тесты:
 
 ```bash
@@ -59,6 +66,9 @@ uv run python tvoy_magazin_api/manage.py parse_invoice ~/Downloads/nakladnaya.jp
 | `DJANGO_MEDIA_ROOT` | `media/` рядом с кодом | Куда складывать фотографии: на хостинге — примонтированный том |
 | `ACCESS_TOKEN_HOURS` | `12` | Время жизни access-токена |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:4200,...` | Откуда пускаем фронт |
+| `DJANGO_DEBUG` | выключена | `1` — трейсбеки в браузере. В проде не включать |
+| `DJANGO_STATIC_ROOT` | `staticfiles/` | Куда `collectstatic` кладёт оформление админки |
+| `CSRF_TRUSTED_ORIGINS` | — | Домен админки, иначе вход не пройдёт проверку CSRF |
 | `DJANGO_SECRET_KEY`, `DJANGO_ALLOWED_HOSTS` | dev-значения | Для продакшена задать обязательно |
 
 ## API
