@@ -14,6 +14,8 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
+from . import database
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -108,14 +110,22 @@ WSGI_APPLICATION = 'tvoy_magazin_api.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        # Отдельный файл базы пригождается для проверок на живом API.
-        'NAME': os.environ.get('DJANGO_DB_NAME') or BASE_DIR / 'db.sqlite3',
-        'OPTIONS': {'timeout': 20},
+# На хостинге база приходит адресом в `DATABASE_URL` — там это Postgres в
+# отдельном контейнере. Локально переменной нет, и работает файловый SQLite:
+# ставить Postgres на машину ради разработки незачем.
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
+
+if DATABASE_URL:
+    DATABASES = {'default': database.from_url(DATABASE_URL)}
+else:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            # Отдельный файл базы пригождается для проверок на живом API.
+            'NAME': os.environ.get('DJANGO_DB_NAME') or BASE_DIR / 'db.sqlite3',
+            'OPTIONS': {'timeout': 20},
+        }
     }
-}
 
 
 # Password validation
@@ -188,7 +198,9 @@ SIMPLE_JWT = {
 }
 
 MEDIA_URL = 'media/'
-MEDIA_ROOT = BASE_DIR / 'media'
+# Фотографии накладных переживают деплой только на примонтированном томе:
+# файловая система контейнера эфемерна. Локально — обычная папка рядом с кодом.
+MEDIA_ROOT = Path(os.environ.get('DJANGO_MEDIA_ROOT') or BASE_DIR / 'media')
 
 # Загруженное фото накладной целиком уходит в память при разборе,
 # так что держим лимит близко к проверке в сериализаторе.

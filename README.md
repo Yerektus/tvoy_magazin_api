@@ -7,6 +7,17 @@ Django 6.1 + DRF + SimpleJWT, Python 3.12, зависимости через `uv
 
 ## Запуск
 
+База — Postgres, такая же, как на хостинге. Локально она живёт в контейнере:
+
+```bash
+docker compose up -d          # поднять, данные останутся в томе
+docker compose down           # остановить
+docker compose down -v        # остановить и стереть данные
+```
+
+Адрес базы лежит в `DATABASE_URL` (см. `.env.example`). Убрать эту строку —
+Django вернётся на файловый SQLite, и Postgres для работы не понадобится.
+
 ```bash
 export OPENROUTER_API_KEY=sk-or-...
 uv run python tvoy_magazin_api/manage.py migrate
@@ -43,7 +54,9 @@ uv run python tvoy_magazin_api/manage.py parse_invoice ~/Downloads/nakladnaya.jp
 | `OPENROUTER_TIMEOUT` | `120` | Таймаут запроса к модели, секунды |
 | `INVOICE_PARSE_CONCURRENCY` | `1` | Сколько накладных разбирается одновременно |
 | `INVOICE_PARSE_INLINE` | — | `1` — разбирать прямо в запросе, без фонового потока |
-| `DJANGO_DB_NAME` | `db.sqlite3` | Отдельный файл базы — удобно для проверок |
+| `DATABASE_URL` | — | Адрес Postgres. Пусто — работает файловый SQLite |
+| `DJANGO_DB_NAME` | `db.sqlite3` | Файл SQLite, когда `DATABASE_URL` не задан |
+| `DJANGO_MEDIA_ROOT` | `media/` рядом с кодом | Куда складывать фотографии: на хостинге — примонтированный том |
 | `ACCESS_TOKEN_HOURS` | `12` | Время жизни access-токена |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:4200,...` | Откуда пускаем фронт |
 | `DJANGO_SECRET_KEY`, `DJANGO_ALLOWED_HOSTS` | dev-значения | Для продакшена задать обязательно |

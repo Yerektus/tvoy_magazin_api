@@ -1,0 +1,34 @@
+# Postgres для разработки — такой же, как на хостинге, чтобы расхождения между
+# базами не всплывали уже в проде.
+#
+#   docker compose up -d      поднять
+#   docker compose down       остановить, данные остаются в томе
+#   docker compose down -v    остановить и стереть данные
+#
+# Адрес для Django лежит в `.env`:
+#   DATABASE_URL=postgresql://tvoy_magazin:tvoy_magazin@127.0.0.1:5433/tvoy_magazin
+
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: tvoy_magazin_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tvoy_magazin
+      POSTGRES_USER: tvoy_magazin
+      POSTGRES_PASSWORD: tvoy_magazin
+    ports:
+      # Наружу 5433: на 5432 может уже сидеть Postgres, поставленный руками.
+      - '5433:5432'
+    volumes:
+      - db:/var/lib/postgresql/data
+    healthcheck:
+      # Пока проверка не прошла, база ещё не принимает соединения: `migrate`
+      # сразу после `up` без этого падает на первом запуске.
+      test: ['CMD-SHELL', 'pg_isready -U tvoy_magazin -d tvoy_magazin']
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  db:
