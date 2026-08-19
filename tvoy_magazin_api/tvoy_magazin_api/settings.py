@@ -83,6 +83,9 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    # Отозванные refresh-токены. Приложение идёт внутри simplejwt — отдельного
+    # пакета не нужно, только две таблицы под уже недействительные токены.
+    'rest_framework_simplejwt.token_blacklist',
     'accounts',
     'extensions',
     'invoices',
@@ -206,11 +209,23 @@ REST_FRAMEWORK = {
     'UNAUTHENTICATED_USER': None,
 }
 
-# Токен один — access. Refresh не выдаём и не принимаем, поэтому живёт он долго.
+# Токенов два. Access живёт час и ходит в каждом запросе; refresh лежит у
+# фронта и меняется на новый access, когда прежний протух. Раньше access был
+# один и жил 12 часов — украденный работал все двенадцать, и отобрать его было
+# нечем. Короткий access сам закрывает окно, а refresh отзывается по списку.
+#
+# ACCESS_TOKEN_HOURS остался прежним именем ради уже настроенных окружений.
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(
-        hours=int(os.environ.get('ACCESS_TOKEN_HOURS', '12')),
+        hours=int(os.environ.get('ACCESS_TOKEN_HOURS', '1')),
     ),
+    'REFRESH_TOKEN_LIFETIME': timedelta(
+        days=int(os.environ.get('REFRESH_TOKEN_DAYS', '30')),
+    ),
+    # Обновление выдаёт новый refresh, а прежний уходит в чёрный список: если
+    # его успели украсть, вторым обновлением воспользоваться уже нельзя.
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': True,
     'AUTH_HEADER_TYPES': ('Bearer',),
     'USER_ID_FIELD': 'id',
     'USER_ID_CLAIM': 'user_id',

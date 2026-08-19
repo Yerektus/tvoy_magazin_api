@@ -79,17 +79,83 @@ class AuthTests(APITestCase):
     def setUp(self):
         User.objects.create_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
 
-    def test_login_returns_single_access_token(self):
-        response = self.client.post(
+    def login(self):
+        return self.client.post(
             '/api/auth/login/',
             {'email': 'shop@tvoymagazin.kz', 'password': 'tainy-parol-123'},
             format='json',
         )
 
+    def test_login_returns_both_tokens(self):
+        response = self.login()
+
         self.assertEqual(response.status_code, 200)
         self.assertIn('access', response.data)
-        self.assertNotIn('refresh', response.data)
+        self.assertIn('refresh', response.data)
         self.assertEqual(response.data['user']['email'], 'shop@tvoymagazin.kz')
+
+    def test_refresh_gives_a_working_access_token(self):
+        """Access протух — за новым идут с refresh, а не с почтой и паролем."""
+
+        refreshed = self.client.post(
+            '/api/auth/refresh/',
+            {'refresh': self.login().data['refresh']},
+            format='json',
+        )
+
+        self.assertEqual(refreshed.status_code, 200)
+
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {refreshed.data["access"]}')
+        self.assertEqual(self.client.get('/api/auth/me/').status_code, 200)
+
+    def test_used_refresh_token_stops_working(self):
+        """Обновление выдаёт новый refresh, а прежний гасит: украденный не сработает."""
+
+        stolen = self.login().data['refresh']
+        self.client.post('/api/auth/refresh/', {'refresh': stolen}, format='json')
+
+        again = self.client.post('/api/auth/refresh/', {'refresh': stolen}, format='json')
+        self.assertEqual(again.status_code, 401)
+
+    def test_rotation_hands_out_a_fresh_refresh_token(self):
+        first = self.login().data['refresh']
+        rotated = self.client.post('/api/auth/refresh/', {'refresh': first}, format='json')
+
+        self.assertIn('refresh', rotated.data)
+        self.assertNotEqual(rotated.data['refresh'], first)
+
+    def test_logout_kills_the_refresh_token(self):
+        """Выход настоящий: тем же refresh новый access больше не получить."""
+
+        refresh = self.login().data['refresh']
+
+        self.assertEqual(
+            self.client.post('/api/auth/logout/', {'refresh': refresh}, format='json').status_code,
+            204,
+        )
+        self.assertEqual(
+            self.client.post('/api/auth/refresh/', {'refresh': refresh}, format='json').status_code,
+            401,
+        )
+
+    def test_logout_needs_no_live_access_token(self):
+        """Выходят обычно как раз тогда, когда access уже протух."""
+
+        refresh = self.login().data['refresh']
+        self.client.credentials(HTTP_AUTHORIZATION='Bearer protuh')
+
+        response = self.client.post('/api/auth/logout/', {'refresh': refresh}, format='json')
+        self.assertEqual(response.status_code, 204)
+
+    def test_garbage_refresh_token_is_rejected(self):
+        self.assertEqual(
+            self.client.post('/api/auth/refresh/', {'refresh': 'ne-token'}, format='json').status_code,
+            401,
+        )
+        self.assertEqual(
+            self.client.post('/api/auth/logout/', {'refresh': 'ne-token'}, format='json').status_code,
+            400,
+        )
 
     def test_login_rejects_wrong_password(self):
         response = self.client.post(
