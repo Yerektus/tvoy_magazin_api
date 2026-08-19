@@ -20,8 +20,13 @@ class Invoice(models.Model):
         CHECKED = 'checked', 'Проверено'
         FAILED = 'failed', 'Ошибка'
 
+    # Снимок накладной: сжат, в JPEG и повёрнут так, чтобы текст стоял ровно.
+    # Он один на накладную — его показывает браузер, его читает модель, он же
+    # идёт в обучающую выборку (см. `for_training`).
     image = models.FileField('фото накладной', upload_to='invoices/%Y/%m')
-    # HEIC с айфона браузер не показывает — для просмотра держим копию в JPEG.
+    # Остался от времён, когда рядом держали второй файл. Заполнен только у
+    # старых накладных, у которых в `image` лежит сырой HEIC; новые пишут
+    # единственный снимок и это поле не трогают.
     preview = models.FileField('превью', upload_to='invoices/%Y/%m/preview', blank=True)
     status = models.CharField('статус', max_length=16, choices=Status.choices, default=Status.PENDING)
     error = models.TextField('ошибка разбора', blank=True)
@@ -79,6 +84,12 @@ class Invoice(models.Model):
     umag_store_id = models.PositiveIntegerField('магазин в UMAG', null=True, blank=True)
     umag_store_name = models.CharField('название магазина', max_length=255, blank=True)
 
+    # Фото плюс выверенные руками строки — готовая пара для дообучения модели.
+    # Ставится в момент проверки: до неё в строках догадка модели, и учить на
+    # них значит закреплять её же ошибки. Флаг отдельно от `checked_at` затем,
+    # чтобы негодный снимок можно было исключить, не снимая проверку.
+    for_training = models.BooleanField('годится для обучения', default=False)
+
     # Накладные не выкидываем: удалённая просто перестаёт показываться.
     deleted_at = models.DateTimeField('удалено', null=True, blank=True)
 
@@ -94,12 +105,17 @@ class Invoice(models.Model):
         return self.number or f'Накладная #{self.pk}'
 
     def mark_checked(self, user):
-        """Отмечает, что человек сверил распознанные данные с бумагой."""
+        """Отмечает, что человек сверил распознанные данные с бумагой.
+
+        С этой минуты накладная годится и в обучение: снимок настоящий, а
+        числа в строках выверены глазами по бумаге — эталоннее не будет.
+        """
 
         self.status = self.Status.CHECKED
         self.checked_at = timezone.now()
         self.checked_by = user
-        self.save(update_fields=('status', 'checked_at', 'checked_by'))
+        self.for_training = True
+        self.save(update_fields=('status', 'checked_at', 'checked_by', 'for_training'))
 
     def soft_delete(self):
         """Помечает накладную удалённой, оставляя данные и фото в базе."""

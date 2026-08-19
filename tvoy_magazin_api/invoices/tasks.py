@@ -67,15 +67,18 @@ def run(invoice_id: int) -> None:
         # целиком — иначе накладная вернулась бы в «очередь» до самого конца.
         invoice.status = Invoice.Status.PROCESSING
 
-        # Превью делаем до разбора: на упавшую накладную человек всё равно
+        # Снимок готовим до разбора: на упавшую накладную человек всё равно
         # захочет посмотреть глазами.
-        _make_preview(invoice)
+        prepare_photo(invoice)
 
         try:
             image, content_type = _for_model(invoice)
             parsed = parse_invoice(image, content_type)
 
             _save(invoice, parsed)
+            # Модель прочитала текст и заодно сказала, где у документа верх, —
+            # теперь снимок можно повернуть, чтобы его не смотрели боком.
+            _turn_upright(invoice, preview.UPRIGHT_TURNS.get(parsed.data.get('top_edge')))
             # БИН на фото читается не всегда: если поставщик знакомый, берём
             # его из прошлой накладной.
             _fill_supplier(invoice)
@@ -91,10 +94,11 @@ def run(invoice_id: int) -> None:
 
 
 def _for_model(invoice: Invoice) -> tuple[bytes, str]:
-    """Чем кормить модель: снимок с айфона сначала переводим в JPEG.
+    """Чем кормить модель — сжатым снимком накладной.
 
-    HEIC понимают не все — модели OpenAI отвечают на него «это не картинка».
-    Превью для браузера уже сделано выше, оно же идёт и в модель.
+    `preview` заполнен только у накладных, загруженных когда второй файл ещё
+    делался: у них в `image` лежит сырой HEIC, который читают не все модели.
+    Новые накладные хранят один снимок, и ветка ниже их не касается.
     """
 
     if invoice.preview:
@@ -105,23 +109,63 @@ def _for_model(invoice: Invoice) -> tuple[bytes, str]:
         return image.read(), content_type_for(invoice.image.name)
 
 
-def _make_preview(invoice: Invoice) -> None:
-    """Кладёт рядом JPEG, если исходник браузер не покажет."""
+def prepare_photo(invoice: Invoice) -> bool:
+    """Сжимает загруженный снимок, заменяя им сырой файл.
 
-    if invoice.preview or not preview.needed_for(invoice.image.name):
+    Снимок на накладную один: сырой оригинал с телефона втрое тяжелее, а
+    нужен ровно тем же — и браузеру, и модели, и будущей обучающей выборке.
+    Ровно его потом и довернём, когда модель скажет, где у документа верх.
+
+    Возвращает False, если обрабатывать было нечего или не получилось.
+    """
+
+    if not preview.needed_for(invoice.image.name):
+        return False
+
+    try:
+        source = Path(invoice.image.path)
+    except (NotImplementedError, ValueError):
+        # Хранилище без локальных путей — обрабатывать нечего.
+        return False
+
+    jpeg = preview.compress(source)
+    if jpeg is None:
+        return False
+
+    return _replace_photo(invoice, source, jpeg)
+
+
+def _turn_upright(invoice: Invoice, degrees) -> None:
+    """Доворачивает снимок так, как прочитала модель: боком его никто не смотрит.
+
+    Углы тут кратны 90 — это перестановка пикселей, документ от неё не портится.
+    Модель смотрит уже на повёрнутый снимок при следующем разборе и отвечает 0,
+    поэтому «распознать заново» второй раз ничего не крутит.
+    """
+
+    if degrees not in preview.TURNS:
         return
 
     try:
         source = Path(invoice.image.path)
     except (NotImplementedError, ValueError):
-        # Хранилище без локальных путей — конвертировать нечего.
         return
 
-    jpeg = preview.to_jpeg(source)
-    if jpeg is None:
+    turned = preview.upright(source, degrees)
+    if turned is None:
         return
 
-    invoice.preview.save(f'{source.stem}.jpg', ContentFile(jpeg), save=True)
+    _replace_photo(invoice, source, turned)
+
+
+def _replace_photo(invoice: Invoice, source: Path, jpeg: bytes) -> bool:
+    """Кладёт новый снимок в то же поле и стирает прежний файл."""
+
+    previous = invoice.image.name
+    invoice.image.save(f'{source.stem}.jpg', ContentFile(jpeg), save=True)
+    invoice.image.storage.delete(previous)
+
+    return True
 
 
 def content_type_for(name: str) -> str:

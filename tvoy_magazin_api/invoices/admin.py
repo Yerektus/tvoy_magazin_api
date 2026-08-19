@@ -10,8 +10,12 @@ class InvoiceLineInline(admin.TabularInline):
 
 @admin.register(Invoice)
 class InvoiceAdmin(admin.ModelAdmin):
-    list_display = ('__str__', 'supplier', 'issued_at', 'total', 'status', 'created_at', 'deleted_at')
-    list_filter = ('status',)
+    list_display = (
+        '__str__', 'supplier', 'issued_at', 'total', 'status', 'for_training', 'created_at', 'deleted_at',
+    )
+    # `for_training` в фильтре — чтобы выборку для дообучения можно было
+    # собрать глазами и снять флаг с негодного снимка.
+    list_filter = ('status', 'for_training')
     search_fields = ('number', 'supplier', 'supplier_bin')
     inlines = [InvoiceLineInline]
 

@@ -99,8 +99,13 @@ class InvoiceCountsView(InvoiceQuerysetMixin, APIView):
         )
 
 
-class InvoiceDetailView(InvoiceQuerysetMixin, generics.RetrieveDestroyAPIView):
-    """GET /api/invoices/<id>/ — накладная с позициями; DELETE — пометить удалённой."""
+class InvoiceDetailView(InvoiceQuerysetMixin, generics.RetrieveUpdateDestroyAPIView):
+    """/api/invoices/<id>/ — накладная с позициями.
+
+    GET отдаёт карточку, PATCH правит поставщика (модель читает его название и
+    БИН с бумаги хуже всего — там печать, а не таблица), DELETE помечает
+    накладную удалённой.
+    """
 
     serializer_class = InvoiceDetailSerializer
 
@@ -108,6 +113,16 @@ class InvoiceDetailView(InvoiceQuerysetMixin, generics.RetrieveDestroyAPIView):
         # Удалённые открываются на чтение: их видно во вкладке списка, и
         # тыкать в строку, которая ведёт в никуда, странно.
         return Invoice.all_objects.filter(created_by=self.request.user)
+
+    def update(self, request, *args, **kwargs):
+        # Удалённую открывают только посмотреть — править там нечего.
+        if self.get_object().deleted_at is not None:
+            return Response(
+                {'detail': 'Накладная удалена'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        return super().update(request, *args, **kwargs)
 
     def perform_destroy(self, instance):
         # Из базы ничего не выкидываем — накладная просто уходит из выдачи.
@@ -262,11 +277,14 @@ class InvoiceRetryView(InvoiceQuerysetMixin, APIView):
             )
 
         # Данные будут другими — прежняя отметка о проверке к ним не относится.
+        # Вместе с ней снимаем и годность к обучению: строки снова станут
+        # догадкой модели, а учить на них — закреплять её же ошибки.
         invoice.status = Invoice.Status.PENDING
         invoice.error = ''
         invoice.checked_at = None
         invoice.checked_by = None
-        invoice.save(update_fields=('status', 'error', 'checked_at', 'checked_by'))
+        invoice.for_training = False
+        invoice.save(update_fields=('status', 'error', 'checked_at', 'checked_by', 'for_training'))
         tasks.schedule(invoice)
 
         return Response(InvoiceDetailSerializer(invoice).data, status=status.HTTP_202_ACCEPTED)

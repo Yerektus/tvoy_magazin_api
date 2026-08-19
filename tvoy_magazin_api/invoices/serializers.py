@@ -71,13 +71,30 @@ class InvoiceListSerializer(serializers.ModelSerializer):
 
 
 class InvoiceDetailSerializer(InvoiceListSerializer):
+    """Карточка накладной. Правятся руками только поля поставщика.
+
+    Остальное либо прочитано с бумаги и меняется через «распознать заново»,
+    либо ведётся нами (статус, стоимость разбора, отметки UMAG), поэтому
+    держим всё это только на чтение: PATCH с лишним полем ничего не испортит.
+    """
+
     lines = InvoiceLineSerializer(many=True, read_only=True)
     image = serializers.FileField(read_only=True)
-    # Пусто у обычных JPEG — там браузеру хватает оригинала.
+    # Выпрямленный снимок — его и показываем. Пусто, если лист на фото найти
+    # не удалось: тогда просмотрщик откатывается на `image`.
     preview = serializers.FileField(read_only=True)
 
     class Meta(InvoiceListSerializer.Meta):
         fields = InvoiceListSerializer.Meta.fields + ('image', 'preview', 'model', 'lines')
+        read_only_fields = tuple(set(fields) - {'supplier', 'supplier_bin'})
+
+    def update(self, invoice, validated_data):
+        # БИН вписали руками — значит он из бумаги, а не подставлен моделью по
+        # прошлым накладным. Иначе в карточке осталась бы висеть плашка «подставил ИИ».
+        if 'supplier_bin' in validated_data:
+            invoice.supplier_bin_auto = False
+
+        return super().update(invoice, validated_data)
 
 
 class InvoiceCreateSerializer(serializers.ModelSerializer):

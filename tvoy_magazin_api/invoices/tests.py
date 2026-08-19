@@ -8,7 +8,7 @@ from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.test import SimpleTestCase, override_settings
-from PIL import Image
+from PIL import Image, ImageDraw
 from rest_framework.test import APITestCase
 
 from umag.models import UmagAccount
@@ -55,6 +55,26 @@ def photo():
     return SimpleUploadedFile('nakladnaya.jpg', b'\xff\xd8\xff\xdb fake jpeg', content_type='image/jpeg')
 
 
+def sideways_jpeg(size=(1600, 900)) -> bytes:
+    """Снимок «лежащей на боку» накладной: широкий кадр с меткой в углу.
+
+    Метка даёт понять, куда повернулась картинка, — иначе белый прямоугольник
+    после поворота не отличить от исходного.
+    """
+
+    canvas = Image.new('RGB', size, 'white')
+    ImageDraw.Draw(canvas).rectangle([(0, 0), (size[0] // 8, size[1] // 8)], fill='black')
+
+    buffer = io.BytesIO()
+    canvas.save(buffer, format='JPEG', quality=95)
+
+    return buffer.getvalue()
+
+
+# Сжатый снимок, который отдаёт обработка.
+COMPRESSED = b'\xff\xd8\xff\xdb compressed'
+
+
 class AuthTests(APITestCase):
     def setUp(self):
         User.objects.create_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
@@ -93,9 +113,15 @@ class PreviewTests(SimpleTestCase):
 
         return path
 
+    def sideways(self, directory: str) -> Path:
+        path = Path(directory) / 'nakladnaya.jpg'
+        path.write_bytes(sideways_jpeg())
+
+        return path
+
     def test_heic_becomes_a_jpeg_the_browser_can_show(self):
         with tempfile.TemporaryDirectory() as directory:
-            jpeg = preview.to_jpeg(self.heic(directory))
+            jpeg = preview.compress(self.heic(directory))
 
         self.assertIsNotNone(jpeg)
 
@@ -105,17 +131,81 @@ class PreviewTests(SimpleTestCase):
             # за размер картинки мы платим ещё и токенами при разборе.
             self.assertEqual(max(image.size), preview.PREVIEW_SIZE)
 
+    def test_photo_is_turned_the_way_the_model_read_it(self):
+        """Поворот на 90 по часовой: широкий кадр встаёт вертикально, метка — вправо."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            turned = preview.upright(self.sideways(directory), 90)
+
+        self.assertIsNotNone(turned)
+
+        with Image.open(io.BytesIO(turned)) as image:
+            # Кадр был 1600x900 — после четверти оборота стал 900x1600.
+            self.assertEqual(image.size, (900, 1600))
+            # Метка была в левом верхнем углу; по часовой она уходит в правый
+            # верхний, а левый становится чистым.
+            self.assertLess(self.brightness(image.crop((800, 0, 900, 100))), 40)
+            self.assertGreater(self.brightness(image.crop((0, 0, 100, 100))), 200)
+
+    def brightness(self, image: Image.Image) -> float:
+        return sum(image.convert('L').getdata()) / (image.width * image.height)
+
+    def test_upright_photo_is_left_alone(self):
+        """Угол нулевой — крутить нечего, файл не переписываем."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(preview.upright(self.sideways(directory), 0))
+
+    def test_top_edge_turns_the_frame_the_short_way(self):
+        """Сторона, где шапка, — и угол, который ставит её наверх."""
+
+        self.assertEqual(preview.UPRIGHT_TURNS['top'], 0)
+        # Шапка справа — кадр идёт против часовой, то есть 270 по часовой.
+        self.assertEqual(preview.UPRIGHT_TURNS['right'], 270)
+        self.assertEqual(preview.UPRIGHT_TURNS['bottom'], 180)
+        self.assertEqual(preview.UPRIGHT_TURNS['left'], 90)
+
+    def test_ready_photo_is_not_compressed_twice(self):
+        """«Распознать заново» не должно пережимать снимок по кругу."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'nakladnaya.jpg'
+            path.write_bytes(preview.compress(self.heic(directory)))
+
+            self.assertIsNone(preview.compress(path))
+
     def test_broken_file_does_not_break_the_parse(self):
         with tempfile.TemporaryDirectory() as directory:
             broken = Path(directory) / 'IMG_0034.HEIC'
             broken.write_bytes(b'\x00\x00\x00\x18ftypheic')
 
-            self.assertIsNone(preview.to_jpeg(broken))
+            self.assertIsNone(preview.compress(broken))
 
-    def test_only_heic_needs_a_preview(self):
+    def test_raster_formats_need_a_preview(self):
+        # Любую картинку сжимаем — не только HEIC ради браузера, но и обычный
+        # JPEG/PNG ради токенов модели.
         self.assertTrue(preview.needed_for('IMG_0033.HEIC'))
         self.assertTrue(preview.needed_for('foto.heif'))
-        self.assertFalse(preview.needed_for('nakladnaya.jpg'))
+        self.assertTrue(preview.needed_for('nakladnaya.jpg'))
+        self.assertTrue(preview.needed_for('nakladnaya.png'))
+        self.assertTrue(preview.needed_for('nakladnaya.webp'))
+        # PDF Pillow не откроет, а сжимать его тут не наша забота.
+        self.assertFalse(preview.needed_for('nakladnaya.pdf'))
+
+    def test_jpeg_gets_compressed_too(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'nakladnaya.jpg'
+            Image.new('RGB', (3000, 4000), 'white').save(path, format='JPEG', quality=95)
+            original_size = path.stat().st_size
+
+            jpeg = preview.compress(path)
+
+        self.assertIsNotNone(jpeg)
+        self.assertLess(len(jpeg), original_size)
+
+        with Image.open(io.BytesIO(jpeg)) as image:
+            self.assertEqual(image.format, 'JPEG')
+            self.assertEqual(max(image.size), preview.PREVIEW_SIZE)
 
 
 @override_settings(INVOICE_PARSE_INLINE=True)
@@ -230,28 +320,62 @@ class InvoiceTests(APITestCase):
 
         self.assertIsNone(Invoice.objects.get(pk=response.data['id']).umag_store_id)
 
-    def test_missing_previews_are_made_up(self):
-        """Накладные, загруженные без утилиты конвертации, догоняют потом."""
+    def test_upload_leaves_one_photo_compressed_and_upright(self):
+        """Настоящая обработка целиком: один файл, сжатый и повёрнутый как надо."""
+
+        sideways = SimpleUploadedFile('nakladnaya.jpg', sideways_jpeg(), content_type='image/jpeg')
+        # Шапка у левого края — значит кадр доворачивают на 90 по часовой.
+        turned = Parsed({**PARSED, 'top_edge': 'left'}, 'qwen/qwen3-vl-32b-instruct', 0.004965)
+
+        with tempfile.TemporaryDirectory() as directory, override_settings(MEDIA_ROOT=directory):
+            with patch('invoices.tasks.parse_invoice', return_value=turned):
+                response = self.client.post('/api/invoices/', {'image': sideways}, format='multipart')
+
+            invoice = Invoice.objects.get(pk=response.data['id'])
+
+            # Кадр был широким, а лёг вертикально: снимок довёрнут.
+            with Image.open(invoice.image) as stored:
+                self.assertLess(stored.width, stored.height)
+
+            # Второго файла нет: ни сырого оригинала, ни отдельного превью.
+            self.assertFalse(invoice.preview)
+            saved = [path for path in Path(directory).rglob('*') if path.is_file()]
+            self.assertEqual(len(saved), 1)
+
+    def test_upright_photo_is_not_turned(self):
+        """Шапка и так сверху — крутить нечего, кадр остаётся как был."""
+
+        sideways = SimpleUploadedFile('nakladnaya.jpg', sideways_jpeg(), content_type='image/jpeg')
+        straight = Parsed({**PARSED, 'top_edge': 'top'}, 'qwen/qwen3-vl-32b-instruct', 0.004965)
+
+        with tempfile.TemporaryDirectory() as directory, override_settings(MEDIA_ROOT=directory):
+            with patch('invoices.tasks.parse_invoice', return_value=straight):
+                response = self.client.post('/api/invoices/', {'image': sideways}, format='multipart')
+
+            with Image.open(Invoice.objects.get(pk=response.data['id']).image) as stored:
+                self.assertGreater(stored.width, stored.height)
+
+    def test_old_photos_are_compressed_by_the_command(self):
+        """Накладные, загруженные до появления обработки, догоняют потом."""
 
         heic = SimpleUploadedFile('IMG_0039.HEIC', b'\x00\x00\x00\x18ftypheic', content_type='image/heic')
 
-        # Утилиты не было: накладная разобралась, а превью не появилось.
+        # Обработки не было: накладная разобралась, а снимок остался сырым.
         with (
             patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT),
-            patch('invoices.preview.to_jpeg', return_value=None),
+            patch('invoices.preview.compress', return_value=None),
         ):
             response = self.client.post('/api/invoices/', {'image': heic}, format='multipart')
 
         invoice = Invoice.objects.get(pk=response.data['id'])
-        self.assertFalse(invoice.preview)
+        self.assertTrue(invoice.image.name.endswith('.HEIC'))
 
-        # Утилита появилась — команда проходит по таким накладным ещё раз.
-        with patch('invoices.preview.to_jpeg', return_value=b'\xff\xd8\xff\xdb converted'):
-            call_command('make_previews')
+        # Обработка появилась — команда проходит по таким накладным ещё раз.
+        with patch('invoices.preview.compress', return_value=COMPRESSED):
+            call_command('compress_photos')
 
         invoice.refresh_from_db()
-        self.assertTrue(invoice.preview)
-        self.assertEqual(invoice.preview.read(), b'\xff\xd8\xff\xdb converted')
+        self.assertEqual(invoice.image.read(), COMPRESSED)
 
     def test_photo_is_served_with_debug_off(self):
         """В проде отладка выключена, а фотографию просмотрщик всё равно берёт."""
@@ -295,29 +419,29 @@ class InvoiceTests(APITestCase):
         # Прочитанное с фото сохранилось: с ним человеку сверяться.
         self.assertEqual(response.data['id'], Invoice.objects.get(pk=response.data['id']).pk)
 
-    def test_heic_goes_to_model_as_jpeg(self):
-        """Снимок с айфона отдаём моделью уже переведённым: HEIC читают не все."""
+    def test_model_reads_the_compressed_photo(self):
+        """Снимок с айфона отдаём моделью уже сжатым: HEIC читают не все."""
 
         heic = SimpleUploadedFile('IMG_0051.HEIC', b'\x00\x00\x00\x18ftypheic', content_type='image/heic')
 
         with (
             patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT) as model,
-            patch('invoices.preview.to_jpeg', return_value=b'\xff\xd8\xff\xdb converted'),
+            patch('invoices.preview.compress', return_value=COMPRESSED),
         ):
             self.client.post('/api/invoices/', {'image': heic}, format='multipart')
 
         image, content_type = model.call_args.args
         self.assertEqual(content_type, 'image/jpeg')
-        self.assertEqual(image, b'\xff\xd8\xff\xdb converted')
+        self.assertEqual(image, COMPRESSED)
 
-    def test_heic_goes_as_is_when_there_is_nothing_to_convert_with(self):
-        """Утилиты для конвертации нет — отправляем оригинал, а не падаем."""
+    def test_heic_goes_as_is_when_it_cannot_be_processed(self):
+        """Обработать снимок не вышло — отправляем оригинал, а не падаем."""
 
-        heic = SimpleUploadedFile('IMG_0052.HEIC', b'\x00\x00\x00\x18ftypheic', content_type='image/heic')
+        heic = SimpleUploadedFile('IMG_0053.HEIC', b'\x00\x00\x00\x18ftypheic', content_type='image/heic')
 
         with (
             patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT) as model,
-            patch('invoices.preview.to_jpeg', return_value=None),
+            patch('invoices.preview.compress', return_value=None),
         ):
             self.client.post('/api/invoices/', {'image': heic}, format='multipart')
 
@@ -383,6 +507,74 @@ class InvoiceTests(APITestCase):
         self.assertEqual(self.client.get(f'/api/invoices/{other.pk}/').status_code, 200)
         self.assertEqual(self.client.post(f'/api/invoices/{other.pk}/check/').status_code, 200)
 
+    def test_supplier_is_edited_by_hand(self):
+        """Название и БИН поставщика правятся в карточке: печать модель читает плохо."""
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        response = self.client.patch(
+            f'/api/invoices/{created.data["id"]}/',
+            {'supplier': 'ТОО «КАРАВАН»', 'supplier_bin': '220340013017'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 200)
+        invoice = Invoice.objects.get(pk=created.data['id'])
+        self.assertEqual(invoice.supplier, 'ТОО «КАРАВАН»')
+        self.assertEqual(invoice.supplier_bin, '220340013017')
+
+    def test_hand_typed_bin_drops_the_guessed_mark(self):
+        """БИН вписали руками — плашка «подставил ИИ» больше не про него."""
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        invoice = Invoice.objects.get(pk=created.data['id'])
+        invoice.supplier_bin_auto = True
+        invoice.save(update_fields=('supplier_bin_auto',))
+
+        self.client.patch(
+            f'/api/invoices/{created.data["id"]}/',
+            {'supplier_bin': '140940011293'},
+            format='json',
+        )
+
+        invoice.refresh_from_db()
+        self.assertFalse(invoice.supplier_bin_auto)
+
+    def test_only_supplier_fields_can_be_edited(self):
+        """Остальное прочитано с бумаги или ведём мы — PATCH его не трогает."""
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        invoice = Invoice.objects.get(pk=created.data['id'])
+
+        self.client.patch(
+            f'/api/invoices/{created.data["id"]}/',
+            {'number': 'подделка', 'total': '999999', 'status': Invoice.Status.CHECKED},
+            format='json',
+        )
+
+        after = Invoice.objects.get(pk=invoice.pk)
+        self.assertEqual(after.number, invoice.number)
+        self.assertEqual(after.total, invoice.total)
+        self.assertEqual(after.status, invoice.status)
+
+    def test_deleted_invoice_cannot_be_edited(self):
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        self.client.delete(f'/api/invoices/{created.data["id"]}/')
+        response = self.client.patch(
+            f'/api/invoices/{created.data["id"]}/',
+            {'supplier': 'ТОО «КАРАВАН»'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 409)
+
     def test_failed_parsing_is_reported(self):
         with patch('invoices.tasks.parse_invoice', side_effect=OpenRouterError('OpenRouter ответил 402')):
             response = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
@@ -432,6 +624,16 @@ class InvoiceTests(APITestCase):
         invoice = Invoice.objects.get(pk=invoice_id)
         self.assertIsNotNone(invoice.checked_at)
         self.assertEqual(invoice.checked_by, self.user)
+        # Строки выверены по бумаге — снимок годится в обучающую выборку.
+        self.assertTrue(invoice.for_training)
+
+    def test_unchecked_invoice_is_not_training_material(self):
+        """Пока человек не сверил строки — это догадка модели, а не эталон."""
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        self.assertFalse(Invoice.objects.get(pk=created.data['id']).for_training)
 
     def test_check_rejected_until_parsing_finished(self):
         with patch('invoices.tasks.parse_invoice', side_effect=OpenRouterError('нет ключа')):
@@ -449,6 +651,9 @@ class InvoiceTests(APITestCase):
         invoice = Invoice.objects.get(pk=created.data['id'])
         self.assertIsNone(invoice.checked_at)
         self.assertEqual(invoice.status, Invoice.Status.DONE)
+        # Строки перечитаны заново — выверенными они быть перестали, и в
+        # обучение такая пара больше не годится.
+        self.assertFalse(invoice.for_training)
         # Разбор был дважды — в карточке видно, во что обошлись оба.
         self.assertEqual(str(invoice.cost), '0.009930')
 
