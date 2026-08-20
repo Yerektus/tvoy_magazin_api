@@ -5,6 +5,7 @@ from django.contrib.auth import get_user_model
 from django.test import SimpleTestCase, override_settings
 from rest_framework.test import APITestCase
 
+from accounts.tests import make_user
 from umag.models import UmagAccount
 
 from . import planner
@@ -117,7 +118,7 @@ class PlannerMathTests(SimpleTestCase):
 @override_settings(INVOICE_PARSE_INLINE=True)
 class PlanningApiTests(APITestCase):
     def setUp(self):
-        self.user = User.objects.create_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
+        self.user = make_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
         self.client.force_authenticate(self.user)
 
     def connect_umag(self):
@@ -255,7 +256,7 @@ class PlanningApiTests(APITestCase):
 
     def test_plan_of_other_user_is_hidden(self):
         self.install()
-        other = User.objects.create_user(email='other@tvoymagazin.kz', password='tainy-parol-123')
+        other = make_user(email='other@tvoymagazin.kz', password='tainy-parol-123')
         PurchasePlan.objects.create(user=other, store_id=17795, status=PurchasePlan.Status.READY)
 
         self.assertEqual(self.client.get('/api/purchases/plan/').status_code, 204)

@@ -3,13 +3,23 @@ from rest_framework import serializers
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import User
+from .models import Organization, User
+
+
+class OrganizationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Organization
+        fields = ('id', 'name')
 
 
 class UserSerializer(serializers.ModelSerializer):
+    organization = OrganizationSerializer(read_only=True)
+    # По ней фронт решает, показывать ли расширения: у менеджера их нет.
+    manages_organization = serializers.BooleanField(read_only=True)
+
     class Meta:
         model = User
-        fields = ('id', 'email', 'name')
+        fields = ('id', 'email', 'name', 'role', 'organization', 'manages_organization')
 
 
 class LoginSerializer(serializers.Serializer):
@@ -30,6 +40,12 @@ class LoginSerializer(serializers.Serializer):
 
         if not user.is_active:
             raise serializers.ValidationError('Учётная запись отключена')
+
+        if user.organization_id is None:
+            # Заходят в организацию, а не «просто в кабинет»: без неё непонятно,
+            # чьи накладные показывать и куда складывать новые. Так выглядит
+            # суперпользователь, заведённый из консоли, — ему в админку Django.
+            raise serializers.ValidationError('Учётная запись не привязана к организации')
 
         attrs['user'] = user
         return attrs

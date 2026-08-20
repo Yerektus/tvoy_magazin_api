@@ -11,6 +11,7 @@ from django.test import SimpleTestCase, override_settings
 from PIL import Image, ImageDraw
 from rest_framework.test import APITestCase
 
+from accounts.tests import make_organization, make_user
 from umag.models import UmagAccount
 from umag.tests import FakeUmag
 
@@ -77,7 +78,7 @@ COMPRESSED = b'\xff\xd8\xff\xdb compressed'
 
 class AuthTests(APITestCase):
     def setUp(self):
-        User.objects.create_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
+        make_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
 
     def login(self):
         return self.client.post(
@@ -168,6 +169,59 @@ class AuthTests(APITestCase):
 
     def test_me_requires_token(self):
         self.assertEqual(self.client.get('/api/auth/me/').status_code, 401)
+
+    def test_login_tells_which_organization_you_are_in(self):
+        """Заходят в организацию — фронту нужно знать, в какую и кем."""
+
+        user = self.login().data['user']
+
+        self.assertEqual(user['organization']['name'], 'Магазин на углу')
+        self.assertEqual(user['role'], User.Role.OWNER)
+        self.assertTrue(user['manages_organization'])
+
+    def test_account_without_organization_cannot_sign_in(self):
+        """Суперпользователь из консоли — ему в админку Django, а не в кабинет."""
+
+        User.objects.create_superuser(email='root@tvoymagazin.kz', password='tainy-parol-123')
+
+        response = self.client.post(
+            '/api/auth/login/',
+            {'email': 'root@tvoymagazin.kz', 'password': 'tainy-parol-123'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+
+class RoleTests(APITestCase):
+    """Менеджер работает с накладными, но организацией не заведует."""
+
+    def setUp(self):
+        self.organization = make_organization()
+
+    def sign_in(self, role):
+        self.client.force_authenticate(
+            make_user(email=f'{role}@tvoymagazin.kz', organization=self.organization, role=role)
+        )
+
+    def test_manager_does_not_get_the_extensions_catalogue(self):
+        self.sign_in(User.Role.MANAGER)
+        self.assertEqual(self.client.get('/api/extensions/').status_code, 403)
+
+    def test_owner_and_admin_do(self):
+        for role in (User.Role.OWNER, User.Role.ADMIN):
+            with self.subTest(role=role):
+                self.sign_in(role)
+                self.assertEqual(self.client.get('/api/extensions/').status_code, 200)
+
+    def test_manager_cannot_connect_an_extension(self):
+        """Читать состояние можно — иначе страница закупов не нарисуется."""
+
+        self.sign_in(User.Role.MANAGER)
+
+        self.assertEqual(self.client.get('/api/purchases/access/').status_code, 200)
+        self.assertEqual(self.client.post('/api/purchases/access/').status_code, 403)
+        self.assertEqual(self.client.delete('/api/purchases/access/').status_code, 403)
 
 
 class PreviewTests(SimpleTestCase):
@@ -277,7 +331,7 @@ class PreviewTests(SimpleTestCase):
 @override_settings(INVOICE_PARSE_INLINE=True)
 class InvoiceTests(APITestCase):
     def setUp(self):
-        self.user = User.objects.create_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
+        self.user = make_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
         self.client.force_authenticate(self.user)
 
     def test_upload_schedules_parsing_and_stores_lines(self):
@@ -525,13 +579,15 @@ class InvoiceTests(APITestCase):
         )
 
         mine = Invoice.objects.create(
+            organization=self.user.organization,
             created_by=self.user,
             image='invoices/moya.jpg',
             umag_store_id=17795,
         )
         # Завели до подключения UMAG: спрятать её некуда, видна в любом магазине.
-        nobodys = Invoice.objects.create(created_by=self.user, image='invoices/nichya.jpg')
+        nobodys = Invoice.objects.create(organization=self.user.organization, created_by=self.user, image='invoices/nichya.jpg')
         Invoice.objects.create(
+            organization=self.user.organization,
             created_by=self.user,
             image='invoices/chuzhaya.jpg',
             umag_store_id=17796,
@@ -548,8 +604,8 @@ class InvoiceTests(APITestCase):
     def test_list_keeps_every_invoice_without_umag(self):
         """UMAG не подключён — отбирать не по чему, список остаётся общим."""
 
-        Invoice.objects.create(created_by=self.user, image='invoices/odna.jpg', umag_store_id=17795)
-        Invoice.objects.create(created_by=self.user, image='invoices/dve.jpg', umag_store_id=17796)
+        Invoice.objects.create(organization=self.user.organization, created_by=self.user, image='invoices/odna.jpg', umag_store_id=17795)
+        Invoice.objects.create(organization=self.user.organization, created_by=self.user, image='invoices/dve.jpg', umag_store_id=17796)
 
         self.assertEqual(self.client.get('/api/invoices/').data['count'], 2)
 
@@ -564,6 +620,7 @@ class InvoiceTests(APITestCase):
             store_name='Каратал Ерентал',
         )
         other = Invoice.objects.create(
+            organization=self.user.organization,
             created_by=self.user,
             image='invoices/chuzhaya.jpg',
             status=Invoice.Status.DONE,
@@ -649,15 +706,61 @@ class InvoiceTests(APITestCase):
         self.assertEqual(invoice.status, Invoice.Status.FAILED)
         self.assertIn('402', invoice.error)
 
-    def test_invoices_are_isolated_per_user(self):
+    def test_invoices_are_isolated_per_organization(self):
+        """Чужая организация накладную не видит — ни в списке, ни по прямой ссылке."""
+
         with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
             created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
 
-        other = User.objects.create_user(email='other@tvoymagazin.kz', password='tainy-parol-123')
+        # У этого своя организация: `make_user` заводит её каждому.
+        other = make_user(email='other@tvoymagazin.kz', password='tainy-parol-123')
         self.client.force_authenticate(other)
 
         self.assertEqual(self.client.get(f'/api/invoices/{created.data["id"]}/').status_code, 404)
         self.assertEqual(self.client.get('/api/invoices/').data['count'], 0)
+
+    def test_colleague_sees_what_the_shift_uploaded(self):
+        """Ради этого организация и заводилась: принял сменщик — видит хозяин."""
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        colleague = make_user(
+            email='smena@tvoymagazin.kz',
+            password='tainy-parol-123',
+            organization=self.user.organization,
+            role=User.Role.MANAGER,
+        )
+        self.client.force_authenticate(colleague)
+
+        self.assertEqual(self.client.get(f'/api/invoices/{created.data["id"]}/').status_code, 200)
+        self.assertEqual(self.client.get('/api/invoices/').data['count'], 1)
+
+    def test_manager_edits_what_the_owner_uploaded(self):
+        """Менеджера роль не ограничивает в работе с накладными — только в расширениях."""
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        self.client.force_authenticate(
+            make_user(
+                email='smena@tvoymagazin.kz',
+                password='tainy-parol-123',
+                organization=self.user.organization,
+                role=User.Role.MANAGER,
+            )
+        )
+
+        patched = self.client.patch(
+            f'/api/invoices/{created.data["id"]}/',
+            {'supplier': 'ТОО «КАРАВАН»'},
+            format='json',
+        )
+        self.assertEqual(patched.status_code, 200)
+        self.assertEqual(
+            self.client.post(f'/api/invoices/{created.data["id"]}/check/').status_code,
+            200,
+        )
 
     def test_delete_only_marks_invoice_as_deleted(self):
         with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
@@ -823,6 +926,7 @@ class InvoiceTests(APITestCase):
         """Прошлая накладная того же поставщика — с прочитанным БИН."""
 
         return Invoice.objects.create(
+            organization=self.user.organization,
             created_by=self.user,
             status=Invoice.Status.CHECKED,
             supplier=name,
@@ -939,7 +1043,7 @@ class InvoiceTests(APITestCase):
         invoice_id = created.data['id']
         line = Invoice.objects.get(pk=invoice_id).lines.first()
 
-        other = User.objects.create_user(email='other@tvoymagazin.kz', password='tainy-parol-123')
+        other = make_user(email='other@tvoymagazin.kz', password='tainy-parol-123')
         self.client.force_authenticate(other)
 
         response = self.client.patch(

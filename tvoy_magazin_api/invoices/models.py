@@ -53,6 +53,16 @@ class Invoice(models.Model):
         blank=True,
     )
 
+    # Накладная принадлежит организации, а не тому, кто её сфотографировал:
+    # принимает товар сменщик, а сверяет и отправляет в приёмку хозяин.
+    organization = models.ForeignKey(
+        'accounts.Organization',
+        verbose_name='организация',
+        on_delete=models.CASCADE,
+        related_name='invoices',
+    )
+    # Кто загрузил — остаётся, но правами больше не заведует: это след в
+    # истории и адрес, по которому берут учётку UMAG при отправке приёмки.
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         verbose_name='загрузил',

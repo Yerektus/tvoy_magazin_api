@@ -7,6 +7,7 @@ from django.test import SimpleTestCase
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
+from accounts.tests import make_user
 from invoices.models import Invoice, InvoiceLine
 from invoices.openrouter import OpenRouterError, Parsed
 
@@ -112,6 +113,7 @@ class FakeUmag:
 
 def invoice_for(user, **fields) -> Invoice:
     invoice = Invoice.objects.create(
+        organization=user.organization,
         created_by=user,
         status=Invoice.Status.CHECKED,
         supplier=fields.pop('supplier', 'ТОО «Жасар-Сауда»'),
@@ -230,7 +232,7 @@ class CatalogTests(APITestCase):
         """Свежую копию не трогаем: выгрузка тяжёлая, а товары за час не меняются."""
 
         account = UmagAccount.objects.create(
-            user=User.objects.create_user(email='fresh@tvoymagazin.kz', password='tainy-parol-123'),
+            user=make_user(email='fresh@tvoymagazin.kz', password='tainy-parol-123'),
             phone='7474419654',
             token='u33577.token',
             store_id=17795,
@@ -251,7 +253,7 @@ class CatalogTests(APITestCase):
             ]
         )
         account = UmagAccount.objects.create(
-            user=User.objects.create_user(email='sync@tvoymagazin.kz', password='tainy-parol-123'),
+            user=make_user(email='sync@tvoymagazin.kz', password='tainy-parol-123'),
             phone='7474419654',
             token='u33577.token',
             store_id=17795,
@@ -271,7 +273,7 @@ class CatalogTests(APITestCase):
 
 class UmagAccountTests(APITestCase):
     def setUp(self):
-        self.user = User.objects.create_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
+        self.user = make_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
         self.client.force_authenticate(self.user)
 
     def test_connect_exchanges_password_for_token(self):
@@ -338,7 +340,7 @@ class UmagAccountTests(APITestCase):
 
 class UmagSupplyTests(APITestCase):
     def setUp(self):
-        self.user = User.objects.create_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
+        self.user = make_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
         self.client.force_authenticate(self.user)
         self.account = UmagAccount.objects.create(
             user=self.user,
@@ -740,7 +742,7 @@ class UmagSupplyTests(APITestCase):
         self.assertEqual(response.status_code, 409)
 
     def test_other_user_invoice_is_hidden(self):
-        other = User.objects.create_user(email='other@tvoymagazin.kz', password='tainy-parol-123')
+        other = make_user(email='other@tvoymagazin.kz', password='tainy-parol-123')
         UmagAccount.objects.create(
             user=other,
             phone='7770000000',

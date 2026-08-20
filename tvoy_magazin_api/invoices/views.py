@@ -19,7 +19,11 @@ from .serializers import (
 
 
 class InvoiceQuerysetMixin:
-    """Накладные сотрудника — все, независимо от выбранного магазина.
+    """Накладные организации — все, независимо от выбранного магазина.
+
+    Отбираем по организации, а не по тому, кто загрузил: товар принимает
+    сменщик, а сверяет и отправляет в приёмку хозяин, и видеть они должны одно
+    и то же.
 
     По магазину отбирается только список: открытую накладную чужого магазина
     нужно и дочитать, и поправить, даже если в шапке уже переключились.
@@ -28,7 +32,7 @@ class InvoiceQuerysetMixin:
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        return Invoice.objects.filter(created_by=self.request.user)
+        return Invoice.objects.filter(organization=self.request.user.organization_id)
 
 
 class InvoiceListCreateView(InvoiceQuerysetMixin, generics.ListCreateAPIView):
@@ -53,7 +57,7 @@ class InvoiceListCreateView(InvoiceQuerysetMixin, generics.ListCreateAPIView):
         if tab == 'deleted':
             return _of_store(
                 Invoice.all_objects.filter(
-                    created_by=self.request.user,
+                    organization=self.request.user.organization_id,
                     deleted_at__isnull=False,
                 ),
                 self.request.user,
@@ -70,7 +74,11 @@ class InvoiceListCreateView(InvoiceQuerysetMixin, generics.ListCreateAPIView):
         return queryset
 
     def perform_create(self, serializer):
-        invoice = serializer.save(created_by=self.request.user, **_store(self.request.user))
+        invoice = serializer.save(
+            organization=self.request.user.organization,
+            created_by=self.request.user,
+            **_store(self.request.user),
+        )
         # Ответ уходит сразу, распознавание идёт в фоне — фронт опрашивает статус.
         tasks.schedule(invoice)
 
@@ -85,7 +93,10 @@ class InvoiceCountsView(InvoiceQuerysetMixin, APIView):
     def get(self, request):
         alive = _of_store(self.get_queryset(), request.user)
         deleted = _of_store(
-            Invoice.all_objects.filter(created_by=request.user, deleted_at__isnull=False),
+            Invoice.all_objects.filter(
+                organization=request.user.organization_id,
+                deleted_at__isnull=False,
+            ),
             request.user,
         )
 
@@ -112,7 +123,7 @@ class InvoiceDetailView(InvoiceQuerysetMixin, generics.RetrieveUpdateDestroyAPIV
     def get_queryset(self):
         # Удалённые открываются на чтение: их видно во вкладке списка, и
         # тыкать в строку, которая ведёт в никуда, странно.
-        return Invoice.all_objects.filter(created_by=self.request.user)
+        return Invoice.all_objects.filter(organization=self.request.user.organization_id)
 
     def update(self, request, *args, **kwargs):
         # Удалённую открывают только посмотреть — править там нечего.
@@ -162,7 +173,7 @@ class InvoiceLineView(generics.RetrieveUpdateDestroyAPIView):
     def get_queryset(self):
         return InvoiceLine.objects.filter(
             invoice__pk=self.kwargs['pk'],
-            invoice__created_by=self.request.user,
+            invoice__organization=self.request.user.organization_id,
             invoice__deleted_at__isnull=True,
         )
 

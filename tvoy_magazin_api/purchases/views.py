@@ -3,6 +3,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.permissions import ManagesOrganization
 from extensions.models import Extension, ExtensionInstall
 from umag.models import UmagAccount
 
@@ -19,9 +20,19 @@ class PlanningAccessView(APIView):
 
     Своего входа у него нет: оно работает поверх подключённого UMAG, поэтому
     подключение — это отметка, что сотрудник им пользуется.
+
+    Читать состояние может любой — иначе страница закупов не поймёт, показывать
+    ей план или приглашение подключиться. А вот подключать и отключать
+    расширения — дело владельца и администратора.
     """
 
     permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        if self.request.method in ('POST', 'DELETE'):
+            return [IsAuthenticated(), ManagesOrganization()]
+
+        return super().get_permissions()
 
     def get(self, request):
         return Response(_state(request.user))

@@ -155,7 +155,7 @@ def _prepare(request, pk):
     """Общее начало: чья накладная и есть ли доступ в UMAG."""
 
     invoice = generics.get_object_or_404(
-        Invoice.objects.filter(created_by=request.user),
+        Invoice.objects.filter(organization=request.user.organization_id),
         pk=pk,
     )
     account = _account(request)

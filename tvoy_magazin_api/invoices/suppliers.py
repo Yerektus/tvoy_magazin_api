@@ -52,10 +52,14 @@ def fill(invoice) -> None:
 
 
 def _known(invoice) -> list[dict]:
-    """Поставщики с БИН из прошлых накладных того же сотрудника."""
+    """Поставщики с БИН из прошлых накладных той же организации.
+
+    Не «того же сотрудника»: поставщик один на магазин, и БИН, однажды
+    прочитанный сменщиком, годится и накладной, которую завёл хозяин.
+    """
 
     rows = (
-        Invoice.objects.filter(created_by=invoice.created_by)
+        Invoice.objects.filter(organization=invoice.organization_id)
         .exclude(pk=invoice.pk)
         .exclude(supplier='')
         .exclude(supplier_bin='')
