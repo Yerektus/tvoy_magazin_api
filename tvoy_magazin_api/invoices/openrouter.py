@@ -306,10 +306,44 @@ class Parsed(NamedTuple):
     cost: float | None
 
 
-def parse_invoice(image_bytes: bytes, content_type: str) -> Parsed:
-    """Возвращает разобранные данные накладной, имя модели и цену запроса."""
+def parse_invoice(pages: list[tuple[bytes, str]]) -> Parsed:
+    """Возвращает разобранные данные накладной, имя модели и цену запроса.
 
-    data_url = f'data:{content_type};base64,{base64.b64encode(image_bytes).decode()}'
+    `pages` — листы документа по порядку, каждый парой «байты, тип». Обычно
+    лист один; когда позиции не поместились на страницу, их два и больше.
+
+    Все листы уходят в один запрос, а не разбираются по отдельности: шапка
+    стоит только на первом, а позиции второго — продолжение той же таблицы.
+    Разобрав их порознь, мы получили бы две накладные, у одной из которых нет
+    ни поставщика, ни номера.
+    """
+
+    if not pages:
+        raise OpenRouterError('Нечего разбирать: у накладной нет ни одного листа')
+
+    images = [
+        {
+            'type': 'image_url',
+            'image_url': {
+                'url': f'data:{content_type};base64,{base64.b64encode(image).decode()}'
+            },
+        }
+        for image, content_type in pages
+    ]
+
+    text = (
+        'Разбери накладную с фотографии. Сначала найди на листе '
+        'таблицу позиций и посмотри, где печать, а где рукописные правки.'
+    )
+
+    if len(pages) > 1:
+        text = (
+            f'Это одна накладная на {len(pages)} листах, снятая по частям. '
+            'Шапка — поставщик, номер, дата — есть только на первом листе, '
+            'на остальных продолжается таблица позиций. Собери все позиции со '
+            'всех листов в один список по порядку и не повторяй те, что уже '
+            'выписал. Посмотри, где печать, а где рукописные правки.'
+        )
 
     payload = {
         'model': settings.OPENROUTER_VISION_MODEL,
@@ -321,14 +355,7 @@ def parse_invoice(image_bytes: bytes, content_type: str) -> Parsed:
             {'role': 'system', 'content': SYSTEM_PROMPT},
             {
                 'role': 'user',
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': 'Разбери накладную с фотографии. Сначала найди на листе '
-                                'таблицу позиций и посмотри, где печать, а где рукописные правки.',
-                    },
-                    {'type': 'image_url', 'image_url': {'url': data_url}},
-                ],
+                'content': [{'type': 'text', 'text': text}, *images],
             },
         ],
         'response_format': {

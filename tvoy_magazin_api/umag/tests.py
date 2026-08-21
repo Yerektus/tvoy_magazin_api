@@ -11,7 +11,7 @@ from accounts.tests import make_user
 from invoices.models import Invoice, InvoiceLine
 from invoices.openrouter import OpenRouterError, Parsed
 
-from . import catalog, matching
+from . import catalog, matching, supply
 from .client import UmagClient, UmagError
 from .models import SupplierLink, UmagAccount, UmagProduct
 
@@ -71,8 +71,11 @@ class FakeUmag:
         self.answers = answers
         self.fail_on = answers.pop('fail_on', None)
 
-    def __call__(self, method, path, params=None, payload=None, auth=''):
-        self.calls.append({'method': method, 'path': path, 'params': params, 'payload': payload})
+    def __call__(self, method, path, params=None, payload=None, form=None, auth=''):
+        # Часть адресов кабинета принимает не JSON, а форму — запоминаем оба вида.
+        self.calls.append(
+            {'method': method, 'path': path, 'params': params, 'payload': payload or form}
+        )
 
         if self.fail_on and self.fail_on in path:
             raise UmagError('UMAG ответил 500', 500)
@@ -104,6 +107,9 @@ class FakeUmag:
             return self.answers.get('report', [])
         if path == 'opr/supplies/v2/create':
             return {'id': 122693174}
+        if path == 'org/agent/create':
+            agent = (form or {}).get('agentJson') or {}
+            return {**agent, 'id': 2100777}
 
         return {}
 
@@ -601,7 +607,9 @@ class UmagSupplyTests(APITestCase):
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.data['supply_id'], 122693174)
-        self.assertIn('122693174', response.data['url'])
+        # Ссылку на черновик собирает фронт: в адресе кабинета стоит порядковый
+        # номер магазина, а список магазинов есть только у него.
+        self.assertNotIn('url', response.data)
 
         header = fake.payload('/edit')
         self.assertEqual(header['supplierId'], 1832935)
@@ -718,13 +726,157 @@ class UmagSupplyTests(APITestCase):
         self.assertIsNone(self.invoice.umag_supply_id)
 
     def test_unchecked_invoice_is_not_sent(self):
+        """Порядок: сначала «Проверено», потом отправка. Непроверенную не берём."""
+
         self.invoice.status = Invoice.Status.DONE
         self.invoice.save(update_fields=('status',))
 
         with patch('umag.client._request', new=FakeUmag()):
-            response = self.client.post(f'/api/umag/invoices/{self.invoice.pk}/', {}, format='json')
+            response = self.client.post(
+                f'/api/umag/invoices/{self.invoice.pk}/',
+                {'agent_id': 1832935},
+                format='json',
+            )
 
         self.assertEqual(response.status_code, 409)
+        self.invoice.refresh_from_db()
+        self.assertIsNone(self.invoice.umag_supply_id)
+
+    def test_unknown_supplier_is_created_in_umag(self):
+        """Контрагента, которого в кабинете нет, заводим сами — иначе приёмку не создать."""
+
+        unknown = invoice_for(self.user, supplier='ТОО «КАРАВАН КАРАВАН»')
+        unknown.refresh_from_db()
+
+        fake = FakeUmag()
+        with patch('umag.client._request', new=fake):
+            supply.push(unknown, self.account)
+
+        created = fake.payload('org/agent/create')['agentJson']
+        self.assertEqual(created['name'], 'ТОО «КАРАВАН КАРАВАН»')
+        self.assertEqual(created['type'], 'SUPPLIER')
+        # Правовую форму берём из названия, а БИН не шлём: к нему кабинет
+        # требует ещё и юридическое название.
+        self.assertEqual(created['legalType'], 'ТОО')
+        self.assertEqual(created['bin'], '')
+
+        # Связка запомнена — второй раз того же поставщика заводить не нужно.
+        link = SupplierLink.objects.get(store_id=17795, agent_id=2100777)
+        self.assertEqual(link.agent_name, 'ТОО «КАРАВАН КАРАВАН»')
+
+    def test_supplier_with_namesakes_is_not_created(self):
+        """Тёзки в кабинете есть — выбирает человек, дубль не плодим."""
+
+        fake = FakeUmag()
+        with patch('umag.client._request', new=fake):
+            response = self.client.post(f'/api/umag/invoices/{self.invoice.pk}/', {}, format='json')
+
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn('org/agent/create', [call['path'] for call in fake.calls])
+
+    def test_preflight_creates_nobody(self):
+        """Осмотр — это чтение: смотреть на «Проверку» можно сколько угодно."""
+
+        unknown = invoice_for(self.user, supplier='ТОО «КАРАВАН КАРАВАН»')
+
+        fake = FakeUmag()
+        with patch('umag.client._request', new=fake):
+            self.client.get(f'/api/umag/invoices/{unknown.pk}/')
+
+        self.assertNotIn('org/agent/create', [call['path'] for call in fake.calls])
+        self.assertFalse(SupplierLink.objects.exists())
+
+    def test_legal_type_is_read_from_the_name(self):
+        self.assertEqual(supply._legal_type('ТОО «Караван»'), 'ТОО')
+        self.assertEqual(supply._legal_type('ИП Немельбаева'), 'ИП')
+        self.assertEqual(supply._legal_type('«Товарищество с ограниченной…»'), 'ТОО')
+        # Ничего не подсказывает — берём самое частое у поставщиков магазина.
+        self.assertEqual(supply._legal_type('Прайм Алко'), 'ТОО')
+
+    def test_account_state_carries_the_store_list(self):
+        """Без списка магазинов ссылка на приёмку ведёт не в тот магазин.
+
+        В адресе кабинета стоит порядковый номер магазина, и считает его фронт —
+        значит список должен приходить с обычным состоянием, а не только сразу
+        после входа.
+        """
+
+        # Список кабинет отдаёт при смене магазина — там он и запоминается.
+        with patch('umag.client._request', new=FakeUmag()):
+            self.client.patch('/api/umag/account/', {'store_id': 17796}, format='json')
+            response = self.client.get('/api/umag/account/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [store['id'] for store in response.data['stores']],
+            [17795, 17796],
+        )
+
+    def test_old_account_gets_its_stores_once(self):
+        """Учётки, заведённые до появления поля, дочитывают список один раз.
+
+        Иначе у них он остался бы пустым навсегда, а ссылка на приёмку снова
+        вела бы в первый магазин.
+        """
+
+        self.assertEqual(self.account.stores, [])
+
+        fake = FakeUmag()
+        with patch('umag.client._request', new=fake):
+            first = self.client.get('/api/umag/account/')
+            calls_after_first = len(fake.calls)
+            self.client.get('/api/umag/account/')
+
+        self.assertEqual([s['id'] for s in first.data['stores']], [17795, 17796])
+        # Второе чтение уже бесплатное: список лежит в базе.
+        self.assertEqual(len(fake.calls), calls_after_first)
+
+    def test_reading_state_does_not_touch_umag(self):
+        """Состояние читается из базы: поход в кабинет тут стоил бы 504.
+
+        Раньше список магазинов запрашивался на каждое чтение. UMAG отвечает не
+        быстро, и страница вставала на его время — на проде это заканчивалось
+        таймаутом шлюза.
+        """
+
+        self.account.stores = [{'id': 17795, 'name': 'Каратал Ерентал'}]
+        self.account.save(update_fields=('stores',))
+
+        fake = FakeUmag()
+        with patch('umag.client._request', new=fake):
+            response = self.client.get('/api/umag/account/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['stores'], self.account.stores)
+        self.assertEqual(fake.calls, [], 'чтение состояния не должно ходить в UMAG')
+
+    def test_unknown_supplier_is_not_a_blocker_anymore(self):
+        """Осмотр не должен ругаться на то, что отправка починит сама.
+
+        Фронт по первой же проблеме показывает ошибку и до отправки не доходит,
+        поэтому «нет в UMAG» здесь означало бы, что контрагент не заведётся уже
+        никогда.
+        """
+
+        unknown = invoice_for(self.user, supplier='ТОО «КАРАВАН КАРАВАН»')
+
+        with patch('umag.client._request', new=FakeUmag()):
+            response = self.client.get(f'/api/umag/invoices/{unknown.pk}/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data['ready'], response.data['problems'])
+        self.assertEqual(response.data['problems'], [])
+
+    def test_nameless_supplier_still_blocks(self):
+        """А вот пустое название заводить нечем — тут нужен человек."""
+
+        nameless = invoice_for(self.user, supplier='')
+
+        with patch('umag.client._request', new=FakeUmag()):
+            response = self.client.get(f'/api/umag/invoices/{nameless.pk}/')
+
+        self.assertFalse(response.data['ready'])
+        self.assertIn('не распознан', response.data['problems'][0])
 
     def test_invoice_is_sent_only_once(self):
         self.invoice.umag_supply_id = 122693174

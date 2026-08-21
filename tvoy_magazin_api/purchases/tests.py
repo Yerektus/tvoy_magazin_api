@@ -41,7 +41,7 @@ class FakeReport:
         self.by_supplier = by_supplier or {}
         self.calls = []
 
-    def __call__(self, method, path, params=None, payload=None, auth=''):
+    def __call__(self, method, path, params=None, payload=None, form=None, auth=''):
         self.calls.append(path)
         params = params or {}
 

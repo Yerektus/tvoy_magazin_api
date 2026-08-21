@@ -1,5 +1,6 @@
 import io
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -7,6 +8,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
+from django.db.models import Sum
 from django.test import SimpleTestCase, override_settings
 from PIL import Image, ImageDraw
 from rest_framework.test import APITestCase
@@ -539,6 +541,71 @@ class InvoiceTests(APITestCase):
         # Прочитанное с фото сохранилось: с ним человеку сверяться.
         self.assertEqual(response.data['id'], Invoice.objects.get(pk=response.data['id']).pk)
 
+    def test_two_pages_go_to_the_model_as_one_document(self):
+        """Накладная на двух листах — один документ, а не два.
+
+        Оба листа уходят в один запрос: шапка есть только на первом, и разбери
+        мы их порознь, у второго не было бы ни поставщика, ни номера.
+        """
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT) as model:
+            response = self.client.post(
+                '/api/invoices/',
+                {'image': photo(), 'pages': photo()},
+                format='multipart',
+            )
+
+        self.assertEqual(response.status_code, 201)
+
+        # Разбор был один, и в нём оба листа по порядку.
+        self.assertEqual(model.call_count, 1)
+        (pages,) = model.call_args.args
+        self.assertEqual(len(pages), 2)
+
+        invoice = Invoice.objects.get(pk=response.data['id'])
+        self.assertEqual(invoice.pages.count(), 1)
+        self.assertEqual(invoice.pages.first().position, 2)
+
+    def test_card_shows_every_page(self):
+        """В карточке — все листы по порядку, первым тот, что в накладной."""
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            created = self.client.post(
+                '/api/invoices/',
+                {'image': photo(), 'pages': photo()},
+                format='multipart',
+            )
+
+        card = self.client.get(f'/api/invoices/{created.data["id"]}/')
+        self.assertEqual(len(card.data['images']), 2)
+        # Первый лист тот же, что и одиночный снимок: старые клиенты берут его.
+        self.assertTrue(card.data['images'][0].endswith(card.data['image'].split('/')[-1]))
+
+    def test_single_page_invoice_still_has_one_image(self):
+        """Без второго листа ничего не меняется: в списке один снимок."""
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        card = self.client.get(f'/api/invoices/{created.data["id"]}/')
+        self.assertEqual(len(card.data['images']), 1)
+        self.assertEqual(Invoice.objects.get(pk=created.data['id']).pages.count(), 0)
+
+    def test_broken_extra_page_is_refused(self):
+        """Второй лист проверяем так же, как первый."""
+
+        broken = SimpleUploadedFile('notes.txt', b'not a photo', content_type='text/plain')
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            response = self.client.post(
+                '/api/invoices/',
+                {'image': photo(), 'pages': broken},
+                format='multipart',
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(Invoice.objects.count(), 0)
+
     def test_model_reads_the_compressed_photo(self):
         """Снимок с айфона отдаём моделью уже сжатым: HEIC читают не все."""
 
@@ -550,9 +617,9 @@ class InvoiceTests(APITestCase):
         ):
             self.client.post('/api/invoices/', {'image': heic}, format='multipart')
 
-        image, content_type = model.call_args.args
-        self.assertEqual(content_type, 'image/jpeg')
-        self.assertEqual(image, COMPRESSED)
+        # Модель получает список листов; лист тут один.
+        (pages,) = model.call_args.args
+        self.assertEqual(pages, [(COMPRESSED, 'image/jpeg')])
 
     def test_heic_goes_as_is_when_it_cannot_be_processed(self):
         """Обработать снимок не вышло — отправляем оригинал, а не падаем."""
@@ -565,7 +632,8 @@ class InvoiceTests(APITestCase):
         ):
             self.client.post('/api/invoices/', {'image': heic}, format='multipart')
 
-        self.assertEqual(model.call_args.args[1], 'image/heic')
+        (pages,) = model.call_args.args
+        self.assertEqual(pages[0][1], 'image/heic')
 
     def test_list_shows_only_invoices_of_chosen_store(self):
         """Магазин переключают в шапке — список документов меняется вместе с ним."""
@@ -887,6 +955,188 @@ class InvoiceTests(APITestCase):
         self.assertEqual(line.name, 'Пепси 1 л')
         self.assertEqual(str(line.quantity), '48.000')
         self.assertEqual(str(line.price), '540.00')
+
+    def linked_umag(self):
+        """Подключённый кабинет: без него сопоставлять не с чем."""
+
+        return UmagAccount.objects.create(
+            user=self.user,
+            phone='7474419654',
+            token='u33577.token',
+            store_id=17795,
+            store_name='Каратал Ерентал',
+        )
+
+    def test_new_barcode_finds_product_again(self):
+        """Штрихкод поправили — товар ищется в кабинете сразу, а не при отправке.
+
+        Круг целиком: чужой штрихкод сбивает сопоставление, верный находит его
+        заново. Раньше строка так и оставалась пустой до проверки накладной.
+        """
+
+        self.linked_umag()
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT), patch(
+            'umag.client._request', new=FakeUmag()
+        ):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        invoice_id = created.data['id']
+        line = Invoice.objects.get(pk=invoice_id).lines.first()
+        self.assertEqual(line.umag_product_id, 132421277)
+
+        def edit(barcode):
+            with patch('umag.client._request', new=FakeUmag()):
+                self.client.patch(
+                    f'/api/invoices/{invoice_id}/lines/{line.pk}/',
+                    {'barcode': barcode},
+                    format='json',
+                )
+            line.refresh_from_db()
+
+        # Такого штрихкода в кабинете нет — товар отвязывается.
+        edit('9999999999999')
+        self.assertIsNone(line.umag_product_id)
+        self.assertEqual(line.umag_product_name, '')
+
+        # Вернули верный — товар находится снова, без всякой отправки.
+        edit('4870145005545')
+        self.assertEqual(line.umag_product_id, 132421277)
+        self.assertEqual(line.umag_product_name, 'Напиток PEPSI-COLA ПЭТ 1.0')
+        # Штрихкод с бумаги — сопоставление точное, без оценки модели.
+        self.assertEqual(line.umag_confidence, 1.0)
+
+    def test_name_edit_does_not_call_umag(self):
+        """Правка названия в кабинет не ходит: по имени выбирает модель."""
+
+        self.linked_umag()
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT), patch(
+            'umag.client._request', new=FakeUmag()
+        ):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        invoice_id = created.data['id']
+        line = Invoice.objects.get(pk=invoice_id).lines.first()
+        umag = FakeUmag()
+
+        with patch('umag.client._request', new=umag):
+            self.client.patch(
+                f'/api/invoices/{invoice_id}/lines/{line.pk}/',
+                {'name': 'Совсем другой товар'},
+                format='json',
+            )
+
+        self.assertEqual(umag.calls, [])
+        line.refresh_from_db()
+        self.assertIsNone(line.umag_product_id)
+
+    def test_broken_umag_does_not_break_barcode_edit(self):
+        """Кабинет лёг — правка всё равно сохраняется, просто без товара."""
+
+        self.linked_umag()
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT), patch(
+            'umag.client._request', new=FakeUmag()
+        ):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        invoice_id = created.data['id']
+        line = Invoice.objects.get(pk=invoice_id).lines.first()
+
+        with patch('umag.client._request', new=FakeUmag(fail_on='findProductByBarcode')):
+            response = self.client.patch(
+                f'/api/invoices/{invoice_id}/lines/{line.pk}/',
+                {'barcode': '4870145005545'},
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 200)
+        line.refresh_from_db()
+        self.assertEqual(line.barcode, '4870145005545')
+
+    def test_edit_recounts_line_total(self):
+        """Поправили количество — сумма строки и итог накладной идут следом.
+
+        Без этого на экране остаётся сумма от прежних чисел: количество 10,
+        цена 270, а рядом 18 900 от прошлых семидесяти.
+        """
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        invoice_id = created.data['id']
+        invoice = Invoice.objects.get(pk=invoice_id)
+        line = invoice.lines.first()
+        others = invoice.lines.exclude(pk=line.pk).aggregate(Sum('total'))['total__sum'] or 0
+
+        self.client.patch(
+            f'/api/invoices/{invoice_id}/lines/{line.pk}/',
+            {'quantity': '10', 'price': '270'},
+            format='json',
+        )
+
+        line.refresh_from_db()
+        invoice.refresh_from_db()
+        self.assertEqual(str(line.total), '2700.00')
+        self.assertEqual(invoice.total, Decimal('2700.00') + others)
+
+    def test_edit_of_price_alone_recounts_total(self):
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        invoice_id = created.data['id']
+        line = Invoice.objects.get(pk=invoice_id).lines.first()
+
+        # Количество в первой строке — 60, цену ставим ровную.
+        self.client.patch(
+            f'/api/invoices/{invoice_id}/lines/{line.pk}/',
+            {'price': '100'},
+            format='json',
+        )
+
+        line.refresh_from_db()
+        self.assertEqual(str(line.total), '6000.00')
+
+    def test_hand_written_total_is_not_overwritten(self):
+        """На бумаге сумма бывает не равна произведению — скидка, округление.
+
+        Раз человек вписал её сам, наша арифметика к ней не относится.
+        """
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        invoice_id = created.data['id']
+        line = Invoice.objects.get(pk=invoice_id).lines.first()
+
+        self.client.patch(
+            f'/api/invoices/{invoice_id}/lines/{line.pk}/',
+            {'quantity': '10', 'price': '270', 'total': '2500'},
+            format='json',
+        )
+
+        line.refresh_from_db()
+        self.assertEqual(str(line.total), '2500.00')
+
+    def test_edit_without_quantity_leaves_total_alone(self):
+        """Правка названия к арифметике отношения не имеет."""
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        invoice_id = created.data['id']
+        line = Invoice.objects.get(pk=invoice_id).lines.first()
+        was = line.total
+
+        self.client.patch(
+            f'/api/invoices/{invoice_id}/lines/{line.pk}/',
+            {'name': 'Другое название'},
+            format='json',
+        )
+
+        line.refresh_from_db()
+        self.assertEqual(line.total, was)
 
     def test_edit_forgets_matched_product(self):
         """Строку переписали — прежний товар из UMAG к ней уже не относится."""

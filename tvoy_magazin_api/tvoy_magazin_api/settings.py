@@ -277,12 +277,6 @@ UMAG_API_VERSION = os.environ.get('UMAG_API_VERSION', '1.4')
 UMAG_CLIENT_VERSION = os.environ.get('UMAG_CLIENT_VERSION', 'angular_cabinet_20.0.24')
 UMAG_TIMEOUT = int(os.environ.get('UMAG_TIMEOUT', '30'))
 
-# Ссылка на созданный черновик — её показываем человеку после отправки.
-UMAG_SUPPLY_URL = os.environ.get(
-    'UMAG_SUPPLY_URL',
-    'https://web.umag.kz/store/0/supplies/{id}/edit',
-)
-
 # Сколько накладных разбираем одновременно.
 INVOICE_PARSE_CONCURRENCY = int(os.environ.get('INVOICE_PARSE_CONCURRENCY', '1'))
 

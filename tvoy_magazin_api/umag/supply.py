@@ -52,7 +52,7 @@ def push(invoice, account, agent_id: int | None = None) -> int:
     if agent_id:
         _remember_supplier(invoice, client, agent_id)
 
-    supplier, matches, problems = _inspect(invoice, client)
+    supplier, matches, problems = _inspect(invoice, client, create_supplier=True)
 
     if problems:
         raise NotReady('; '.join(problems))
@@ -113,6 +113,30 @@ def match_lines(invoice) -> None:
     catalog.refresh_later(account)
 
 
+def rematch_line(line) -> None:
+    """Штрихкод в строке поправили — ищем товар в кабинете заново.
+
+    Прежнее сопоставление к строке уже не относится, а новое можно найти сразу:
+    штрихкод — точный ключ, и ждать до отправки, чтобы человек увидел, тот ли
+    товар подобрался, незачем.
+
+    Молча ничего не делаем, если кабинет не подключён или недоступен: правка
+    строки — не то место, где человека стоит останавливать чужой ошибкой.
+    Сопоставление тогда найдётся при следующей проверке накладной.
+    """
+
+    invoice = line.invoice
+    account = UmagAccount.objects.filter(user=invoice.created_by).first()
+
+    if account is None or not account.ready or not line.barcode:
+        return
+
+    try:
+        _match_line(line, UmagClient(account, invoice.umag_store_id))
+    except UmagError:
+        return
+
+
 def normalize(name: str) -> str:
     """«ТОО «Жасар-Сауда»» и «жасар сауда» — один и тот же поставщик."""
 
@@ -120,10 +144,15 @@ def normalize(name: str) -> str:
     return re.sub(r'\s+', ' ', re.sub(r'[^0-9a-zа-яё]+', ' ', lowered)).strip()
 
 
-def _inspect(invoice, client) -> tuple[dict, list[dict], list[str]]:
-    """Один проход по накладной: поставщик, строки и список претензий."""
+def _inspect(invoice, client, create_supplier: bool = False) -> tuple[dict, list[dict], list[str]]:
+    """Один проход по накладной: поставщик, строки и список претензий.
 
-    supplier = _match_supplier(invoice, client)
+    `create_supplier` включает отправка: незнакомого контрагента заводим в
+    UMAG сами. При обычном осмотре (`preflight`) он выключен — смотреть на
+    вкладку «Проверка» можно сколько угодно, и записей от этого не прибавится.
+    """
+
+    supplier = _match_supplier(invoice, client, create=create_supplier)
     matches = [_match_line(line, client) for line in invoice.lines.all()]
 
     # Строки без штрихкода достаются модели: уверенный выбор она впишет сама.
@@ -140,12 +169,15 @@ def _inspect(invoice, client) -> tuple[dict, list[dict], list[str]]:
 
     problems = []
 
-    if not supplier['agent_id']:
-        problems.append(
-            'Выберите поставщика в UMAG'
-            if supplier['candidates']
-            else f'Поставщика «{invoice.supplier or "без названия"}» нет в UMAG — заведите контрагента'
-        )
+    # Незнакомого контрагента заводим сами при отправке, поэтому помехой он
+    # больше не считается — иначе осмотр вечно сообщал бы «нет в UMAG», а
+    # фронт по этому сообщению до самой отправки бы и не доходил.
+    # Остаётся один случай: тёзок несколько, и выбрать должен человек.
+    if not supplier['agent_id'] and supplier['candidates']:
+        problems.append('Выберите поставщика в UMAG')
+
+    if not supplier['agent_id'] and not supplier['candidates'] and not (invoice.supplier or '').strip():
+        problems.append('Поставщик в накладной не распознан — впишите название')
 
     if not matches:
         problems.append('В накладной нет позиций')
@@ -214,8 +246,11 @@ def _doc_millis(invoice) -> int:
     return int(moment.timestamp() * 1000)
 
 
-def _match_supplier(invoice, client) -> dict:
-    """Ищет контрагента: сперва прошлый выбор, потом одноимённые кандидаты."""
+def _match_supplier(invoice, client, create: bool = False) -> dict:
+    """Ищет контрагента: сперва прошлый выбор, потом одноимённые кандидаты.
+
+    Не нашёлся ни один и `create` включён — заводим его в UMAG сами.
+    """
 
     name = normalize(invoice.supplier)
     # Связки живут по магазинам: в каждом свои контрагенты.
@@ -239,11 +274,103 @@ def _match_supplier(invoice, client) -> dict:
     # кабинете поставщики задвоены, и не всё равно, на какого вешать приёмку.
     chosen = candidates[0] if len(candidates) == 1 else None
 
+    # Тёзок нет вовсе — значит такого поставщика в кабинете ещё не заводили.
+    # Когда есть из кого выбрать, молча создавать нельзя: получился бы дубль.
+    if not candidates and create:
+        return _create_supplier(invoice, client)
+
     return {
         'name': invoice.supplier,
         'agent_id': chosen['id'] if chosen else None,
         'agent_name': chosen['name'] if chosen else '',
         'candidates': candidates,
+    }
+
+
+# Правовая форма для карточки контрагента. UMAG принимает только эти значения,
+# а угадать её можно по тому, как поставщик подписан в накладной.
+LEGAL_TYPES = (
+    ('ТОО', ('тоо', 'товарищество')),
+    ('ИП', ('ип', 'индивидуальный предприниматель')),
+    ('AO', ('ао', 'акционерное')),
+    ('РГКП', ('ргкп',)),
+    ('РГП', ('ргп',)),
+    ('ОО', ('оо ', 'общественное')),
+)
+DEFAULT_LEGAL_TYPE = 'ТОО'
+
+
+def _legal_type(name: str) -> str:
+    """Правовая форма по названию из накладной: «ТОО «Караван»» → ТОО."""
+
+    lowered = (name or '').lower().lstrip(' "«\'')
+
+    for legal_type, prefixes in LEGAL_TYPES:
+        if any(lowered.startswith(prefix) for prefix in prefixes):
+            return legal_type
+
+    return DEFAULT_LEGAL_TYPE
+
+
+def _create_supplier(invoice, client) -> dict:
+    """Заводит контрагента в UMAG по названию из накладной.
+
+    Без контрагента приёмку не создать, а руками его заводят в кабинете —
+    поэтому делаем это сами. Зовётся только из `push`: `preflight` обязан
+    оставаться чтением, иначе один взгляд на вкладку «Проверка» плодил бы
+    контрагентов.
+
+    БИН не отправляем намеренно: кабинет требует к заполненному БИН ещё и
+    юридическое название, а его в накладной обычно нет. Допишет человек.
+    """
+
+    name = (invoice.supplier or '').strip()
+
+    if not name:
+        return {'name': '', 'agent_id': None, 'agent_name': '', 'candidates': []}
+
+    # Кабинет шлёт контрагента формой, а сам объект — строкой в `agentJson`.
+    # На обычный JSON этот адрес отвечает 415.
+    created = client.post_form(
+        'org/agent/create',
+        {'agentJson': {
+            'id': None,
+            'type': 'SUPPLIER',
+            'name': name,
+            'bin': '',
+            'legalType': _legal_type(name),
+            'legalName': '',
+            'companyId': '',
+            'storeId': '',
+            'legalAddress': '',
+            'actualAddress': '',
+            'phone': '',
+            'note': '',
+            'isDeleted': False,
+            'editTime': '',
+        }},
+    )
+
+    agent_id = created.get('id') if isinstance(created, dict) else None
+
+    if not agent_id:
+        raise UmagError(f'UMAG не вернул контрагента: {str(created)[:200]}')
+
+    agent_name = (created.get('name') or name).strip()
+
+    # Запоминаем сразу: второй раз того же поставщика заводить не нужно.
+    SupplierLink.objects.update_or_create(
+        store_id=client.store_id,
+        name=normalize(name),
+        defaults={'agent_id': agent_id, 'agent_name': agent_name},
+    )
+    logger.info('Завели контрагента «%s» (%s) в магазине %s', agent_name, agent_id, client.store_id)
+
+    return {
+        'name': invoice.supplier,
+        'agent_id': agent_id,
+        'agent_name': agent_name,
+        'candidates': [],
     }
 
 

@@ -134,6 +134,38 @@ class Invoice(models.Model):
         self.save(update_fields=('deleted_at',))
 
 
+class InvoicePage(models.Model):
+    """Второй и следующие листы накладной.
+
+    Первый лист лежит в самой накладной (`Invoice.image`): он один у
+    подавляющего большинства документов, и на нём шапка — поставщик, номер,
+    дата. Сюда попадают только продолжения, когда позиции не поместились на
+    одну страницу.
+
+    Модели все листы уходят разом, одним документом: строки на втором листе
+    продолжают нумерацию первого, а шапки у него нет вовсе.
+    """
+
+    invoice = models.ForeignKey(
+        Invoice,
+        verbose_name='накладная',
+        on_delete=models.CASCADE,
+        related_name='pages',
+    )
+    image = models.FileField('лист накладной', upload_to='invoices/%Y/%m')
+
+    # Со второго: первый лист — это `Invoice.image`.
+    position = models.PositiveSmallIntegerField('№ листа', default=2)
+
+    class Meta:
+        verbose_name = 'лист накладной'
+        verbose_name_plural = 'листы накладной'
+        ordering = ('position',)
+
+    def __str__(self):
+        return f'лист {self.position}'
+
+
 class InvoiceLine(models.Model):
     """Позиция накладной — только то, что реально есть в бумаге."""
 

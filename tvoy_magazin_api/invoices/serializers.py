@@ -83,10 +83,30 @@ class InvoiceDetailSerializer(InvoiceListSerializer):
     # Выпрямленный снимок — его и показываем. Пусто, если лист на фото найти
     # не удалось: тогда просмотрщик откатывается на `image`.
     preview = serializers.FileField(read_only=True)
+    images = serializers.SerializerMethodField()
 
     class Meta(InvoiceListSerializer.Meta):
-        fields = InvoiceListSerializer.Meta.fields + ('image', 'preview', 'model', 'lines')
+        fields = InvoiceListSerializer.Meta.fields + (
+            'image',
+            'images',
+            'preview',
+            'model',
+            'lines',
+        )
         read_only_fields = tuple(set(fields) - {'supplier', 'supplier_bin'})
+
+    def get_images(self, invoice) -> list[str]:
+        """Все листы по порядку, первым — тот, что в самой накладной.
+
+        Одним списком, а не «image плюс отдельно остальные»: смотрящему всё
+        равно, где какой лист хранится, ему нужно пролистать документ.
+        """
+
+        request = self.context.get('request')
+        files = [invoice.preview or invoice.image, *(page.image for page in invoice.pages.all())]
+        urls = [image.url for image in files if image]
+
+        return [request.build_absolute_uri(url) for url in urls] if request else urls
 
     def update(self, invoice, validated_data):
         # БИН вписали руками — значит он из бумаги, а не подставлен моделью по
@@ -104,13 +124,23 @@ class InvoiceCreateSerializer(serializers.ModelSerializer):
         read_only_fields = ('id', 'status')
 
     def validate_image(self, image):
-        if image.size > MAX_IMAGE_SIZE:
-            raise serializers.ValidationError('Файл больше 15 МБ')
+        return check_photo(image)
 
-        known_type = image.content_type in ALLOWED_TYPES
-        known_name = image.name.lower().endswith(ALLOWED_EXTENSIONS)
 
-        if not known_type and not known_name:
-            raise serializers.ValidationError('Нужен файл JPEG, PNG, WEBP, HEIC или PDF')
+def check_photo(image):
+    """Годится ли файл в снимок накладной.
 
-        return image
+    Отдельной функцией, а не только методом сериализатора: те же проверки нужны
+    для второго и следующих листов, которые приходят рядом с первым.
+    """
+
+    if image.size > MAX_IMAGE_SIZE:
+        raise serializers.ValidationError('Файл больше 15 МБ')
+
+    known_type = getattr(image, 'content_type', '') in ALLOWED_TYPES
+    known_name = image.name.lower().endswith(ALLOWED_EXTENSIONS)
+
+    if not known_type and not known_name:
+        raise serializers.ValidationError('Нужен файл JPEG, PNG, WEBP, HEIC или PDF')
+
+    return image

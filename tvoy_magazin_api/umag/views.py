@@ -1,4 +1,5 @@
-from django.conf import settings
+import logging
+
 from rest_framework import generics, status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -13,6 +14,8 @@ from .client import UmagAuthError, UmagError
 from .models import UmagAccount
 from .serializers import UmagAccountSerializer, UmagConnectSerializer, UmagStoreSerializer
 
+logger = logging.getLogger(__name__)
+
 # Код UMAG в каталоге расширений: на нём стоят надстройки вроде планирования.
 SLUG = 'umag'
 
@@ -23,8 +26,10 @@ class UmagAccountView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        account = _account(request)
-        return Response(_state(account))
+        # Отдаём то, что лежит в базе, — включая сохранённый список магазинов.
+        # Он нужен фронту для ссылки на приёмку: в адресе кабинета стоит
+        # порядковый номер магазина, а не его id.
+        return Response(_state(_fill_stores(_account(request))))
 
     def post(self, request):
         """Телефон и пароль в обмен на токен сессии."""
@@ -130,6 +135,9 @@ class UmagSupplyView(APIView):
         if refusal:
             return refusal
 
+        # Порядок такой: сначала человек отмечает накладную проверенной, и
+        # только потом её можно отправить. Иначе в кабинет уехало бы то, что
+        # никто не сверял с бумагой.
         if invoice.status != Invoice.Status.CHECKED:
             return Response(
                 {'detail': 'Сначала отметьте накладную проверенной'},
@@ -145,8 +153,10 @@ class UmagSupplyView(APIView):
         agent_id = request.data.get('agent_id') or None
 
         def send():
-            supply_id = supply.push(invoice, account, agent_id)
-            return {'supply_id': supply_id, 'url': settings.UMAG_SUPPLY_URL.format(id=supply_id)}
+            # Ссылку на черновик собирает фронт: в адресе кабинета стоит не
+            # номер магазина, а его порядковый номер в списке, и знает этот
+            # список именно фронт.
+            return {'supply_id': supply.push(invoice, account, agent_id)}
 
         return _run(send, ok=status.HTTP_201_CREATED)
 
@@ -196,14 +206,46 @@ def _set_store(account, store: dict) -> None:
     account.save(update_fields=('store_id', 'store_name', 'refreshed_at'))
 
 
+def _fill_stores(account):
+    """Дописывает список магазинов учётке, заведённой до появления этого поля.
+
+    Ходит в кабинет один раз на учётку, а не на каждое чтение: именно поход на
+    каждое чтение когда-то и упирался в таймаут шлюза. Кабинет недоступен —
+    оставляем пусто и попробуем в следующий раз, страницу из-за этого не роняем.
+    """
+
+    if account is None or account.stores or not account.token:
+        return account
+
+    try:
+        stores = umag_client.stores(account.token)
+    except UmagError as error:
+        logger.warning('Не удалось дочитать магазины UMAG: %s', error)
+        return account
+
+    account.stores = _stores(stores)
+    account.save(update_fields=('stores', 'refreshed_at'))
+
+    return account
+
+
 def _state(account, stores: list | None = None) -> dict:
+    """Состояние подключения для фронта.
+
+    `stores` передают там, где кабинет только что отдал свежий список, — вход и
+    смена магазина. Тогда он заодно сохраняется, чтобы следующее чтение
+    обошлось без похода в UMAG.
+    """
+
     if account is None:
-        state = {'connected': False, 'phone': '', 'store_id': None, 'store_name': ''}
-    else:
-        state = UmagAccountSerializer(account).data
+        return {'connected': False, 'phone': '', 'store_id': None, 'store_name': ''}
 
     if stores is not None:
-        state['stores'] = _stores(stores)
+        account.stores = _stores(stores)
+        account.save(update_fields=('stores', 'refreshed_at'))
+
+    state = UmagAccountSerializer(account).data
+    state['stores'] = account.stores
 
     return state
 

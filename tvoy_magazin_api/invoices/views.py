@@ -1,3 +1,5 @@
+from decimal import ROUND_HALF_UP, Decimal
+
 from django.db.models import Q, Sum
 from rest_framework import generics, status
 from rest_framework.parsers import FormParser, MultiPartParser
@@ -5,16 +7,17 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from umag import matching
+from umag import matching, supply
 from umag.models import UmagAccount
 
 from . import tasks
-from .models import Invoice, InvoiceLine
+from .models import Invoice, InvoiceLine, InvoicePage
 from .serializers import (
     InvoiceCreateSerializer,
     InvoiceDetailSerializer,
     InvoiceLineSerializer,
     InvoiceListSerializer,
+    check_photo,
 )
 
 
@@ -73,12 +76,32 @@ class InvoiceListCreateView(InvoiceQuerysetMixin, generics.ListCreateAPIView):
 
         return queryset
 
+    #: Больше листов у накладной не бывает — это защита от случайной пачки, а
+    #: не ограничение по смыслу: разбор всех листов идёт одним запросом к
+    #: модели, и десяток фотографий в нём стоил бы дорого и читался бы хуже.
+    MAX_PAGES = 5
+
     def perform_create(self, serializer):
+        # Остальные листы приходят рядом с первым, полем `pages`: накладную на
+        # две страницы снимают в один заход, и делать из неё два документа —
+        # значит потерять шапку у второго.
+        extra = self.request.FILES.getlist('pages')[: self.MAX_PAGES - 1]
+        for image in extra:
+            check_photo(image)
+
         invoice = serializer.save(
             organization=self.request.user.organization,
             created_by=self.request.user,
             **_store(self.request.user),
         )
+
+        InvoicePage.objects.bulk_create(
+            [
+                InvoicePage(invoice=invoice, image=image, position=number)
+                for number, image in enumerate(extra, start=2)
+            ]
+        )
+
         # Ответ уходит сразу, распознавание идёт в фоне — фронт опрашивает статус.
         tasks.schedule(invoice)
 
@@ -178,13 +201,22 @@ class InvoiceLineView(generics.RetrieveUpdateDestroyAPIView):
         )
 
     def perform_update(self, serializer):
+        changed = set(serializer.validated_data)
         line = serializer.save()
 
         # Название или штрихкод поправили — прежнее сопоставление с товаром
-        # UMAG к строке больше не относится, при следующей проверке ищем заново.
-        if {'name', 'barcode'} & set(serializer.validated_data):
+        # UMAG к строке больше не относится.
+        if {'name', 'barcode'} & changed:
             matching.forget(line)
 
+            # Штрихкод — точный ключ: по нему товар находится сразу, и ждать
+            # проверки накладной, чтобы увидеть, тот ли он, незачем. По одному
+            # названию так не выйдет — там выбирает модель, и делает это разбор
+            # целиком, а не правка одной строки.
+            if 'barcode' in changed:
+                supply.rematch_line(line)
+
+        _recount(line, changed)
         _refresh_total(line.invoice)
 
     def perform_destroy(self, instance):
@@ -227,6 +259,30 @@ def _of_store(queryset, user):
 
 def _account(user):
     return UmagAccount.objects.filter(user=user).first()
+
+
+def _recount(line, changed: set) -> None:
+    """Пересчитывает сумму строки после правки количества или цены.
+
+    Иначе на экране остаётся сумма от прежних чисел: поправили количество с 70
+    на 10, а рядом по-прежнему стоит 18 900 — и она же уходит в итог накладной.
+
+    Сумму, вписанную руками в том же запросе, не трогаем: на бумаге она бывает
+    не равна произведению — скидка, округление, НДС строкой. Человек видит
+    бумагу, а мы нет.
+    """
+
+    if 'total' in changed or not {'quantity', 'price'} & changed:
+        return
+
+    if line.quantity is None or line.price is None:
+        return
+
+    total = (line.quantity * line.price).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+    if total != line.total:
+        line.total = total
+        line.save(update_fields=('total',))
 
 
 def _refresh_total(invoice):

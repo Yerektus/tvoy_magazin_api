@@ -67,13 +67,14 @@ def run(invoice_id: int) -> None:
         # целиком — иначе накладная вернулась бы в «очередь» до самого конца.
         invoice.status = Invoice.Status.PROCESSING
 
-        # Снимок готовим до разбора: на упавшую накладную человек всё равно
+        # Снимки готовим до разбора: на упавшую накладную человек всё равно
         # захочет посмотреть глазами.
         prepare_photo(invoice)
+        for page in invoice.pages.all():
+            prepare_photo(page)
 
         try:
-            image, content_type = _for_model(invoice)
-            parsed = parse_invoice(image, content_type)
+            parsed = parse_invoice(_for_model(invoice))
 
             _save(invoice, parsed)
             # Модель прочитала текст и заодно сказала, где у документа верх, —
@@ -93,8 +94,8 @@ def run(invoice_id: int) -> None:
             _fail(invoice, f'Внутренняя ошибка: {error}')
 
 
-def _for_model(invoice: Invoice) -> tuple[bytes, str]:
-    """Чем кормить модель — сжатым снимком накладной.
+def _for_model(invoice: Invoice) -> list[tuple[bytes, str]]:
+    """Чем кормить модель — сжатыми снимками всех листов накладной, по порядку.
 
     `preview` заполнен только у накладных, загруженных когда второй файл ещё
     делался: у них в `image` лежит сырой HEIC, который читают не все модели.
@@ -103,27 +104,35 @@ def _for_model(invoice: Invoice) -> tuple[bytes, str]:
 
     if invoice.preview:
         with invoice.preview.open('rb') as jpeg:
-            return jpeg.read(), 'image/jpeg'
+            first = (jpeg.read(), 'image/jpeg')
+    else:
+        first = _read(invoice.image)
 
-    with invoice.image.open('rb') as image:
-        return image.read(), content_type_for(invoice.image.name)
+    return [first, *(_read(page.image) for page in invoice.pages.all())]
 
 
-def prepare_photo(invoice: Invoice) -> bool:
+def _read(field) -> tuple[bytes, str]:
+    with field.open('rb') as image:
+        return image.read(), content_type_for(field.name)
+
+
+def prepare_photo(holder) -> bool:
     """Сжимает загруженный снимок, заменяя им сырой файл.
 
-    Снимок на накладную один: сырой оригинал с телефона втрое тяжелее, а
-    нужен ровно тем же — и браузеру, и модели, и будущей обучающей выборке.
-    Ровно его потом и довернём, когда модель скажет, где у документа верх.
+    `holder` — накладная или её лист: у обоих снимок лежит в поле `image`, и
+    делать с ним нужно одно и то же. Копии снимка не держим: сырой оригинал с
+    телефона втрое тяжелее, а нужен ровно тем же — и браузеру, и модели, и
+    будущей обучающей выборке. Ровно его потом и довернём, когда модель скажет,
+    где у документа верх.
 
     Возвращает False, если обрабатывать было нечего или не получилось.
     """
 
-    if not preview.needed_for(invoice.image.name):
+    if not preview.needed_for(holder.image.name):
         return False
 
     try:
-        source = Path(invoice.image.path)
+        source = Path(holder.image.path)
     except (NotImplementedError, ValueError):
         # Хранилище без локальных путей — обрабатывать нечего.
         return False
@@ -132,7 +141,7 @@ def prepare_photo(invoice: Invoice) -> bool:
     if jpeg is None:
         return False
 
-    return _replace_photo(invoice, source, jpeg)
+    return _replace_photo(holder, source, jpeg)
 
 
 def _turn_upright(invoice: Invoice, degrees) -> None:
@@ -146,24 +155,25 @@ def _turn_upright(invoice: Invoice, degrees) -> None:
     if degrees not in preview.TURNS:
         return
 
-    try:
-        source = Path(invoice.image.path)
-    except (NotImplementedError, ValueError):
-        return
+    # Листы одной накладной снимают одинаково, поэтому доворачиваем их на тот
+    # же угол: модель называет верх документа, а не каждой страницы отдельно.
+    for holder in [invoice, *invoice.pages.all()]:
+        try:
+            source = Path(holder.image.path)
+        except (NotImplementedError, ValueError):
+            continue
 
-    turned = preview.upright(source, degrees)
-    if turned is None:
-        return
-
-    _replace_photo(invoice, source, turned)
+        turned = preview.upright(source, degrees)
+        if turned is not None:
+            _replace_photo(holder, source, turned)
 
 
-def _replace_photo(invoice: Invoice, source: Path, jpeg: bytes) -> bool:
+def _replace_photo(holder, source: Path, jpeg: bytes) -> bool:
     """Кладёт новый снимок в то же поле и стирает прежний файл."""
 
-    previous = invoice.image.name
-    invoice.image.save(f'{source.stem}.jpg', ContentFile(jpeg), save=True)
-    invoice.image.storage.delete(previous)
+    previous = holder.image.name
+    holder.image.save(f'{source.stem}.jpg', ContentFile(jpeg), save=True)
+    holder.image.storage.delete(previous)
 
     return True
 
@@ -218,6 +228,10 @@ def _fill_supplier(invoice: Invoice) -> None:
 
 def _match(invoice: Invoice) -> None:
     """Сводит позиции с номенклатурой UMAG, если он подключён.
+
+    Саму приёмку отсюда не заводим: в UMAG накладную отправляет человек
+    кнопкой. Здесь только готовим почву, чтобы к моменту, когда он откроет
+    карточку, позиции уже были сведены.
 
     Кабинет недоступен — накладная всё равно распознана: сопоставление
     повторится на вкладке «Проверка», ронять из-за него разбор незачем.

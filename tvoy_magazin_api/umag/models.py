@@ -22,6 +22,12 @@ class UmagAccount(models.Model):
     store_id = models.PositiveIntegerField('магазин', null=True, blank=True)
     store_name = models.CharField('название магазина', max_length=255, blank=True)
 
+    # Список магазинов, каким его отдал кабинет при входе. Лежит здесь, а не
+    # спрашивается заново: по нему фронт считает порядковый номер магазина для
+    # ссылки на приёмку, и ради этого ходить в UMAG на каждое чтение состояния
+    # нельзя — кабинет отвечает не быстро, и страница вставала бы на его время.
+    stores = models.JSONField('магазины', default=list, blank=True)
+
     connected_at = models.DateTimeField('подключено', auto_now_add=True)
     refreshed_at = models.DateTimeField('токен обновлён', auto_now=True)
 

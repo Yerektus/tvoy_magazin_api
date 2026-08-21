@@ -97,15 +97,31 @@ class UmagClient:
     def post(self, path: str, payload: dict | None = None, **params):
         return self._call('POST', path, params=params, payload=payload or {})
 
-    def _call(self, method: str, path: str, params: dict, payload: dict | None = None):
+    def post_form(self, path: str, form: dict, **params):
+        """POST обычной формой — так кабинет шлёт контрагентов и импорт товаров."""
+
+        return self._call('POST', path, params=params, form=form)
+
+    def delete(self, path: str, **params):
+        return self._call('DELETE', path, params=params)
+
+    def _call(
+        self,
+        method: str,
+        path: str,
+        params: dict,
+        payload: dict | None = None,
+        form: dict | None = None,
+    ):
         params = {'storeId': self.store_id, **params}
+        call = dict(params=params, payload=payload, form=form)
 
         try:
-            return _request(method, path, params=params, payload=payload, auth=self.account.token)
+            return _request(method, path, **call, auth=self.account.token)
         except UmagAuthError:
             # Токен живёт недолго и протухает молча — меняем его и повторяем.
             self._refresh()
-            return _request(method, path, params=params, payload=payload, auth=self.account.token)
+            return _request(method, path, **call, auth=self.account.token)
 
     def _refresh(self) -> None:
         body = _request('GET', 'org/login/refresh-token', auth=self.account.token)
@@ -126,6 +142,7 @@ def _request(
     path: str,
     params: dict | None = None,
     payload: dict | None = None,
+    form: dict | None = None,
     auth: str = '',
 ):
     """Один запрос к UMAG. Возвращает разобранный JSON или текст ответа."""
@@ -146,7 +163,17 @@ def _request(
         headers['Authorization'] = auth
 
     data = None
-    if payload is not None:
+    if form is not None:
+        # Часть кабинета шлёт не JSON, а обычную форму: значения-объекты в ней
+        # лежат JSON-строками. На JSON такие адреса отвечают 415.
+        data = urllib.parse.urlencode(
+            {
+                key: json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else value
+                for key, value in form.items()
+            }
+        ).encode()
+        headers['Content-Type'] = 'application/x-www-form-urlencoded'
+    elif payload is not None:
         data = json.dumps(payload).encode()
         headers['Content-Type'] = 'application/json'
 
