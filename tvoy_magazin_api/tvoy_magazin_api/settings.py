@@ -87,6 +87,7 @@ INSTALLED_APPS = [
     # пакета не нужно, только две таблицы под уже недействительные токены.
     'rest_framework_simplejwt.token_blacklist',
     'accounts',
+    'assistant',
     'extensions',
     'invoices',
     'purchases',
@@ -252,6 +253,13 @@ OPENROUTER_VISION_MODEL = os.environ.get(
     'OPENROUTER_VISION_MODEL',
     'openai/gpt-5.6-luna',
 )
+# Аналитик в чате: миллион токенов контекста и цена в шесть центов за миллион —
+# на этом можно спрашивать сколько угодно, не считая деньги.
+OPENROUTER_ASSISTANT_MODEL = os.environ.get(
+    'OPENROUTER_ASSISTANT_MODEL',
+    'deepseek/deepseek-v4-flash',
+)
+
 OPENROUTER_TIMEOUT = int(os.environ.get('OPENROUTER_TIMEOUT', '120'))
 
 # Сопоставление позиций с номенклатурой UMAG и поставщиков между собой.
