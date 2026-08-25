@@ -101,6 +101,14 @@ class FakeUmag:
             if barcode in self.answers.get('known', {'4870145005545'}):
                 return PRODUCT
             raise UmagError('Товара с таким штрихкодом не существует', 422)
+        if path == 'nom/category/find-categories':
+            return self.answers.get(
+                'categories',
+                [{'id': 900, 'name': 'Незаданные'}, {'id': 901, 'name': 'Напитки'}],
+            )
+        if path == 'nom/product/create':
+            product = (form or {}).get('productJson') or {}
+            return {**product, 'id': 5150001}
         if path == 'nom/product/by-part':
             return self.answers.get('by_part', [])
         if path == 'nom/product/report':
@@ -584,16 +592,104 @@ class UmagSupplyTests(APITestCase):
         # Единица переехала из карточки: в бумаге были «бут.».
         self.assertEqual(stored.unit, 'шт')
 
-    def test_unknown_barcode_blocks_sending(self):
+    def test_unknown_barcode_starts_a_new_product_instead_of_guessing(self):
+        """Штрихкод с бумаги главнее названия.
+
+        Его нет в кабинете — значит товар новый: заводим карточку с этим же
+        кодом. Приклеить строку к похожему по названию значило бы принять
+        приход на чужую карточку, а это пересорт.
+        """
+
         self.invoice.lines.update(barcode='0000000000000')
         fake = FakeUmag()
 
         with patch('umag.client._request', new=fake):
-            response = self.client.post(f'/api/umag/invoices/{self.invoice.pk}/', {}, format='json')
+            response = self.client.post(
+                f'/api/umag/invoices/{self.invoice.pk}/',
+                {'agent_id': 1832935},
+                format='json',
+            )
 
-        self.assertEqual(response.status_code, 422)
-        self.invoice.refresh_from_db()
-        self.assertIsNone(self.invoice.umag_supply_id)
+        self.assertEqual(response.status_code, 201)
+
+        # По названию не искали вовсе — ни в кабинете, ни моделью.
+        self.assertNotIn('nom/product/by-part', [call['path'] for call in fake.calls])
+
+        card = fake.payload('nom/product/create')['productJson']
+        self.assertEqual(card['barcode'], '0000000000000')
+        # Код карточки в кабинете — тот же штрихкод.
+        self.assertEqual(card['code'], '0000000000000')
+        self.assertEqual(card['name'], 'Напиток PEPSI-COLA ПЭТ 1.0*12')
+        self.assertEqual(card['categoryId'], 900)
+
+        # И строка ушла в приёмку под своим штрихкодом.
+        products = fake.payload('add-products')['products']
+        self.assertEqual(products[0]['barcode'], 0)
+
+    def test_new_product_gets_the_price_from_the_invoice(self):
+        """Цену на полке ставим равной приходу.
+
+        Своей цены у нового товара нет, а ноль означал бы, что касса отдаст его
+        даром. Настоящую наценку магазин выставит сам.
+        """
+
+        self.invoice.lines.update(barcode='0000000000000')
+        fake = FakeUmag()
+
+        with patch('umag.client._request', new=fake):
+            self.client.post(
+                f'/api/umag/invoices/{self.invoice.pk}/',
+                {'agent_id': 1832935},
+                format='json',
+            )
+
+        price = next(
+            call['payload']['productStorePriceJson']
+            for call in fake.calls
+            if call['path'] == 'nom/product/create'
+        )
+
+        self.assertEqual(price['arrivalCost'], 535.5)
+        self.assertEqual(price['sellingPrice'], 535.5)
+        self.assertEqual(price['storeId'], 17795)
+
+    def test_weight_goods_are_created_as_weight_goods(self):
+        """Единицу берём из накладной: весовой товар в кабинете отдельного типа."""
+
+        self.invoice.lines.update(barcode='0000000000000', unit='кг')
+        fake = FakeUmag()
+
+        with patch('umag.client._request', new=fake):
+            self.client.post(
+                f'/api/umag/invoices/{self.invoice.pk}/',
+                {'agent_id': 1832935},
+                format='json',
+            )
+
+        card = fake.payload('nom/product/create')['productJson']
+
+        self.assertEqual(card['measure'], 1)
+        self.assertEqual(card['type'], 1)
+
+    def test_nothing_is_created_while_only_looking(self):
+        """Осмотр остаётся чтением: заведение товара — дело отправки."""
+
+        self.invoice.lines.update(barcode='0000000000000')
+        fake = FakeUmag()
+
+        with patch('umag.client._request', new=fake):
+            response = self.client.get(f'/api/umag/invoices/{self.invoice.pk}/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn('nom/product/create', [call['path'] for call in fake.calls])
+
+        # И такая строка отправке не мешает: товар заведётся сам. Про
+        # поставщика кабинет спросить может — это другой разговор.
+        self.assertEqual(response.data['lines'][0]['status'], 'new_product')
+        self.assertNotIn(
+            'Не сопоставлены позиции',
+            ' '.join(response.data['problems']),
+        )
 
     def test_push_creates_draft_and_remembers_supplier(self):
         fake = FakeUmag()

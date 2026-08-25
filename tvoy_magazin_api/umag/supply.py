@@ -22,6 +22,30 @@ AGENTS_PAGE = 1000
 # Обычная строка приёмки. Бонусные UMAG держит отдельным списком.
 LINE_TYPE = 0
 
+#: Заведение товара в номенклатуре кабинета.
+CREATE_PRODUCT = 'nom/product/create'
+CATEGORIES = 'nom/category/find-categories'
+
+#: Куда кладём заведённый товар. Так кабинет называет категорию для тех, кому
+#: её не выбрали, — раскладывать товары по полкам не наше дело.
+DEFAULT_CATEGORY = 'Незаданные'
+
+#: Единица из накладной → код единицы в карточке UMAG. Всё, чего тут нет,
+#: считаем штучным: так товар хотя бы заведётся, а единицу человек поправит.
+UNITS = {
+    'кг': 1,
+    'г': 1,
+    'гр': 1,
+    'л': 2,
+    'мл': 2,
+}
+
+#: Весовой и разливной товар кабинет держит отдельным типом.
+WEIGHT_TYPE = 1
+
+#: Внутренний весовой код магазина: тринадцать цифр, начинается с двойки.
+INNER_TYPE = 2
+
 
 class NotReady(UmagError):
     """Накладную ещё нельзя отправлять — сначала правки в UMAG или в строках."""
@@ -61,6 +85,7 @@ def push(invoice, account, agent_id: int | None = None) -> int:
 
     try:
         _set_header(client, supply_id, invoice, supplier['agent_id'])
+        _create_missing(client, matches, supplier['agent_id'])
         client.post(
             f'opr/supplies/v2/{supply_id}/add-products',
             {'products': [_product(match) for match in matches]},
@@ -182,7 +207,8 @@ def _inspect(invoice, client, create_supplier: bool = False) -> tuple[dict, list
     if not matches:
         problems.append('В накладной нет позиций')
 
-    stuck = [match for match in matches if match['status'] != 'ok']
+    # `new_product` не помеха: такой товар мы заведём сами при отправке.
+    stuck = [match for match in matches if match['status'] not in ('ok', 'new_product')]
     if stuck:
         names = ', '.join(f'«{match["name"]}»' for match in stuck[:3])
         tail = f' и ещё {len(stuck) - 3}' if len(stuck) > 3 else ''
@@ -407,6 +433,8 @@ def _match_line(line, client) -> dict:
         'code': code,
         'quantity': line.quantity,
         'price': line.price,
+        # Единица нужна, только если товар придётся заводить в кабинете.
+        'unit': line.unit,
         'status': 'ok',
         'product_id': None,
         'product_name': '',
@@ -432,7 +460,11 @@ def _match_line(line, client) -> dict:
         if error.status != 422:
             raise
 
-        match['status'] = 'unknown_barcode'
+        # Штрихкод с бумаги настоящий — контрольную цифру мы проверили ещё при
+        # разборе. Раз его нет в кабинете, это новый товар, и заводить его надо
+        # с этим самым кодом, а не приклеивать строку к похожему по названию:
+        # чужая карточка — это пересорт, который потом никто не распутает.
+        match['status'] = 'new_product'
         return match
 
     product = found.get('product') or {}
@@ -460,6 +492,93 @@ def _match_line(line, client) -> dict:
     match['confidence'] = line.umag_confidence
 
     return match
+
+
+def _create_missing(client, matches: list[dict], agent_id: int | None) -> None:
+    """Заводит в кабинете товары, которых там ещё нет.
+
+    Зовётся только из `push`: осмотр обязан оставаться чтением, иначе один
+    взгляд на вкладку «Проверка» плодил бы карточки.
+    """
+
+    missing = [match for match in matches if match['status'] == 'new_product']
+
+    if not missing:
+        return
+
+    category = _category_id(client)
+
+    for match in missing:
+        _create_product(client, match, agent_id, category)
+
+
+def _create_product(client, match: dict, agent_id: int | None, category: int | None) -> None:
+    """Карточка товара по штрихкоду из накладной.
+
+    Цену на полке ставим равной приходу: продавать себе в убыток хуже, чем
+    продавать без наценки, а настоящую цену магазин выставляет сам. Название и
+    единица — те, что прочитаны с бумаги; поправить их человек может в кабинете.
+    """
+
+    code = match['code']
+    measure = UNITS.get((match.get('unit') or '').strip().lower(), 0)
+    arrival = float(match['price'])
+
+    product = {
+        'id': None,
+        'name': (match['name'] or '')[:255],
+        'measure': measure,
+        'type': _product_type(code, measure),
+        # Код и штрихкод в карточке кабинета — одно и то же значение.
+        'code': code,
+        'barcode': code,
+        'categoryId': category,
+    }
+    price = {
+        'storeId': client.store_id,
+        'productId': None,
+        'arrivalCost': arrival,
+        'sellingPrice': arrival,
+        'wholesalePrice': 0,
+        'isHiddenOnScale': False,
+    }
+
+    form = {'productJson': product, 'productStorePriceJson': price}
+
+    if agent_id:
+        form['supplierId'] = agent_id
+
+    client.post_form(CREATE_PRODUCT, form)
+    logger.info('Завели товар %s «%s» в магазине %s', code, product['name'], client.store_id)
+
+
+def _product_type(code: str, measure: int) -> int:
+    """Тип карточки: обычный товар, весовой или внутренний весовой код."""
+
+    if len(code) == 13 and code.startswith('2'):
+        return INNER_TYPE
+
+    return WEIGHT_TYPE if measure else LINE_TYPE
+
+
+def _category_id(client) -> int | None:
+    """Категория для заводимых товаров.
+
+    Кабинет просит её у человека, но у него же есть «Незаданные» — туда и
+    кладём. Не нашлась — отправляем без категории: пусть решает кабинет, это
+    не повод не принять накладную.
+    """
+
+    try:
+        body = client.get(CATEGORIES)
+    except UmagError as error:
+        logger.warning('UMAG не отдал категории: %s', error)
+        return None
+
+    rows = body if isinstance(body, list) else (body or {}).get('categories') or []
+    names = {(row.get('name') or '').strip().lower(): row.get('id') for row in rows if isinstance(row, dict)}
+
+    return names.get(DEFAULT_CATEGORY.lower()) or next(iter(names.values()), None)
 
 
 def _product(match: dict) -> dict:

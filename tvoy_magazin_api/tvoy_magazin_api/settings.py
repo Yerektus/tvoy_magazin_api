@@ -243,9 +243,15 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = 16 * 1024 * 1024
 FILE_UPLOAD_MAX_MEMORY_SIZE = 16 * 1024 * 1024
 
 # Свой CORS вместо django-cors-headers: фронт на Angular стоит отдельно.
+#
+# Кроме кабинета (4200) сюда же ходит мобильное приложение, когда его запускают
+# в браузере: Expo поднимает его на 8081, а при занятом порте — на следующем.
+# С телефона CORS не при чём — заголовок Origin шлёт только браузер.
 CORS_ALLOWED_ORIGINS = os.environ.get(
     'CORS_ALLOWED_ORIGINS',
-    'http://localhost:4200,http://127.0.0.1:4200',
+    'http://localhost:4200,http://127.0.0.1:4200,'
+    'http://localhost:8081,http://127.0.0.1:8081,'
+    'http://localhost:8082,http://127.0.0.1:8082',
 ).split(',')
 
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
@@ -253,11 +259,13 @@ OPENROUTER_VISION_MODEL = os.environ.get(
     'OPENROUTER_VISION_MODEL',
     'openai/gpt-5.6-luna',
 )
-# Аналитик в чате: миллион токенов контекста и цена в шесть центов за миллион —
-# на этом можно спрашивать сколько угодно, не считая деньги.
+# Аналитик в чате. Нужна была не самая умная модель, а такая, которая умеет
+# всё сразу: звать функции, смотреть на фото и, когда попросят, думать перед
+# ответом. Дешевле неё среди умеющих это ничего нет — три цента за миллион
+# токенов на входе, тринадцать на выходе, миллион токенов контекста.
 OPENROUTER_ASSISTANT_MODEL = os.environ.get(
     'OPENROUTER_ASSISTANT_MODEL',
-    'deepseek/deepseek-v4-flash',
+    'qwen/qwen3.7-flash',
 )
 
 OPENROUTER_TIMEOUT = int(os.environ.get('OPENROUTER_TIMEOUT', '120'))

@@ -1,11 +1,16 @@
 from decimal import Decimal
 from unittest.mock import patch
 
+from django.core.cache import cache
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from accounts.tests import make_organization, make_user
 from invoices.models import Invoice, InvoiceLine
+from invoices.tests import sideways_jpeg
+from purchases import planner
+from purchases.tests import FakeReport, product as sold
 
 from umag.client import UmagError
 from umag.models import UmagAccount, UmagProduct
@@ -13,6 +18,17 @@ from umag.tests import FakeUmag
 
 from . import agent, cabinet, tools
 from .models import Conversation, Message
+
+
+def photo():
+    """Фото к вопросу. Настоящий JPEG: пустые байты сервер и не примет — он
+    проверяет, что прислали картинку, а не что попало под видом неё."""
+
+    return SimpleUploadedFile(
+        'polka.jpg',
+        sideways_jpeg((320, 240)),
+        content_type='image/jpeg',
+    )
 
 
 def answer(text='Готово.', calls=None, cost=0.0001):
@@ -179,14 +195,20 @@ class ChatApiTests(APITestCase):
         history = self.client.get('/api/assistant/chat/')
         self.assertEqual(len(history.data['messages']), 2)
 
-    def test_question_survives_a_broken_model(self):
-        """Модель недоступна — вопрос остаётся в переписке, а не пропадает."""
+    def test_unanswered_question_does_not_stay_in_the_chat(self):
+        """Модель недоступна — вопрос не остаётся висеть без ответа.
+
+        Иначе переписка копит немые реплики: вопрос есть, ответа нет и не
+        будет, а выглядит это как молчание аналитика. Текст при этом не
+        теряется: приложение возвращает его в поле.
+        """
 
         with patch('assistant.agent._post', side_effect=agent.OpenRouterError('OpenRouter лёг')):
             response = self.client.post('/api/assistant/chat/', {'text': 'Что там?'}, format='json')
 
         self.assertEqual(response.status_code, 502)
-        self.assertEqual(Message.objects.filter(role=Message.Role.USER).count(), 1)
+        self.assertEqual(Message.objects.count(), 0)
+        self.assertEqual(self.client.get('/api/assistant/chat/').data['messages'], [])
 
     def test_chat_can_be_started_over(self):
         with patch('assistant.agent._post', return_value=answer()):
@@ -196,6 +218,84 @@ class ChatApiTests(APITestCase):
 
         self.assertEqual(Conversation.objects.count(), 0)
         self.assertEqual(self.client.get('/api/assistant/chat/').data['messages'], [])
+
+    def test_photo_goes_to_the_model_and_stays_in_the_chat(self):
+        """Фото уходит прямо в запросе: media у нас за логином, снаружи его
+        никто не откроет."""
+
+        with patch('assistant.agent._post', return_value=answer('Это ценник.')) as asked:
+            response = self.client.post(
+                '/api/assistant/chat/',
+                {'text': 'Что это?', 'image': photo()},
+                format='multipart',
+            )
+
+        self.assertEqual(response.status_code, 201)
+
+        sent = asked.call_args.args[0]['messages'][-1]['content']
+        kinds = [part['type'] for part in sent]
+
+        self.assertEqual(kinds, ['text', 'image_url'])
+        self.assertTrue(sent[1]['image_url']['url'].startswith('data:image/jpeg;base64,'))
+
+        # В переписке фото остаётся: человек должен видеть, о чём спрашивал.
+        self.assertTrue(Message.objects.get(role=Message.Role.USER).image)
+        self.assertIn('assistant/', response.data['messages'][0]['image'])
+
+    def test_photo_is_not_paid_for_twice(self):
+        """Со следующим вопросом старое фото не пересылаем."""
+
+        with patch('assistant.agent._post', return_value=answer('Ценник.')):
+            self.client.post(
+                '/api/assistant/chat/',
+                {'text': 'Что это?', 'image': photo()},
+                format='multipart',
+            )
+
+        with patch('assistant.agent._post', return_value=answer('Да.')) as asked:
+            self.client.post('/api/assistant/chat/', {'text': 'А дорого?'}, format='json')
+
+        sent = asked.call_args.args[0]['messages']
+
+        self.assertTrue(all(isinstance(message['content'], str) for message in sent))
+
+    def test_a_photo_is_a_question_by_itself(self):
+        """Прислали одну фотографию без слов — это тоже вопрос."""
+
+        with patch('assistant.agent._post', return_value=answer('Вижу накладную.')):
+            response = self.client.post(
+                '/api/assistant/chat/',
+                {'image': photo()},
+                format='multipart',
+            )
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_nothing_at_all_is_not_a_question(self):
+        response = self.client.post('/api/assistant/chat/', {'text': '   '}, format='json')
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_thinking_is_switched_on_by_the_person(self):
+        """Думать дольше — просьба человека: это дороже и заметно медленнее."""
+
+        with patch('assistant.agent._post', return_value=answer('Ответ.')) as asked:
+            self.client.post('/api/assistant/chat/', {'text': 'Подумай'}, format='json')
+
+        self.assertNotIn('reasoning', asked.call_args.args[0])
+
+        with patch('assistant.agent._post', return_value=answer('Ответ.')) as asked:
+            self.client.post(
+                '/api/assistant/chat/',
+                {'text': 'Подумай', 'think': True},
+                format='json',
+            )
+
+        # Рассуждение нужно модели, а не переписке: в ответ его не просим.
+        self.assertEqual(
+            asked.call_args.args[0]['reasoning'],
+            {'enabled': True, 'exclude': True},
+        )
 
     def test_chat_needs_authentication(self):
         self.client.force_authenticate(None)
@@ -217,6 +317,9 @@ class CabinetTests(APITestCase):
     """Граница с UMAG: смотреть можно, писать нельзя, и только своим токеном."""
 
     def setUp(self):
+        # Отчёт кабинета живёт в кэше пару минут — между тестами он не должен
+        # переезжать, иначе половина из них проверяет чужой ответ.
+        cache.clear()
         self.user = make_user()
         self.account = UmagAccount.objects.create(
             user=self.user,
@@ -327,3 +430,109 @@ class CabinetTests(APITestCase):
         names = [row['товар'] for row in cabinet.catalog(self.user, query='pepsi')['товары']]
 
         self.assertNotIn('Чужой магазин PEPSI', names)
+
+    def test_sales_read_what_the_shop_actually_sold(self):
+        """Продажи есть только в кабинете: в накладных лежит закуп."""
+
+        report = FakeReport(
+            [
+                sold(
+                    productName='Пепси 1 л',
+                    saleQuantity=60,
+                    saleSellingAmount=24000,
+                    marginAmount=6000,
+                    stockQuantity=10,
+                ),
+            ]
+        )
+
+        with patch('umag.client._request', new=report):
+            found = cabinet.sales(self.user)
+
+        row = found['товары'][0]
+
+        self.assertEqual(found['период_дней'], 30)
+        self.assertEqual(row['товар'], 'Пепси 1 л')
+        self.assertEqual(row['продано'], 60)
+        self.assertEqual(row['выручка'], 24000.0)
+        self.assertEqual(row['маржа'], 6000.0)
+        self.assertEqual(row['остаток'], 10)
+        # Две штуки в день, десять на полке — на пять дней.
+        self.assertEqual(row['хватит_дней'], 5.0)
+
+    def test_sales_start_with_the_biggest_money(self):
+        """«Что продаётся» — вопрос про деньги, а не про штуки."""
+
+        report = FakeReport(
+            [
+                sold(productName='Жвачка', saleQuantity=500, saleSellingAmount=15000),
+                sold(productName='Молоко', saleQuantity=90, saleSellingAmount=42000),
+            ]
+        )
+
+        with patch('umag.client._request', new=report):
+            names = [row['товар'] for row in cabinet.sales(self.user)['товары']]
+
+        self.assertEqual(names, ['Молоко', 'Жвачка'])
+
+    def test_sales_can_be_asked_about_one_product(self):
+        report = FakeReport(
+            [
+                sold(productName='Напиток PEPSI-COLA ПЭТ 1.0'),
+                sold(productName='Молоко «Одари» 2.5%'),
+            ]
+        )
+
+        with patch('umag.client._request', new=report):
+            found = cabinet.sales(self.user, query='pepsi')
+
+        self.assertEqual(found['найдено'], 1)
+        self.assertEqual(found['товары'][0]['товар'], 'Напиток PEPSI-COLA ПЭТ 1.0')
+
+    def test_running_out_puts_the_shortest_stock_first(self):
+        report = FakeReport(
+            [
+                sold(productName='Хватит надолго', saleQuantity=30, stockQuantity=100),
+                sold(productName='Кончается', saleQuantity=300, stockQuantity=2),
+                # Не продавался: полка с ним не опустеет, планировать нечего.
+                sold(productName='Лежит мёртвым грузом', saleQuantity=0, stockQuantity=50),
+            ]
+        )
+
+        with patch('umag.client._request', new=report):
+            names = [row['товар'] for row in cabinet.running_out(self.user)['товары']]
+
+        self.assertEqual(names, ['Кончается', 'Хватит надолго'])
+
+    def test_the_report_is_asked_once_for_the_same_period(self):
+        """В одном ответе аналитик спрашивает и продажи, и что кончается."""
+
+        report = FakeReport([sold()])
+
+        with patch('umag.client._request', new=report):
+            cabinet.sales(self.user)
+            cabinet.running_out(self.user)
+
+        self.assertEqual(report.calls.count(planner.REPORT), 1)
+
+    def test_broken_report_does_not_break_the_chat(self):
+        with patch('umag.client._request', new=FakeUmag(fail_on='list-product-report')):
+            found = cabinet.sales(self.user)
+
+        self.assertEqual(found, {'ошибка': 'Кабинет UMAG сейчас не отвечает'})
+
+    def test_sales_need_a_connected_cabinet(self):
+        stranger = make_user(email='без-умага-тоже@tvoymagazin.kz')
+
+        self.assertEqual(cabinet.sales(stranger), {'ошибка': 'UMAG не подключён'})
+        self.assertEqual(cabinet.running_out(stranger), {'ошибка': 'UMAG не подключён'})
+
+    def test_period_is_ours_to_decide(self):
+        """Сколько бы дней ни попросила модель, дальше года не смотрим."""
+
+        report = FakeReport([sold()])
+
+        with patch('umag.client._request', new=report):
+            self.assertEqual(cabinet.sales(self.user, days=99999)['период_дней'], 365)
+            self.assertEqual(cabinet.sales(self.user, days='за всё время')['период_дней'], 30)
+

@@ -87,8 +87,13 @@ def build(plan) -> None:
     )
 
 
-def report(client, days: int, **filters) -> list[dict]:
-    """Товарный отчёт за период, страницами. `filters` — например `supplierId`."""
+def report(client, days: int, max_rows: int = MAX_ROWS, **filters) -> list[dict]:
+    """Товарный отчёт за период, страницами. `filters` — например `supplierId`.
+
+    `max_rows` — где остановиться. Плану нужен весь ассортимент, а тому, кто
+    просто смотрит на магазин, хватает верхушки: каждая страница — ещё запрос
+    и ещё секунда ожидания.
+    """
 
     now = timezone.now()
     to_time = _millis(now)
@@ -96,7 +101,7 @@ def report(client, days: int, **filters) -> list[dict]:
 
     rows: list[dict] = []
 
-    while len(rows) < MAX_ROWS:
+    while len(rows) < max_rows:
         body = client.get(
             REPORT,
             fromTime=from_time,

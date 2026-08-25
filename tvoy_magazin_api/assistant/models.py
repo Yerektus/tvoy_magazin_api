@@ -44,7 +44,12 @@ class Message(models.Model):
         related_name='messages',
     )
     role = models.CharField('кто', max_length=16, choices=Role.choices)
-    text = models.TextField('текст')
+    text = models.TextField('текст', blank=True)
+
+    # Фото к вопросу: накладная на столе, ценник, полка. Модели оно уходит
+    # один раз — в том запросе, где его прикрепили; дальше в переписке лежит
+    # ради человека, чтобы он видел, о чём спрашивал.
+    image = models.FileField('фото', upload_to='assistant/%Y/%m', blank=True)
 
     # Сколько стоил ответ. У реплик человека пусто.
     cost = models.DecimalField(
