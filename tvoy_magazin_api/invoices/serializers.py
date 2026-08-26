@@ -44,11 +44,15 @@ class InvoiceLineSerializer(serializers.ModelSerializer):
 class InvoiceListSerializer(serializers.ModelSerializer):
     lines_count = serializers.IntegerField(source='lines.count', read_only=True)
     checked_by_email = serializers.EmailField(source='checked_by.email', read_only=True, default=None)
+    # Снимок нужен и списку: приложение показывает накладные карточками с
+    # превью — по бумаге документ узнают быстрее, чем по номеру.
+    thumbnail = serializers.SerializerMethodField()
 
     class Meta:
         model = Invoice
         fields = (
             'id',
+            'thumbnail',
             'status',
             'error',
             'supplier',
@@ -68,6 +72,22 @@ class InvoiceListSerializer(serializers.ModelSerializer):
             'umag_store_id',
             'umag_store_name',
         )
+
+    def get_thumbnail(self, invoice) -> str | None:
+        """Первый лист накладной — маленькой копией.
+
+        У накладных, снятых до того, как мы стали её делать, копии нет: отдаём
+        полный снимок, чтобы карточка не осталась пустой.
+        """
+
+        image = invoice.thumbnail or invoice.preview or invoice.image
+
+        if not image:
+            return None
+
+        request = self.context.get('request')
+
+        return request.build_absolute_uri(image.url) if request else image.url
 
 
 class InvoiceDetailSerializer(InvoiceListSerializer):

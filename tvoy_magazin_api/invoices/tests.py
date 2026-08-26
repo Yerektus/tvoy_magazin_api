@@ -459,10 +459,21 @@ class InvoiceTests(APITestCase):
             with Image.open(invoice.image) as stored:
                 self.assertLess(stored.width, stored.height)
 
-            # Второго файла нет: ни сырого оригинала, ни отдельного превью.
+            # Сырого оригинала и старого отдельного превью нет: рядом со
+            # снимком лежит только маленькая копия для списка.
             self.assertFalse(invoice.preview)
+            self.assertTrue(invoice.thumbnail)
+
             saved = [path for path in Path(directory).rglob('*') if path.is_file()]
-            self.assertEqual(len(saved), 1)
+            self.assertEqual(len(saved), 2)
+
+            # Копия и правда маленькая — и повёрнута вместе со снимком: в
+            # списке накладная не должна лежать боком.
+            with Image.open(invoice.thumbnail) as small:
+                self.assertLessEqual(max(small.size), preview.THUMBNAIL_SIZE)
+                self.assertLess(small.width, small.height)
+
+            self.assertLess(invoice.thumbnail.size, invoice.image.size)
 
     def test_upright_photo_is_not_turned(self):
         """Шапка и так сверху — крутить нечего, кадр остаётся как был."""

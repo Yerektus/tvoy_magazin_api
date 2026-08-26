@@ -210,14 +210,116 @@ class ChatApiTests(APITestCase):
         self.assertEqual(Message.objects.count(), 0)
         self.assertEqual(self.client.get('/api/assistant/chat/').data['messages'], [])
 
-    def test_chat_can_be_started_over(self):
+    def test_chat_can_be_started_over_without_losing_the_old_one(self):
+        """«Начать заново» заводит новую переписку, а не стирает прежнюю.
+
+        Прежняя уходит в историю: вчерашний разбор поставщиков может
+        понадобиться завтра, а восстановить стёртое неоткуда.
+        """
+
         with patch('assistant.agent._post', return_value=answer()):
             self.client.post('/api/assistant/chat/', {'text': 'Привет'}, format='json')
+            fresh = self.client.post(
+                '/api/assistant/chat/',
+                {'text': 'Другой разговор', 'fresh': True},
+                format='json',
+            )
 
-        self.client.delete('/api/assistant/chat/')
+        self.assertEqual(Conversation.objects.count(), 2)
+
+        # Открыта новая: в ней только её реплики.
+        opened = self.client.get('/api/assistant/chat/')
+        self.assertEqual(opened.data['chat']['id'], fresh.data['chat']['id'])
+        self.assertEqual([m['text'] for m in opened.data['messages']], ['Другой разговор', 'Готово.'])
+
+    def test_history_lists_conversations_freshest_first(self):
+        with patch('assistant.agent._post', return_value=answer()):
+            self.client.post('/api/assistant/chat/', {'text': 'Про поставщиков'}, format='json')
+            self.client.post(
+                '/api/assistant/chat/',
+                {'text': 'Про закупки', 'fresh': True},
+                format='json',
+            )
+
+        history = self.client.get('/api/assistant/chats/')
+
+        # Название — первый вопрос: как спросил, так переписку и вспомнит.
+        self.assertEqual(
+            [chat['title'] for chat in history.data['chats']],
+            ['Про закупки', 'Про поставщиков'],
+        )
+
+    def test_long_question_is_cut_to_fit_the_history(self):
+        with patch('assistant.agent._post', return_value=answer()):
+            self.client.post(
+                '/api/assistant/chat/',
+                {'text': 'Сколько ' * 40},
+                format='json',
+            )
+
+        title = Conversation.objects.get().title
+
+        self.assertEqual(len(title), 80)
+        self.assertTrue(title.endswith('…'))
+
+    def test_old_conversation_opens_and_continues(self):
+        with patch('assistant.agent._post', return_value=answer()):
+            first = self.client.post('/api/assistant/chat/', {'text': 'Первый'}, format='json')
+            self.client.post('/api/assistant/chat/', {'text': 'Второй', 'fresh': True}, format='json')
+
+        old = first.data['chat']['id']
+        opened = self.client.get(f'/api/assistant/chats/{old}/')
+
+        self.assertEqual([m['text'] for m in opened.data['messages']], ['Первый', 'Готово.'])
+
+        with patch('assistant.agent._post', return_value=answer('И ещё.')):
+            self.client.post(
+                '/api/assistant/chat/',
+                {'text': 'Продолжаю', 'chat': old},
+                format='json',
+            )
+
+        # Продолженная переписка всплывает наверх истории — говорили в ней.
+        history = self.client.get('/api/assistant/chats/')
+        self.assertEqual(history.data['chats'][0]['id'], old)
+        self.assertEqual(len(self.client.get(f'/api/assistant/chats/{old}/').data['messages']), 4)
+
+    def test_conversation_can_be_deleted_from_the_history(self):
+        with patch('assistant.agent._post', return_value=answer()):
+            chat = self.client.post('/api/assistant/chat/', {'text': 'Привет'}, format='json')
+
+        gone = self.client.delete(f'/api/assistant/chats/{chat.data["chat"]["id"]}/')
+
+        self.assertEqual(gone.status_code, 204)
+        self.assertEqual(Conversation.objects.count(), 0)
+
+    def test_unanswered_first_question_leaves_no_empty_chat(self):
+        """Модель отказала на первом же вопросе — пустой строке в истории
+        взяться неоткуда."""
+
+        with patch('assistant.agent._post', side_effect=agent.OpenRouterError('лёг')):
+            self.client.post('/api/assistant/chat/', {'text': 'Что там?'}, format='json')
 
         self.assertEqual(Conversation.objects.count(), 0)
-        self.assertEqual(self.client.get('/api/assistant/chat/').data['messages'], [])
+        self.assertEqual(self.client.get('/api/assistant/chats/').data['chats'], [])
+
+    def test_other_users_conversation_is_not_reachable_by_id(self):
+        with patch('assistant.agent._post', return_value=answer()):
+            mine = self.client.post('/api/assistant/chat/', {'text': 'Моё'}, format='json')
+
+        stranger = mine.data['chat']['id']
+        self.client.force_authenticate(make_user(email='чужой@tvoymagazin.kz'))
+
+        self.assertEqual(self.client.get(f'/api/assistant/chats/{stranger}/').status_code, 404)
+        self.assertEqual(self.client.delete(f'/api/assistant/chats/{stranger}/').status_code, 404)
+        self.assertEqual(
+            self.client.post(
+                '/api/assistant/chat/',
+                {'text': 'Влезаю', 'chat': stranger},
+                format='json',
+            ).status_code,
+            404,
+        )
 
     def test_photo_goes_to_the_model_and_stays_in_the_chat(self):
         """Фото уходит прямо в запросе: media у нас за логином, снаружи его

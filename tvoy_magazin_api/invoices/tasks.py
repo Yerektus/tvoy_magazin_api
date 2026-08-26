@@ -174,8 +174,37 @@ def _replace_photo(holder, source: Path, jpeg: bytes) -> bool:
     previous = holder.image.name
     holder.image.save(f'{source.stem}.jpg', ContentFile(jpeg), save=True)
     holder.image.storage.delete(previous)
+    _make_thumbnail(holder)
 
     return True
+
+
+def _make_thumbnail(holder) -> None:
+    """Обновляет маленькую копию снимка — ту, что показывает список.
+
+    Только у самой накладной: в списке видно первый лист, а остальные страницы
+    открывают уже в просмотрщике. Делается после каждой замены снимка, включая
+    доворот, — иначе в списке накладная так и лежала бы боком.
+    """
+
+    if not isinstance(holder, Invoice):
+        return
+
+    try:
+        source = Path(holder.image.path)
+    except (NotImplementedError, ValueError):
+        return
+
+    small = preview.thumbnail(source)
+
+    if small is None:
+        return
+
+    previous = holder.thumbnail.name
+    holder.thumbnail.save(f'{source.stem}.jpg', ContentFile(small), save=True)
+
+    if previous:
+        holder.thumbnail.storage.delete(previous)
 
 
 def content_type_for(name: str) -> str:

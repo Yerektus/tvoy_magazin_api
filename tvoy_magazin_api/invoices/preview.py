@@ -44,6 +44,12 @@ logger = logging.getLogger(__name__)
 PREVIEW_SIZE = 2200
 QUALITY = 85
 
+# Миниатюра для списка накладных. Её не читают — по ней узнают бумагу, поэтому
+# хватает шестисот точек и качества пожиже: снимок на два мегабайта в списке из
+# двадцати карточек — это сорок мегабайт трафика на один экран.
+THUMBNAIL_SIZE = 600
+THUMBNAIL_QUALITY = 70
+
 # PDF сюда не входит: Pillow его не откроет, а в модель он и так уходит как
 # application/pdf, без сжатия.
 NEEDS_PREVIEW = ('.jpg', '.jpeg', '.png', '.webp', '.heic', '.heif')
@@ -103,6 +109,24 @@ def compress(source: Path) -> bytes | None:
         return None
 
 
+def thumbnail(source: Path) -> bytes | None:
+    """Маленькая копия снимка — для списка накладных.
+
+    Отдельно от `compress`: тому нужен читаемый текст (его смотрит модель и
+    человек), а этой копии — только узнаваемая бумага.
+    """
+
+    try:
+        with Image.open(source) as image:
+            image.thumbnail((THUMBNAIL_SIZE, THUMBNAIL_SIZE))
+            ImageOps.exif_transpose(image, in_place=True)
+
+            return _jpeg(image.convert('RGB'), quality=THUMBNAIL_QUALITY)
+    except (OSError, UnidentifiedImageError, ValueError) as error:
+        logger.warning('Не удалось уменьшить снимок %s: %s', source.name, error)
+        return None
+
+
 def upright(source: Path, degrees: int) -> bytes | None:
     """Тот же снимок, повёрнутый на `degrees` по часовой стрелке.
 
@@ -135,8 +159,8 @@ def _ready(image: Image.Image) -> bool:
     )
 
 
-def _jpeg(image: Image.Image) -> bytes:
+def _jpeg(image: Image.Image, quality: int = QUALITY) -> bytes:
     buffer = io.BytesIO()
-    image.save(buffer, 'JPEG', quality=QUALITY, optimize=True)
+    image.save(buffer, 'JPEG', quality=quality, optimize=True)
 
     return buffer.getvalue()

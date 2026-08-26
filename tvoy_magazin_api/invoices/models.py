@@ -28,6 +28,10 @@ class Invoice(models.Model):
     # старых накладных, у которых в `image` лежит сырой HEIC; новые пишут
     # единственный снимок и это поле не трогают.
     preview = models.FileField('превью', upload_to='invoices/%Y/%m/preview', blank=True)
+
+    # Маленькая копия первого листа — её показывает список накладных. Полный
+    # снимок там весит два мегабайта, а по карточке его всё равно не читают.
+    thumbnail = models.FileField('миниатюра', upload_to='invoices/%Y/%m/thumb', blank=True)
     status = models.CharField('статус', max_length=16, choices=Status.choices, default=Status.PENDING)
     error = models.TextField('ошибка разбора', blank=True)
 
