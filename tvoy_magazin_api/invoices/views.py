@@ -210,10 +210,14 @@ class InvoiceLineView(generics.RetrieveUpdateDestroyAPIView):
             matching.forget(line)
 
             # Штрихкод — точный ключ: по нему товар находится сразу, и ждать
-            # проверки накладной, чтобы увидеть, тот ли он, незачем. По одному
-            # названию так не выйдет — там выбирает модель, и делает это разбор
-            # целиком, а не правка одной строки.
+            # проверки накладной, чтобы увидеть, тот ли он, незачем.
             if 'barcode' in changed:
+                # Вписанный руками подобранным больше не считается: человек
+                # смотрел в бумагу, и отметка «сверьте» ему только мешает.
+                if line.barcode_auto:
+                    line.barcode_auto = False
+                    line.save(update_fields=('barcode_auto',))
+
                 supply.rematch_line(line)
 
         _recount(line, changed)

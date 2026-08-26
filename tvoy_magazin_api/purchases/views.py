@@ -3,7 +3,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from accounts.permissions import ManagesOrganization
+from accounts.permissions import ManagesOrganization, UsesPurchases
 from extensions.models import Extension, ExtensionInstall
 from umag.models import UmagAccount
 
@@ -26,11 +26,11 @@ class PlanningAccessView(APIView):
     расширения — дело владельца и администратора.
     """
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, UsesPurchases]
 
     def get_permissions(self):
         if self.request.method in ('POST', 'DELETE'):
-            return [IsAuthenticated(), ManagesOrganization()]
+            return [IsAuthenticated(), UsesPurchases(), ManagesOrganization()]
 
         return super().get_permissions()
 
@@ -63,7 +63,7 @@ class PlanningAccessView(APIView):
 class PurchasePlanView(APIView):
     """/api/purchases/plan/ — последний план по выбранному магазину и пересчёт."""
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, UsesPurchases]
 
     def get(self, request):
         account = _account(request.user)

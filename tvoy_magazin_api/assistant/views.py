@@ -4,6 +4,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.permissions import UsesAssistant
 from invoices.openrouter import OpenRouterError
 
 from . import agent
@@ -16,9 +17,12 @@ HISTORY = 20
 
 
 class ChatMixin:
-    """Общее для ручек переписки: чужие разговоры не видны никому."""
+    """Общее для ручек переписки: чужие разговоры не видны никому.
 
-    permission_classes = [IsAuthenticated]
+    И не всякому: менеджеру помощник закрыт, пока доступ не выдали руками.
+    """
+
+    permission_classes = [IsAuthenticated, UsesAssistant]
 
     def chats(self):
         return Conversation.objects.filter(user=self.request.user)

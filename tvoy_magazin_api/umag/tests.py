@@ -9,9 +9,8 @@ from rest_framework.test import APITestCase
 
 from accounts.tests import make_user
 from invoices.models import Invoice, InvoiceLine
-from invoices.openrouter import OpenRouterError, Parsed
 
-from . import catalog, matching, supply
+from . import catalog, supply
 from .client import UmagClient, UmagError
 from .models import SupplierLink, UmagAccount, UmagProduct
 
@@ -45,22 +44,6 @@ BY_PART = [
     {'id': 132421277, 'barcode': 4870145005545, 'name': 'Напиток PEPSI-COLA ПЭТ 1.0'},
     {'id': 91, 'barcode': 4870145005552, 'name': 'Напиток PEPSI-COLA ПЭТ 0.5'},
 ]
-
-
-def answered(line_id: int, product_id: int | None, confidence: float) -> Parsed:
-    """Ответ модели про одну строку — с ценой запроса, как у настоящего."""
-
-    return Parsed(
-        {'matches': [{'line_id': line_id, 'product_id': product_id, 'confidence': confidence}]},
-        'qwen/qwen3.7-plus',
-        0.0002,
-    )
-
-
-def picked(line_id: int, query: str) -> Parsed:
-    """Ответ модели о том, чем искать строку в номенклатуре."""
-
-    return Parsed({'queries': [{'line_id': line_id, 'query': query}]}, 'qwen/qwen3.7-plus', 0.0001)
 
 
 class FakeUmag:
@@ -147,31 +130,6 @@ def invoice_for(user, **fields) -> Invoice:
         total='2142.00',
     )
     return invoice
-
-
-class ProductQueryTests(SimpleTestCase):
-    """Чем ищем товар в кабинете: порядок запросов решает, найдётся ли он."""
-
-    def test_product_word_goes_before_the_longest_one(self):
-        # «Ромашка» длиннее, но по ней находятся прокладки и соль для ванны,
-        # а карточка называется «коржик ромашка».
-        self.assertEqual(
-            matching._queries('Коржик Ромашка Сайрам нан 500 гр 1*12 шт'),
-            ['Коржик Ромашка', 'Коржик', 'Ромашка'],
-        )
-
-    def test_two_first_words_find_the_card_as_is(self):
-        self.assertEqual(
-            matching._queries('Пряник шоколадный 450гр Сайрам нан 1*14')[0],
-            'Пряник шоколадный',
-        )
-
-    def test_short_words_and_digits_are_not_searched(self):
-        # «нан», «гр», «500» ищут пол-магазина.
-        self.assertEqual(matching._queries('Круасан нан 300 гр'), ['Круасан'])
-
-    def test_line_without_words_asks_nothing(self):
-        self.assertEqual(matching._queries('1*12'), [])
 
 
 class CatalogTests(APITestCase):
@@ -377,202 +335,31 @@ class UmagSupplyTests(APITestCase):
         self.assertEqual(len(response.data['supplier']['candidates']), 2)
         self.assertEqual(response.data['lines'][0]['status'], 'ok')
 
-    def test_model_picks_product_for_line_without_barcode(self):
-        self.invoice.lines.update(barcode='')
-        fake = FakeUmag(by_part=BY_PART)
-        line_id = self.invoice.lines.get().pk
+    def test_line_without_barcode_is_left_to_the_human(self):
+        """По названию товар в кабинете больше не ищем.
 
-        with patch('umag.client._request', new=fake), patch(
-            'umag.matching.search_terms', return_value=picked(line_id, 'Напиток PEPSI-COLA')
-        ), patch(
-            'umag.matching.match_products',
-            return_value=answered(line_id, 132421277, 0.9),
-        ) as model:
-            response = self.client.get(f'/api/umag/invoices/{self.invoice.pk}/')
-
-        line = response.data['lines'][0]
-        # Штрихкод подставлен — строка сопоставлена наравне с теми, что с бумаги.
-        self.assertEqual(line['status'], 'ok')
-        self.assertEqual(line['product_name'], 'Напиток PEPSI-COLA ПЭТ 1.0')
-        self.assertEqual(line['stock'], 165)
-        # Уверенность остаётся при строке: видно, что цифра не из бумаги.
-        self.assertEqual(line['confidence'], 0.9)
-        self.assertNotIn('Не сопоставлены позиции', ' '.join(response.data['problems']))
-
-        # Модель спрашивают один раз на накладную и вместе с кандидатами.
-        self.assertEqual(model.call_count, 1)
-        asked = model.call_args.args[0]
-        self.assertEqual(len(asked), 1)
-        self.assertEqual(asked[0]['id'], line_id)
-        self.assertEqual([product['id'] for product in asked[0]['candidates']], [132421277, 91])
-
-        # Выбор лёг в саму строку — и цена запроса в стоимость документа.
-        stored = self.invoice.lines.get()
-        self.assertEqual(stored.barcode, '4870145005545')
-        self.assertEqual(stored.umag_product_id, 132421277)
-        self.assertEqual(stored.umag_confidence, 0.9)
-        self.invoice.refresh_from_db()
-        # Оба запроса к модели — выбор слова и выбор товара — идут в стоимость.
-        self.assertEqual(str(self.invoice.cost), '0.000300')
-
-    def test_half_sure_model_still_fills_the_line(self):
-        """Половины уверенности хватает: строку человек всё равно сверяет глазами."""
+        Раньше строку без штрихкода отдавали модели вместе с дюжиной похожих
+        карточек, и она регулярно выбирала чужую: в кабинете тысячи товаров, а
+        различаются они одним словом. Приход на чужую карточку — пересорт.
+        Теперь строка честно остаётся несопоставленной: штрихкод подберётся по
+        прошлым накладным при разборе или его впишет человек.
+        """
 
         self.invoice.lines.update(barcode='')
         fake = FakeUmag(by_part=BY_PART)
-        line_id = self.invoice.lines.get().pk
 
-        with patch('umag.client._request', new=fake), patch(
-            'umag.matching.search_terms', return_value=picked(line_id, 'Напиток PEPSI-COLA')
-        ), patch(
-            'umag.matching.match_products',
-            return_value=answered(line_id, 132421277, 0.55),
-        ):
-            response = self.client.get(f'/api/umag/invoices/{self.invoice.pk}/')
-
-        line = response.data['lines'][0]
-        self.assertEqual(line['status'], 'ok')
-        # Уверенность остаётся при строке: видно, что цифра не из бумаги.
-        self.assertEqual(line['confidence'], 0.55)
-        self.assertEqual(self.invoice.lines.get().barcode, '4870145005545')
-
-    def test_unsure_model_suggests_nothing(self):
-        self.invoice.lines.update(barcode='')
-        fake = FakeUmag(by_part=BY_PART)
-        line_id = self.invoice.lines.get().pk
-
-        with patch('umag.client._request', new=fake), patch(
-            'umag.matching.search_terms', return_value=picked(line_id, 'Напиток PEPSI-COLA')
-        ), patch(
-            'umag.matching.match_products',
-            return_value=answered(line_id, 132421277, 0.4),
-        ):
-            response = self.client.get(f'/api/umag/invoices/{self.invoice.pk}/')
-
-        # Догадка на четвёрку — не догадка: неверный товар уедет в остатки.
-        self.assertEqual(response.data['lines'][0]['suggested_barcode'], '')
-        self.assertIsNone(self.invoice.lines.get().umag_product_id)
-
-    def test_model_chooses_what_to_search_by(self):
-        """Слово выбирает модель: в строке товар перемешан с фасовкой."""
-
-        self.invoice.lines.update(barcode='', name='Пряник шоколадный 450гр Сайрам нан 1*14')
-        fake = FakeUmag(by_part=BY_PART)
-        line_id = self.invoice.lines.get().pk
-
-        with patch('umag.client._request', new=fake), patch(
-            'umag.matching.search_terms', return_value=picked(line_id, 'Пряник шоколадный сайрам')
-        ) as words, patch(
-            'umag.matching.match_products',
-            return_value=answered(line_id, 132421277, 0.9),
-        ):
-            self.client.get(f'/api/umag/invoices/{self.invoice.pk}/')
-
-        # Спрашиваем один раз на накладную, до похода в кабинет.
-        self.assertEqual(words.call_count, 1)
-        self.assertEqual(words.call_args.args[0], [{'id': line_id, 'name': 'Пряник шоколадный 450гр Сайрам нан 1*14'}])
-
-        # Искали именно тем, что выбрала модель, а не первыми двумя словами.
-        searched = [
-            call['params']['namePart']
-            for call in fake.calls
-            if call['path'] == 'nom/product/by-part'
-        ]
-        self.assertEqual(searched[0], 'Пряник шоколадный сайрам')
-
-    def test_search_falls_back_to_our_rules_when_model_is_silent(self):
-        """Модель не ответила — ищем по своим правилам, а не бросаем строку."""
-
-        self.invoice.lines.update(barcode='', name='Коржик Ромашка Сайрам нан 500 гр 1*12')
-        fake = FakeUmag(by_part=BY_PART)
-        line_id = self.invoice.lines.get().pk
-
-        with patch('umag.client._request', new=fake), patch(
-            'umag.matching.search_terms',
-            side_effect=OpenRouterError('Не задан OPENROUTER_API_KEY'),
-        ), patch(
-            'umag.matching.match_products',
-            return_value=answered(line_id, 132421277, 0.9),
-        ):
-            response = self.client.get(f'/api/umag/invoices/{self.invoice.pk}/')
-
-        searched = [
-            call['params']['namePart']
-            for call in fake.calls
-            if call['path'] == 'nom/product/by-part'
-        ]
-        self.assertEqual(searched[0], 'Коржик Ромашка')
-        self.assertEqual(response.data['lines'][0]['status'], 'ok')
-
-    def test_local_catalog_replaces_the_search_in_umag(self):
-        """Копия номенклатуры есть — в кабинет за поиском не ходим вовсе."""
-
-        self.invoice.lines.update(barcode='', name='Пряник шоколадный 450гр Сайрам нан 1*14')
-        name = 'Пряник шоколадный сайрам нан'
-        UmagProduct.objects.create(
-            store_id=17795,
-            barcode='4870215285914',
-            name=name,
-            search_name=catalog.normalize(name),
-        )
-        fake = FakeUmag(by_part=BY_PART, known={'4870215285914'})
-        line_id = self.invoice.lines.get().pk
-
-        with patch('umag.client._request', new=fake), patch(
-            'umag.matching.search_terms'
-        ) as words, patch(
-            'umag.matching.match_products',
-            return_value=answered(line_id, 1, 0.9),
-        ) as model:
-            self.client.get(f'/api/umag/invoices/{self.invoice.pk}/')
-
-        # Ни поиска по подстроке, ни выбора слова для него: и то и другое было
-        # нужно только чтобы угодить поиску кабинета.
-        self.assertNotIn('nom/product/by-part', [call['path'] for call in fake.calls])
-        words.assert_not_called()
-
-        # Модель выбирала из того, что нашлось у нас.
-        asked = model.call_args.args[0]
-        self.assertEqual([item['name'] for item in asked[0]['candidates']], [name])
-
-        # Штрихкод из карточки лёг в строку — дальше она живёт как с бумаги.
-        self.assertEqual(self.invoice.lines.get().barcode, '4870215285914')
-
-    def test_chosen_product_is_not_asked_twice(self):
-        self.invoice.lines.update(
-            barcode='',
-            umag_product_id=132421277,
-            umag_product_name='Напиток PEPSI-COLA ПЭТ 1.0',
-            umag_barcode='4870145005545',
-            umag_confidence=0.75,
-        )
-        fake = FakeUmag(by_part=BY_PART)
-
-        with patch('umag.client._request', new=fake), patch(
-            'umag.matching.search_terms'
-        ) as words, patch('umag.matching.match_products') as model:
-            response = self.client.get(f'/api/umag/invoices/{self.invoice.pk}/')
-
-        model.assert_not_called()
-        # Прежний выбор берётся из строки и вписывается без нового запроса.
-        self.assertEqual(response.data['lines'][0]['status'], 'ok')
-        self.assertEqual(self.invoice.lines.get().barcode, '4870145005545')
-
-    def test_model_failure_leaves_line_to_the_human(self):
-        self.invoice.lines.update(barcode='')
-        fake = FakeUmag(by_part=BY_PART)
-        line_id = self.invoice.lines.get().pk
-
-        with patch('umag.client._request', new=fake), patch(
-            'umag.matching.search_terms', return_value=picked(line_id, 'Напиток PEPSI-COLA')
-        ), patch(
-            'umag.matching.match_products',
-            side_effect=OpenRouterError('Не задан OPENROUTER_API_KEY'),
-        ):
+        with patch('umag.client._request', new=fake):
             response = self.client.get(f'/api/umag/invoices/{self.invoice.pk}/')
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data['lines'][0]['suggested_barcode'], '')
+
+        line = response.data['lines'][0]
+        self.assertEqual(line['status'], 'no_barcode')
+        self.assertEqual(line['suggested_barcode'], '')
+
+        # Ни поиска по названию, ни запроса к модели — и платить не за что.
+        self.assertNotIn('nom/product/by-part', [call['path'] for call in fake.calls])
+        self.assertIsNone(self.invoice.lines.get().umag_confidence)
 
     def test_barcode_match_is_remembered_in_the_line(self):
         fake = FakeUmag()

@@ -178,6 +178,11 @@ class InvoiceLine(models.Model):
 
     name = models.CharField('название', max_length=255)
     barcode = models.CharField('штрихкод', max_length=64, blank=True)
+
+    # Штрихкод не с бумаги, а подобран по прошлым накладным: строка называется
+    # так же, как уже приходившая. Человеку это видно в карточке — цифру,
+    # которую он не видел на листе, стоит сверить.
+    barcode_auto = models.BooleanField('штрихкод подобран', default=False)
     quantity = models.DecimalField('количество', max_digits=12, decimal_places=3, null=True, blank=True)
     unit = models.CharField('единица измерения', max_length=32, blank=True)
     price = models.DecimalField('цена по накладной', max_digits=12, decimal_places=2, null=True, blank=True)

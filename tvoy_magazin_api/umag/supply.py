@@ -115,9 +115,11 @@ def push(invoice, account, agent_id: int | None = None) -> int:
 def match_lines(invoice) -> None:
     """Сопоставляет позиции с номенклатурой сразу после распознавания.
 
-    Ходит в кабинет от имени того, кто загрузил накладную: штрихкоды с бумаги
-    превращаются в карточки товаров, а строкам без штрихкода его подбирает
-    модель. К моменту, когда человек откроет накладную, позиции уже сведены.
+    Ходит в кабинет от имени того, кто загрузил накладную: штрихкоды —
+    прочитанные с бумаги и подобранные по прошлым накладным — превращаются в
+    карточки товаров. К моменту, когда человек откроет накладную, позиции уже
+    сведены. Строка без штрихкода остаётся несопоставленной: искать товар по
+    названию мы перестали, см. `matching`.
 
     Заодно поддерживает свежесть копии номенклатуры: первая накладная за сутки
     ищет по вчерашней и запускает обновление, следующие идут уже по новой.
@@ -130,11 +132,12 @@ def match_lines(invoice) -> None:
         return
 
     client = UmagClient(account, invoice.umag_store_id)
-    matches = [_match_line(line, client) for line in invoice.lines.all()]
-    matching.suggest(invoice, matches, client)
 
-    # Копия номенклатуры, по которой всё это искалось, стареет — обновляем её
-    # после сопоставления, в фоне. Расписания снаружи для этого не нужно.
+    for line in invoice.lines.all():
+        _match_line(line, client)
+
+    # Копия номенклатуры стареет — обновляем её после сопоставления, в фоне.
+    # Расписания снаружи для этого не нужно.
     catalog.refresh_later(account)
 
 
@@ -179,18 +182,6 @@ def _inspect(invoice, client, create_supplier: bool = False) -> tuple[dict, list
 
     supplier = _match_supplier(invoice, client, create=create_supplier)
     matches = [_match_line(line, client) for line in invoice.lines.all()]
-
-    # Строки без штрихкода достаются модели: уверенный выбор она впишет сама.
-    filled = matching.suggest(invoice, matches, client)
-
-    if filled:
-        # Штрихкод появился — перечитываем строку из UMAG, чтобы в ответе была
-        # её карточка с ценой и остатком, а статус стал обычным «ok».
-        lines = {line.pk: line for line in invoice.lines.filter(pk__in=filled)}
-        matches = [
-            _match_line(lines[match['id']], client) if match['id'] in lines else match
-            for match in matches
-        ]
 
     problems = []
 

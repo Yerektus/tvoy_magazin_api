@@ -17,9 +17,23 @@ class UserSerializer(serializers.ModelSerializer):
     # По ней фронт решает, показывать ли расширения: у менеджера их нет.
     manages_organization = serializers.BooleanField(read_only=True)
 
+    # Какие разделы показывать. Не роль: менеджеру доступ выдают поштучно, и
+    # приложению незачем знать правило — только результат.
+    uses_purchases = serializers.BooleanField(read_only=True)
+    uses_assistant = serializers.BooleanField(read_only=True)
+
     class Meta:
         model = User
-        fields = ('id', 'email', 'name', 'role', 'organization', 'manages_organization')
+        fields = (
+            'id',
+            'email',
+            'name',
+            'role',
+            'organization',
+            'manages_organization',
+            'uses_purchases',
+            'uses_assistant',
+        )
 
 
 class LoginSerializer(serializers.Serializer):

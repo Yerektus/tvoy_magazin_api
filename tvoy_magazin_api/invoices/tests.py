@@ -17,8 +17,8 @@ from accounts.tests import make_organization, make_user
 from umag.models import UmagAccount
 from umag.tests import FakeUmag
 
-from . import preview
-from .models import Invoice
+from . import openrouter, preview
+from .models import Invoice, InvoiceLine
 from .openrouter import OpenRouterError, Parsed
 
 User = get_user_model()
@@ -216,14 +216,56 @@ class RoleTests(APITestCase):
                 self.sign_in(role)
                 self.assertEqual(self.client.get('/api/extensions/').status_code, 200)
 
-    def test_manager_cannot_connect_an_extension(self):
-        """Читать состояние можно — иначе страница закупов не нарисуется."""
+    def test_manager_is_kept_out_of_purchases_and_the_assistant(self):
+        """Раздел ему не показывают — значит и ручки должны отказывать.
+
+        Прятать в приложении мало: адрес известен, и запрос из консоли считал
+        бы весь закуп магазина.
+        """
 
         self.sign_in(User.Role.MANAGER)
 
+        self.assertEqual(self.client.get('/api/purchases/access/').status_code, 403)
+        self.assertEqual(self.client.get('/api/purchases/plan/').status_code, 403)
+        self.assertEqual(self.client.get('/api/assistant/chat/').status_code, 403)
+
+    def test_manager_with_access_gets_the_sections_but_not_the_settings(self):
+        """Доступ выдают руками в админке — по одной галочке на раздел.
+
+        Подключать сами расширения он всё равно не может: это дело владельца.
+        """
+
+        manager = make_user(
+            email='dostup@tvoymagazin.kz',
+            organization=self.organization,
+            role=User.Role.MANAGER,
+            purchases_access=True,
+            assistant_access=True,
+        )
+        self.client.force_authenticate(manager)
+
         self.assertEqual(self.client.get('/api/purchases/access/').status_code, 200)
+        self.assertEqual(self.client.get('/api/assistant/chat/').status_code, 200)
+
         self.assertEqual(self.client.post('/api/purchases/access/').status_code, 403)
         self.assertEqual(self.client.delete('/api/purchases/access/').status_code, 403)
+
+    def test_sections_of_the_person_are_told_at_login(self):
+        """Приложение прячет разделы по ответу `/auth/me/`, а не по роли: доступ
+        выдаётся поштучно, и правило знает только сервер."""
+
+        self.sign_in(User.Role.MANAGER)
+        me = self.client.get('/api/auth/me/').data
+
+        self.assertFalse(me['uses_purchases'])
+        self.assertFalse(me['uses_assistant'])
+
+        self.sign_in(User.Role.OWNER)
+        me = self.client.get('/api/auth/me/').data
+
+        # Владельцу открыто всё и без галочек.
+        self.assertTrue(me['uses_purchases'])
+        self.assertTrue(me['uses_assistant'])
 
 
 class PreviewTests(SimpleTestCase):
@@ -1319,3 +1361,172 @@ class InvoiceTests(APITestCase):
         response = self.client.post('/api/invoices/', {'image': document}, format='multipart')
 
         self.assertEqual(response.status_code, 400)
+
+
+@override_settings(INVOICE_PARSE_INLINE=True)
+class KnownBarcodeTests(APITestCase):
+    """Штрихкод по названию — из прошлых накладных, а не из кабинета UMAG."""
+
+    def setUp(self):
+        self.user = make_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
+        self.client.force_authenticate(self.user)
+
+    def known_line(self, name: str, barcode: str = '4870145005545', user=None):
+        """Прошлая накладная, в которой у этой строки штрихкод уже стоял."""
+
+        owner = user or self.user
+        invoice = Invoice.objects.create(
+            organization=owner.organization,
+            created_by=owner,
+            status=Invoice.Status.CHECKED,
+            supplier='ТОО ЖЕТЫСУ-ТРЕЙД',
+        )
+
+        return InvoiceLine.objects.create(
+            invoice=invoice,
+            position=1,
+            name=name,
+            barcode=barcode,
+        )
+
+    def upload(self, name: str):
+        """Накладная с одной строкой без штрихкода — его и подбираем."""
+
+        parsed = Parsed(
+            {
+                **PARSED,
+                'lines': [{'name': name, 'quantity': 1, 'unit': 'шт', 'price': 100, 'total': 100}],
+            },
+            PARSE_RESULT.model,
+            PARSE_RESULT.cost,
+        )
+
+        with patch('invoices.tasks.parse_invoice', return_value=parsed):
+            response = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        return Invoice.objects.get(pk=response.data['id']).lines.get()
+
+    def test_same_line_brings_its_barcode(self):
+        self.known_line('Напиток PEPSI-COLA ПЭТ 1.0*12')
+
+        line = self.upload('Напиток PEPSI-COLA ПЭТ 1.0*12')
+
+        self.assertEqual(line.barcode, '4870145005545')
+        # Отметка нужна человеку: цифры этой на листе он не видел.
+        self.assertTrue(line.barcode_auto)
+
+    def test_spacing_and_case_do_not_matter(self):
+        """Поставщик печатает строку то так, то этак — товар тот же."""
+
+        self.known_line('Пряник шоколадный 450гр Сайрам нан')
+
+        line = self.upload('ПРЯНИК ШОКОЛАДНЫЙ 450 ГР САЙРАМ НАН')
+
+        self.assertEqual(line.barcode, '4870145005545')
+
+    def test_another_flavour_is_another_product(self):
+        """На этом и горел подбор через UMAG: одно слово разницы — чужой товар."""
+
+        self.known_line('Сырок Чудо ваниль 5% 40г')
+
+        line = self.upload('Сырок Чудо шоколад 5% 40г')
+
+        self.assertEqual(line.barcode, '')
+        self.assertFalse(line.barcode_auto)
+
+    def test_barcode_from_the_paper_is_not_touched(self):
+        self.known_line('Напиток PEPSI-COLA ПЭТ 1.0*12', barcode='4870145005552')
+
+        parsed = Parsed(
+            {
+                **PARSED,
+                'lines': [
+                    {
+                        'name': 'Напиток PEPSI-COLA ПЭТ 1.0*12',
+                        'barcode': '4870145005545',
+                        'quantity': 1,
+                        'unit': 'шт',
+                        'price': 100,
+                        'total': 100,
+                    }
+                ],
+            },
+            PARSE_RESULT.model,
+            PARSE_RESULT.cost,
+        )
+
+        with patch('invoices.tasks.parse_invoice', return_value=parsed):
+            response = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        line = Invoice.objects.get(pk=response.data['id']).lines.get()
+
+        self.assertEqual(line.barcode, '4870145005545')
+        self.assertFalse(line.barcode_auto)
+
+    def test_other_organization_is_not_looked_at(self):
+        """Накладные соседнего магазина — чужие данные, и товар у него свой."""
+
+        stranger = make_user(
+            email='chuzhoy@tvoymagazin.kz',
+            organization=make_organization('Чужой магазин'),
+        )
+        self.known_line('Напиток PEPSI-COLA ПЭТ 1.0*12', user=stranger)
+
+        line = self.upload('Напиток PEPSI-COLA ПЭТ 1.0*12')
+
+        self.assertEqual(line.barcode, '')
+
+    def test_broken_barcode_is_not_spread_further(self):
+        """В прошлой строке лежит номенклатурный номер, а не штрихкод."""
+
+        self.known_line('Напиток PEPSI-COLA ПЭТ 1.0*12', barcode='80843519')
+
+        line = self.upload('Напиток PEPSI-COLA ПЭТ 1.0*12')
+
+        self.assertEqual(line.barcode, '')
+
+    def test_typed_barcode_is_no_longer_a_guess(self):
+        """Человек вписал код руками — отметка «сверьте» ему больше не нужна."""
+
+        self.known_line('Напиток PEPSI-COLA ПЭТ 1.0*12')
+        line = self.upload('Напиток PEPSI-COLA ПЭТ 1.0*12')
+
+        self.client.patch(
+            f'/api/invoices/{line.invoice_id}/lines/{line.pk}/',
+            {'barcode': '4870145005552'},
+            format='json',
+        )
+
+        line.refresh_from_db()
+        self.assertEqual(line.barcode, '4870145005552')
+        self.assertFalse(line.barcode_auto)
+
+
+@override_settings(OPENROUTER_API_KEY='test-key', OPENROUTER_FALLBACK_MODELS=[])
+class OpenRouterAnswerTests(SimpleTestCase):
+    """Что делаем с ответами, которые не похожи на разобранную накладную."""
+
+    def ask(self, message):
+        body = {'model': 'z-ai/glm-5.3-flash', 'choices': [{'message': message}]}
+
+        with patch('invoices.openrouter._post', return_value=body):
+            return openrouter.parse_invoice([(b'photo', 'image/jpeg')])
+
+    def test_empty_answer_is_named_as_such(self):
+        """Модель без строгой схемы отвечает рассуждением, а вслух — ничем.
+
+        Раньше на такой ответ падало `AttributeError` про `NoneType`, и в логе
+        вместо причины была строчка из середины разбора.
+        """
+
+        with self.assertRaises(OpenRouterError) as failure:
+            self.ask({'content': None, 'reasoning': 'думала долго'})
+
+        self.assertIn('пустотой', str(failure.exception))
+        self.assertIn('z-ai/glm-5.3-flash', str(failure.exception))
+
+    def test_text_around_json_is_not_an_answer(self):
+        with self.assertRaises(OpenRouterError) as failure:
+            self.ask({'content': 'На листе накладная. ```json\n{"supplier": "ИП"}\n```'})
+
+        self.assertIn('не JSON', str(failure.exception))

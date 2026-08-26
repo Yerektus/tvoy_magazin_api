@@ -79,6 +79,13 @@ class User(AbstractUser):
         default=Role.MANAGER,
     )
 
+    # Разделы, которые менеджеру по умолчанию не нужны: он принимает товар, а
+    # не считает закуп и не спрашивает аналитику. Кому нужны — доступ выдают
+    # руками отсюда, из админки. Владельцу и администратору они открыты всегда,
+    # эти галочки их не касаются.
+    purchases_access = models.BooleanField('доступ к закупкам', default=False)
+    assistant_access = models.BooleanField('доступ к помощнику', default=False)
+
     USERNAME_FIELD = 'email'
     REQUIRED_FIELDS = []
 
@@ -101,3 +108,15 @@ class User(AbstractUser):
         """
 
         return self.role in (self.Role.OWNER, self.Role.ADMIN)
+
+    @property
+    def uses_purchases(self) -> bool:
+        """Открыт ли раздел закупок. Ведущим организацию — всегда."""
+
+        return self.manages_organization or self.purchases_access
+
+    @property
+    def uses_assistant(self) -> bool:
+        """Открыт ли помощник. Ведущим организацию — всегда."""
+
+        return self.manages_organization or self.assistant_access

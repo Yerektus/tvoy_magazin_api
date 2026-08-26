@@ -18,7 +18,7 @@ from django.utils import timezone
 
 from umag import supply
 
-from . import barcodes, preview, suppliers
+from . import barcodes, known_barcodes, preview, suppliers
 from .models import Invoice, InvoiceLine
 from .openrouter import OpenRouterError, Parsed, parse_invoice
 
@@ -83,6 +83,9 @@ def run(invoice_id: int) -> None:
             # БИН на фото читается не всегда: если поставщик знакомый, берём
             # его из прошлой накладной.
             _fill_supplier(invoice)
+            # Штрихкод модель читает через раз: колонка узкая, печать бледная.
+            # Тот же товар уже приходил — берём код из прошлой накладной.
+            _fill_barcodes(invoice)
             # Позиции уже в базе — сводим их с номенклатурой UMAG, пока накладная
             # числится «распознаётся»: готовой она станет уже сопоставленной.
             _match(invoice)
@@ -253,6 +256,16 @@ def _fill_supplier(invoice: Invoice) -> None:
         suppliers.fill(invoice)
     except Exception as error:  # noqa: BLE001 — сеть и чужая модель
         logger.warning('Не удалось подобрать БИН для накладной %s: %s', invoice.pk, error)
+
+
+def _fill_barcodes(invoice: Invoice) -> None:
+    """Дописывает штрихкоды по прошлым накладным. Не нашлось — строку сверит
+    человек: он и так проходит накладную глазами перед отправкой."""
+
+    try:
+        known_barcodes.fill(invoice)
+    except Exception as error:  # noqa: BLE001 — подбор не должен ронять разбор
+        logger.warning('Не удалось подобрать штрихкоды для накладной %s: %s', invoice.pk, error)
 
 
 def _match(invoice: Invoice) -> None:

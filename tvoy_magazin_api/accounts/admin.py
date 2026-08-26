@@ -17,7 +17,15 @@ class OrganizationAdmin(admin.ModelAdmin):
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
     ordering = ('email',)
-    list_display = ('email', 'name', 'organization', 'role', 'is_active')
+    list_display = (
+        'email',
+        'name',
+        'organization',
+        'role',
+        'purchases_access',
+        'assistant_access',
+        'is_active',
+    )
     list_filter = ('organization', 'role', 'is_active', 'is_staff')
     search_fields = ('email', 'name')
 
@@ -26,6 +34,14 @@ class UserAdmin(BaseUserAdmin):
         ('Профиль', {'fields': ('name',)}),
         # Пока людей заводят отсюда: своего экрана для приглашений ещё нет.
         ('Организация', {'fields': ('organization', 'role')}),
+        (
+            'Разделы приложения',
+            {
+                'fields': ('purchases_access', 'assistant_access'),
+                'description': 'Менеджеру закупки и помощник закрыты, пока не отмечены здесь. '
+                'Владельцу и администратору они открыты всегда.',
+            },
+        ),
         ('Права', {'fields': ('is_active', 'is_staff', 'is_superuser', 'groups', 'user_permissions')}),
         ('Даты', {'fields': ('last_login', 'date_joined')}),
     )

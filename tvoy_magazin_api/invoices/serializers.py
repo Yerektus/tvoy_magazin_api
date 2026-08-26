@@ -26,6 +26,7 @@ class InvoiceLineSerializer(serializers.ModelSerializer):
             'position',
             'name',
             'barcode',
+            'barcode_auto',
             'quantity',
             'unit',
             'price',
@@ -35,7 +36,15 @@ class InvoiceLineSerializer(serializers.ModelSerializer):
             'umag_product_name',
             'umag_confidence',
         )
-        read_only_fields = ('id', 'position', 'umag_product_name', 'umag_confidence')
+        read_only_fields = (
+            'id',
+            'position',
+            # Подобран он или прочитан — решает сервер: правка штрихкода руками
+            # эту отметку снимает, а выставить её со стороны нельзя.
+            'barcode_auto',
+            'umag_product_name',
+            'umag_confidence',
+        )
         # Строку добавляют пустой и заполняют прямо в таблице, поэтому название
         # при создании не требуем — вью подставит заглушку.
         extra_kwargs = {'name': {'required': False, 'allow_blank': True}}

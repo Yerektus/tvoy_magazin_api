@@ -171,96 +171,6 @@ RESPONSE_SCHEMA = {
 }
 
 
-MATCH_PROMPT = """Ты сопоставляешь позиции товарной накладной с номенклатурой
-магазина и возвращаешь строгий JSON.
-
-К каждой строке накладной приложен список кандидатов из кабинета — товары,
-которые нашлись по названию. Выбери из них тот, которым эта строка и является,
-либо null, если подходящего нет.
-
-## Как выбирать
-
-- Совпадать должен сам товар: бренд, вид, вкус, объём или вес, фасовка.
-  «Пепси 1 л» и «Пепси 0.5 л» — разные товары, это не один и тот же.
-- «*12», «х6», «уп.» в конце названия из накладной — это сколько штук в
-  коробке у поставщика. К выбору товара это отношения не имеет.
-- Сокращения и опечатки в накладной обычны: «мол.», «слив. масло»,
-  «кока-кола ж/б 0,33» — читай их как продавец, а не буквально.
-- Единица измерения помогает: килограммы не совпадут со штучной карточкой.
-- Не уверен — ставь product_id null. Ошибка тут дороже пропуска: пропущенную
-  строку человек сопоставит руками, а неверный товар молча уедет в приёмку и
-  испортит остатки.
-- confidence — от 0 до 1, насколько ты уверен в выборе. Для null ставь 0.
-"""
-
-MATCH_SCHEMA = {
-    'type': 'object',
-    'additionalProperties': False,
-    'required': ['matches'],
-    'properties': {
-        'matches': {
-            'type': 'array',
-            'items': {
-                'type': 'object',
-                'additionalProperties': False,
-                'required': ['line_id', 'product_id', 'confidence'],
-                'properties': {
-                    'line_id': {'type': 'integer', 'description': 'id строки накладной'},
-                    'product_id': {
-                        'type': ['integer', 'null'],
-                        'description': 'id товара из списка кандидатов этой строки или null',
-                    },
-                    'confidence': {'type': 'number', 'description': 'Уверенность в выборе, от 0 до 1'},
-                },
-            },
-        },
-    },
-}
-
-
-SEARCH_PROMPT = """Ты выбираешь, каким куском названия искать товар накладной
-в номенклатуре магазина, и возвращаешь строгий JSON.
-
-Строка накладной длиннее карточки в кабинете: «Пряник шоколадный 450гр Сайрам
-нан 1*14» лежит там как «Пряник шоколадный сайрам нан». Ищет кабинет по куску
-названия, поэтому оставить нужно то, что в карточке наверняка есть.
-
-## Как выбирать
-
-- Оставляй сам товар и, если он есть, бренд: «Коржик Ромашка»,
-  «Напиток PEPSI-COLA», «Пряник шоколадный».
-- Фасовку выкидывай всегда: «1*14», «*12», «уп.», «1 кор» — это сколько штук
-  в коробке у поставщика, в карточке кабинета такого не пишут.
-- Вес и объём («450гр», «500 гр») тоже обычно лишние, но если они часть
-  самого названия («ПЭТ 1.0», «0.5»), оставляй.
-- Одного слова обычно мало, а всей строки много: два слова — самое то.
-  Слишком общее слово вроде «Напиток» или «Молоко» вернёт пол-магазина.
-- Порядок слов оставляй как в накладной: кабинет ищет по подстроке.
-- В названии нет ничего осмысленного — верни пустую строку.
-"""
-
-SEARCH_SCHEMA = {
-    'type': 'object',
-    'additionalProperties': False,
-    'required': ['queries'],
-    'properties': {
-        'queries': {
-            'type': 'array',
-            'items': {
-                'type': 'object',
-                'additionalProperties': False,
-                'required': ['line_id', 'query'],
-                'properties': {
-                    'line_id': {'type': 'integer', 'description': 'id строки накладной'},
-                    'query': {
-                        'type': 'string',
-                        'description': 'Чем искать товар в кабинете или пустая строка',
-                    },
-                },
-            },
-        },
-    },
-}
 
 
 SUPPLIER_PROMPT = """Ты сверяешь поставщика из накладной со списком тех, с кем
@@ -367,63 +277,6 @@ def parse_invoice(pages: list[tuple[bytes, str]]) -> Parsed:
     return _ask(payload)
 
 
-def match_products(lines: list[dict]) -> Parsed:
-    """Выбирает товар кабинета для каждой строки: одна ходка на всю накладную.
-
-    В `lines` идут строки, которым штрихкод не помог, вместе с кандидатами:
-    `{'id': …, 'name': …, 'unit': …, 'candidates': [{'id', 'name', 'barcode'}]}`.
-    """
-
-    payload = {
-        'model': settings.OPENROUTER_MATCH_MODEL,
-        'temperature': 0,
-        'max_tokens': 4000,
-        'messages': [
-            {'role': 'system', 'content': MATCH_PROMPT},
-            {
-                'role': 'user',
-                'content': 'Сопоставь позиции накладной с товарами магазина:\n'
-                           + json.dumps({'lines': lines}, ensure_ascii=False),
-            },
-        ],
-        'response_format': {
-            'type': 'json_schema',
-            'json_schema': {'name': 'matches', 'strict': True, 'schema': MATCH_SCHEMA},
-        },
-    }
-
-    return _ask(payload)
-
-
-def search_terms(lines: list[dict]) -> Parsed:
-    """Выбирает, каким куском названия искать каждую строку в кабинете.
-
-    В `lines` идут строки без штрихкода: `{'id': …, 'name': …}`. Одна ходка на
-    всю накладную — до того, как мы полезем в поиск UMAG.
-    """
-
-    payload = {
-        'model': settings.OPENROUTER_MATCH_MODEL,
-        'temperature': 0,
-        # Модель рассуждает в том же бюджете: на коротком ответ приходит пустым.
-        'max_tokens': 3000,
-        'messages': [
-            {'role': 'system', 'content': SEARCH_PROMPT},
-            {
-                'role': 'user',
-                'content': 'Выбери, чем искать эти позиции в номенклатуре:\n'
-                + json.dumps({'lines': lines}, ensure_ascii=False),
-            },
-        ],
-        'response_format': {
-            'type': 'json_schema',
-            'json_schema': {'name': 'queries', 'strict': True, 'schema': SEARCH_SCHEMA},
-        },
-    }
-
-    return _ask(payload)
-
-
 def match_supplier(name: str, candidates: list[dict]) -> Parsed:
     """Ищет того же поставщика среди тех, с кем уже работали.
 
@@ -470,6 +323,13 @@ def _ask(payload: dict) -> Parsed:
         content = body['choices'][0]['message']['content']
     except (KeyError, IndexError) as error:
         raise OpenRouterError(f'Неожиданный ответ OpenRouter: {str(body)[:500]}') from error
+
+    # Пустой `content` — не наша ошибка формата, а модель, которая всё сказала
+    # в рассуждении и вслух не ответила ничего. Так отвечают модели без
+    # поддержки строгой схемы; без этой проверки дальше падало `AttributeError`
+    # на пустоте, и в логе вместо причины была строчка про `NoneType`.
+    if not content:
+        raise OpenRouterError(f'Модель {body.get("model") or model} ответила пустотой')
 
     # Какая модель ответила на самом деле — при подмене из списка это важно.
     return Parsed(_load_json(content), body.get('model') or model, _cost(body))
