@@ -657,6 +657,66 @@ class UmagSupplyTests(APITestCase):
 
         self.assertEqual(codes, ['2110000043940', '2110000043957'])
 
+    def test_product_is_renamed_to_the_invoice_name(self):
+        """В кабинете товар заведён сокращением, в накладной — полным именем.
+
+        Сверять приёмку с бумагой по «HROOM со вкус.слад.чили» тяжело, поэтому
+        при отправке имя карточки становится тем, что в накладной.
+        """
+
+        line = self.invoice.lines.get()
+        line.name = 'Напиток PEPSI-COLA ПЭТ 1.0*12 (полное имя с бумаги)'
+        line.save(update_fields=('name',))
+
+        fake = FakeUmag()
+        with patch('umag.client._request', new=fake):
+            self.client.post(
+                f'/api/umag/invoices/{self.invoice.pk}/',
+                {'agent_id': 1832935},
+                format='json',
+            )
+
+        card = fake.payload('nom/product/edit')['productJson']
+
+        self.assertEqual(card['name'], 'Напиток PEPSI-COLA ПЭТ 1.0*12 (полное имя с бумаги)')
+        # Карточку шлём целиком: недосланное поле кабинет затрёт.
+        self.assertEqual(card['id'], 132421277)
+        self.assertEqual(card['measure'], 0)
+
+    def test_same_name_is_not_rewritten(self):
+        """Имя совпадает — в кабинет не ходим вовсе."""
+
+        line = self.invoice.lines.get()
+        line.name = 'Напиток PEPSI-COLA ПЭТ 1.0'
+        line.save(update_fields=('name',))
+
+        fake = FakeUmag()
+        with patch('umag.client._request', new=fake):
+            self.client.post(
+                f'/api/umag/invoices/{self.invoice.pk}/',
+                {'agent_id': 1832935},
+                format='json',
+            )
+
+        self.assertNotIn('nom/product/edit', [call['path'] for call in fake.calls])
+
+    def test_rename_failure_does_not_stop_the_supply(self):
+        """Имя дело десятое: приёмка важнее."""
+
+        line = self.invoice.lines.get()
+        line.name = 'Другое имя'
+        line.save(update_fields=('name',))
+
+        fake = FakeUmag(fail_on='nom/product/edit')
+        with patch('umag.client._request', new=fake):
+            response = self.client.post(
+                f'/api/umag/invoices/{self.invoice.pk}/',
+                {'agent_id': 1832935},
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 201)
+
     def test_double_lines_go_as_one(self):
         """Модель прочитала строку бумаги дважды — в приёмку уходит одна.
 

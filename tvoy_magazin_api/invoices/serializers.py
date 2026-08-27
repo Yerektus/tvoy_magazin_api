@@ -110,11 +110,15 @@ class InvoiceListSerializer(serializers.ModelSerializer):
 
 
 class InvoiceDetailSerializer(InvoiceListSerializer):
-    """Карточка накладной. Правятся руками поставщик и дата документа.
+    """Карточка накладной. Правятся руками поставщик, номер и дата документа.
 
     Дата — потому что кабинет её проверяет: приход раньше проведённой
     инвентаризации он не принимает, а модель нет-нет да и прочитает «2020»
     вместо «2026». Без правки такая накладная не уехала бы никогда.
+
+    Номер — потому что он уходит в комментарий приёмки, по нему её потом и
+    ищут в кабинете, а с бумаги он читается через раз: печать бледная, а рядом
+    стоят номера счёта и договора.
 
     Остальное либо прочитано с бумаги и меняется через «распознать заново»,
     либо ведётся нами (статус, стоимость разбора, отметки UMAG), поэтому
@@ -136,7 +140,9 @@ class InvoiceDetailSerializer(InvoiceListSerializer):
             'model',
             'lines',
         )
-        read_only_fields = tuple(set(fields) - {'supplier', 'supplier_bin', 'issued_at'})
+        read_only_fields = tuple(
+            set(fields) - {'supplier', 'supplier_bin', 'number', 'issued_at'}
+        )
 
     def get_images(self, invoice) -> list[str]:
         """Все листы по порядку, первым — тот, что в самой накладной.

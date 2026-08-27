@@ -787,8 +787,12 @@ class InvoiceTests(APITestCase):
         invoice.refresh_from_db()
         self.assertFalse(invoice.supplier_bin_auto)
 
-    def test_only_supplier_fields_can_be_edited(self):
-        """Остальное прочитано с бумаги или ведём мы — PATCH его не трогает."""
+    def test_totals_and_status_are_not_edited_by_hand(self):
+        """Итог считается по строкам, статус ведём мы — PATCH их не трогает.
+
+        Шапку документа править можно: номер и дату кабинет проверяет, а
+        читаются они с бумаги хуже всего.
+        """
 
         with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
             created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
@@ -797,12 +801,12 @@ class InvoiceTests(APITestCase):
 
         self.client.patch(
             f'/api/invoices/{created.data["id"]}/',
-            {'number': 'подделка', 'total': '999999', 'status': Invoice.Status.CHECKED},
+            {'number': '00788712', 'total': '999999', 'status': Invoice.Status.CHECKED},
             format='json',
         )
 
         after = Invoice.objects.get(pk=invoice.pk)
-        self.assertEqual(after.number, invoice.number)
+        self.assertEqual(after.number, '00788712')
         self.assertEqual(after.total, invoice.total)
         self.assertEqual(after.status, invoice.status)
 

@@ -25,6 +25,7 @@ LINE_TYPE = 0
 
 #: Заведение товара в номенклатуре кабинета.
 CREATE_PRODUCT = 'nom/product/create'
+EDIT_PRODUCT = 'nom/product/edit'
 
 #: Следующий свободный внутренний штрихкод кабинета. Им кабинет и сам метит
 #: товары, у которых кода на упаковке нет.
@@ -96,6 +97,9 @@ def push(invoice, account, agent_id: int | None = None) -> int:
         # здесь — его выдаёт кабинет, когда заводит карточку.
         with _step('новые товары'):
             _create_missing(client, invoice, matches, supplier['agent_id'])
+
+        with _step('названия товаров'):
+            _rename_products(client, matches)
 
         products = _products(matches)
 
@@ -534,6 +538,7 @@ def _match_line(line, client) -> dict:
         'suggested_barcode': '',
         'suggested_name': '',
         'confidence': None,
+        'card': None,
     }
 
     if not line.quantity or not line.price:
@@ -564,6 +569,9 @@ def _match_line(line, client) -> dict:
     product = found.get('product') or {}
     prices = found.get('productStorePrice') or {}
 
+    # Карточку держим целиком: чтобы переименовать товар, её нужно отправить
+    # обратно всю — из своих полей мы знаем далеко не все.
+    match['card'] = product
     match['product_id'] = product.get('id')
     match['product_name'] = product.get('name') or ''
     match['measure'] = matching.unit_for(product.get('measure'))
@@ -623,6 +631,48 @@ def _create_missing(client, invoice, matches: list[dict], agent_id: int | None) 
         taken.add(match['code'])
         _create_product(client, match, agent_id, default_category, line)
         match['status'] = 'new_product'
+
+
+def _rename_products(client, matches: list[dict]) -> None:
+    """Приводит названия карточек к тому, что написано в накладной.
+
+    В кабинете товар часто заведён сокращением вроде «HROOM со вкус.слад.чили»,
+    а в накладной он назван целиком. Сверять приёмку с бумагой по таким именам
+    тяжело, поэтому при отправке имя карточки становится тем, что в накладной.
+
+    Шлём карточку целиком, как её отдал кабинет, меняя одно поле: своих знаний
+    о ней не хватит, чтобы собрать её заново, а недосланное поле кабинет
+    затрёт. Отказ не роняет отправку — имя дело десятое, приёмка важнее.
+    """
+
+    for match in matches:
+        card = match.get('card')
+        wanted = (match['name'] or '').strip()[:255]
+
+        if match['status'] != 'ok' or not card or not wanted:
+            continue
+
+        if wanted == (card.get('name') or '').strip():
+            continue
+
+        try:
+            client.post_form(EDIT_PRODUCT, {'productJson': {**card, 'name': wanted}})
+        except UmagError as error:
+            logger.warning(
+                'Не удалось переименовать товар %s в магазине %s: %s',
+                card.get('id'),
+                client.store_id,
+                error,
+            )
+            continue
+
+        logger.info(
+            'Переименовали товар %s: «%s» → «%s»',
+            card.get('id'),
+            card.get('name'),
+            wanted,
+        )
+        match['product_name'] = wanted
 
 
 def _inner_barcode(client, taken: set[str]) -> str:
