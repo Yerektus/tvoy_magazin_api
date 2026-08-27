@@ -496,7 +496,10 @@ class UmagSupplyTests(APITestCase):
 
         header = fake.payload('/edit')
         self.assertEqual(header['supplierId'], 1832935)
-        self.assertEqual(header['docTime'], '2026-08-08T00:00:00')
+        # Дата — с бумаги, время — когда сняли: полночь ставит приход раньше
+        # утренних продаж, и товар оказывается проданным до привоза.
+        scanned = timezone.localtime(self.invoice.created_at).strftime('%H:%M:%S')
+        self.assertEqual(header['docTime'], f'2026-08-08T{scanned}')
         self.assertIn('4000108981', header['comment'])
 
         products = fake.payload('add-products')['products']
@@ -513,6 +516,57 @@ class UmagSupplyTests(APITestCase):
                 }
             ],
         )
+
+    def test_double_lines_go_as_one(self):
+        """Модель прочитала строку бумаги дважды — в приёмку уходит одна.
+
+        Кабинет на две строки с одним штрихкодом и ценой отвечает пятисоткой,
+        а по смыслу это одна поставка того же товара.
+        """
+
+        line = self.invoice.lines.get()
+        InvoiceLine.objects.create(
+            invoice=self.invoice,
+            position=2,
+            name=line.name,
+            barcode=line.barcode,
+            quantity=line.quantity,
+            unit=line.unit,
+            price=line.price,
+            total=line.total,
+        )
+
+        fake = FakeUmag()
+        with patch('umag.client._request', new=fake):
+            self.client.post(
+                f'/api/umag/invoices/{self.invoice.pk}/',
+                {'agent_id': 1832935},
+                format='json',
+            )
+
+        products = fake.payload('add-products')['products']
+
+        self.assertEqual(len(products), 1)
+        self.assertEqual(products[0]['quantity'], 8)
+
+    def test_failed_step_is_named_in_the_error(self):
+        """«Unhandled Server Error» без шага не говорит ничего.
+
+        По названию шага видно хотя бы, шапку кабинет не принял, товар или
+        строки, — иначе искать причину негде.
+        """
+
+        fake = FakeUmag(fail_on='add-products')
+
+        with patch('umag.client._request', new=fake):
+            response = self.client.post(
+                f'/api/umag/invoices/{self.invoice.pk}/',
+                {'agent_id': 1832935},
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertIn('шаг: позиции', response.data['detail'])
 
     def test_barcode_is_cleaned_before_sending(self):
         # Модель дописывает к штрихкоду единицы измерения — в UMAG идут цифры.

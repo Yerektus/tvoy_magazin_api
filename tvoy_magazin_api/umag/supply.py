@@ -6,7 +6,8 @@
 
 import logging
 import re
-from datetime import datetime, time
+from contextlib import contextmanager
+from datetime import datetime
 
 from django.utils import timezone
 
@@ -82,14 +83,32 @@ def push(invoice, account, agent_id: int | None = None) -> int:
         raise NotReady('; '.join(problems))
 
     supply_id = _create_draft(client)
+    products = _products(matches)
 
     try:
-        _set_header(client, supply_id, invoice, supplier['agent_id'])
-        _create_missing(client, matches, supplier['agent_id'])
-        client.post(
-            f'opr/supplies/v2/{supply_id}/add-products',
-            {'products': [_product(match) for match in matches]},
-        )
+        with _step('шапка приёмки'):
+            _set_header(client, supply_id, invoice, supplier['agent_id'])
+
+        with _step('новые товары'):
+            _create_missing(client, matches, supplier['agent_id'])
+
+        with _step('позиции'):
+            try:
+                client.post(
+                    f'opr/supplies/v2/{supply_id}/add-products',
+                    {'products': products},
+                )
+            except UmagError:
+                # Кабинет на 500 не говорит, чем ему не понравились строки, —
+                # кладём их в лог: без них причину не найти по одной фразе
+                # «Unhandled Server Error».
+                logger.warning(
+                    'UMAG не принял позиции накладной %s (%s строк): %s',
+                    invoice.pk,
+                    len(products),
+                    products,
+                )
+                raise
     except UmagError:
         # Половина приёмки хуже, чем её отсутствие: убираем за собой.
         _delete_draft(client, supply_id)
@@ -208,6 +227,44 @@ def _inspect(invoice, client, create_supplier: bool = False) -> tuple[dict, list
     return supplier, matches, problems
 
 
+@contextmanager
+def _step(name: str):
+    """Помечает, на чём споткнулась отправка.
+
+    UMAG на пятисотке отвечает одной фразой «Unhandled Server Error» — по ней
+    не понять, шапку он не принял, товар или строки. Название шага в тексте
+    ошибки стоит того, чтобы человек хотя бы знал, куда смотреть.
+    """
+
+    try:
+        yield
+    except UmagError as error:
+        raise type(error)(f'{error} (шаг: {name})', error.status) from error
+
+
+def _products(matches: list[dict]) -> list[dict]:
+    """Строки приёмки. Одинаковые склеиваем в одну.
+
+    Модель иногда читает одну строку бумаги дважды, а кабинет на две строки с
+    одним штрихкодом и ценой отвечает пятисоткой. Сливаем только полные
+    двойники: тот же товар по другой цене — это акция, и в приёмке она
+    отдельной строкой.
+    """
+
+    merged: dict[tuple, dict] = {}
+
+    for match in matches:
+        product = _product(match)
+        key = (product['barcode'], product['arrivalCost'], product.get('sellingPrice'))
+
+        if key in merged:
+            merged[key]['quantity'] += product['quantity']
+        else:
+            merged[key] = product
+
+    return list(merged.values())
+
+
 def _create_draft(client) -> int:
     """`create` отдаёт пустой черновик — шапка и строки досылаются следом."""
 
@@ -254,13 +311,29 @@ def _doc_date(invoice):
     return invoice.issued_at or timezone.localdate(invoice.created_at)
 
 
+def _doc_moment(invoice) -> datetime:
+    """Дата документа и время, когда его сняли.
+
+    Полночь кабинет принимает, но приход тогда встаёт раньше всего, что было в
+    тот день, — и продажи утра оказываются сделанными из товара, которого ещё
+    не привезли. Время скана ближе к правде: накладную снимают, когда товар уже
+    в дверях.
+
+    Для документа не сегодняшнего дня время берём то же — час приёмки нам всё
+    равно неизвестен, а полночь для него так же неверна.
+    """
+
+    scanned = timezone.localtime(invoice.created_at or timezone.now())
+
+    return timezone.make_aware(datetime.combine(_doc_date(invoice), scanned.time()))
+
+
 def _doc_time(invoice) -> str:
-    return f'{_doc_date(invoice).isoformat()}T00:00:00'
+    return _doc_moment(invoice).strftime('%Y-%m-%dT%H:%M:%S')
 
 
 def _doc_millis(invoice) -> int:
-    moment = timezone.make_aware(datetime.combine(_doc_date(invoice), time.min))
-    return int(moment.timestamp() * 1000)
+    return int(_doc_moment(invoice).timestamp() * 1000)
 
 
 def _match_supplier(invoice, client, create: bool = False) -> dict:

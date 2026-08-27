@@ -7,7 +7,7 @@
 
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -25,6 +25,11 @@ from .openrouter import OpenRouterError, Parsed, parse_invoice
 logger = logging.getLogger(__name__)
 
 MAX_LINES = 200
+
+#: Насколько старой может быть дата на бумаге. Дальше это ошибка чтения года, а
+#: не документ: накладную снимают в день приёмки, изредка — позже разбирают
+#: пачку за неделю-другую.
+OLDEST = timedelta(days=45)
 
 # Сколько накладных разбираем одновременно. Бесплатные модели живут в общем
 # пуле и на пять параллельных запросов отвечают 429, поэтому по умолчанию — одна.
@@ -236,7 +241,7 @@ def _save(invoice: Invoice, parsed: Parsed) -> None:
     invoice.supplier = _text(payload.get('supplier'), 255)
     invoice.supplier_bin = _text(payload.get('supplier_bin'), 32)
     invoice.number = _text(payload.get('number'), 64)
-    invoice.issued_at = _date(payload.get('issued_at'))
+    invoice.issued_at = _issued_at(payload.get('issued_at'), invoice)
     invoice.total = _total(lines) or _decimal(payload.get('total'))
     invoice.raw_response = payload
     invoice.model = parsed.model
@@ -366,6 +371,28 @@ def _decimal(value):
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+
+
+def _issued_at(value, invoice: Invoice):
+    """Дата документа: с бумаги, а не прочиталась — день, когда его сняли.
+
+    Год модель путает: «27.08.2026» на бледной печати читается как «27.08.2020»,
+    и такую накладную кабинет не принимает — приход раньше проведённой
+    инвентаризации он отклоняет. Отличить опечатку модели от настоящей старой
+    накладной по самому числу нельзя, но накладную снимают в день приёмки, и
+    дата из позапрошлой пятилетки — это ошибка чтения, а не документ.
+
+    Границы широкие: месяц назад — обычное дело (бумагу нашли в пачке), а
+    завтрашним числом накладные не выписывают.
+    """
+
+    scanned = timezone.localdate(invoice.created_at or timezone.now())
+    issued = _date(value)
+
+    if issued is None or not scanned - OLDEST <= issued <= scanned:
+        return scanned
+
+    return issued
 
 
 def _date(value):
