@@ -35,6 +35,13 @@ class InvoiceLineSerializer(serializers.ModelSerializer):
             # единицы — штрихкод подставила модель, а не бумага.
             'umag_product_name',
             'umag_confidence',
+            # Такого товара в кабинете нет — карточку заведём при отправке, а
+            # что в ней написать, человек указывает в полях ниже.
+            'umag_missing',
+            'umag_new_name',
+            'umag_new_measure',
+            'umag_new_category_id',
+            'umag_new_selling_price',
         )
         read_only_fields = (
             'id',
@@ -44,6 +51,9 @@ class InvoiceLineSerializer(serializers.ModelSerializer):
             'barcode_auto',
             'umag_product_name',
             'umag_confidence',
+            # Есть товар в кабинете или нет — решает сопоставление, а не тот,
+            # кто правит строку.
+            'umag_missing',
         )
         # Строку добавляют пустой и заполняют прямо в таблице, поэтому название
         # при создании не требуем — вью подставит заглушку.

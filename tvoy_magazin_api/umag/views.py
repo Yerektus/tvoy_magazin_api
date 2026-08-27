@@ -10,7 +10,7 @@ from invoices.models import Invoice
 
 from . import client as umag_client
 from . import supply
-from .client import UmagAuthError, UmagError
+from .client import UmagAuthError, UmagClient, UmagError
 from .models import UmagAccount
 from .serializers import UmagAccountSerializer, UmagConnectSerializer, UmagStoreSerializer
 
@@ -116,6 +116,41 @@ class UmagStoresView(APIView):
             return Response({'detail': str(error)}, status=status.HTTP_502_BAD_GATEWAY)
 
         return Response(_stores(stores))
+
+
+class UmagCategoriesView(APIView):
+    """GET /api/umag/categories/ — полки кабинета.
+
+    Нужны там, где мы заводим товар за человека: в карточке позиции он выбирает,
+    куда положить новый товар, иначе тот уедет в «Незаданные» и потеряется среди
+    сотен таких же.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        account = _account(request)
+
+        if account is None or not account.ready:
+            return Response({'categories': []})
+
+        try:
+            body = UmagClient(account).get(supply.CATEGORIES)
+        except UmagError as error:
+            logger.warning('UMAG не отдал категории: %s', error)
+            return Response({'categories': []})
+
+        rows = body if isinstance(body, list) else (body or {}).get('categories') or []
+
+        return Response(
+            {
+                'categories': [
+                    {'id': row.get('id'), 'name': (row.get('name') or '').strip()}
+                    for row in rows
+                    if isinstance(row, dict) and row.get('id')
+                ]
+            }
+        )
 
 
 class UmagSupplyView(APIView):

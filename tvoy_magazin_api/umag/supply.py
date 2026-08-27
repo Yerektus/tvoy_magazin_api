@@ -494,6 +494,20 @@ def _agents(client) -> list[dict]:
     return (body.get('agents') or []) if isinstance(body, dict) else []
 
 
+def _mark_missing(line, missing: bool) -> None:
+    """Отмечает в строке, знает кабинет такой товар или нет.
+
+    По этой отметке карточка позиции показывает поля новой карточки товара: без
+    неё человек узнавал бы о том, что товара нет, только по отказу отправки.
+    """
+
+    if line.umag_missing == missing:
+        return
+
+    line.umag_missing = missing
+    line.save(update_fields=('umag_missing',))
+
+
 def _match_line(line, client) -> dict:
     """Ищет товар по штрихкоду. Что делать без него, знает `matching`."""
 
@@ -528,6 +542,7 @@ def _match_line(line, client) -> dict:
 
     if not code:
         match['status'] = 'no_barcode'
+        _mark_missing(line, True)
         return match
 
     try:
@@ -541,7 +556,10 @@ def _match_line(line, client) -> dict:
         # с этим самым кодом, а не приклеивать строку к похожему по названию:
         # чужая карточка — это пересорт, который потом никто не распутает.
         match['status'] = 'new_product'
+        _mark_missing(line, True)
         return match
+
+    _mark_missing(line, False)
 
     product = found.get('product') or {}
     prices = found.get('productStorePrice') or {}
@@ -590,18 +608,20 @@ def _create_missing(client, invoice, matches: list[dict], agent_id: int | None) 
     if not missing:
         return
 
-    category = _category_id(client)
+    default_category = _category_id(client)
     lines = {line.pk: line for line in invoice.lines.all()}
     taken: set[str] = set()
 
     for match in missing:
+        line = lines.get(match['id'])
+
         if not match['code']:
             match['code'] = _inner_barcode(client, taken)
             match['barcode'] = match['code']
-            _remember_code(lines.get(match['id']), match['code'])
+            _remember_code(line, match['code'])
 
         taken.add(match['code'])
-        _create_product(client, match, agent_id, category)
+        _create_product(client, match, agent_id, default_category, line)
         match['status'] = 'new_product'
 
 
@@ -661,33 +681,48 @@ def _remember_code(line, code: str) -> None:
     line.save(update_fields=('barcode', 'barcode_auto'))
 
 
-def _create_product(client, match: dict, agent_id: int | None, category: int | None) -> None:
-    """Карточка товара по штрихкоду из накладной.
+def _create_product(
+    client,
+    match: dict,
+    agent_id: int | None,
+    category: int | None,
+    line=None,
+) -> None:
+    """Карточка товара для строки, которой в кабинете ещё нет.
 
-    Цену на полке ставим равной приходу: продавать себе в убыток хуже, чем
-    продавать без наценки, а настоящую цену магазин выставляет сам. Название и
-    единица — те, что прочитаны с бумаги; поправить их человек может в кабинете.
+    Что в ней написать, человек указывает в самой строке — название, единицу,
+    категорию и цену на полке. Не указал — берём то, что прочитано с бумаги:
+    название строки, её единицу и цену прихода. Цена на полке равна приходу:
+    продавать себе в убыток хуже, чем продавать без наценки, а настоящую цену
+    магазин выставляет сам.
     """
 
     code = match['code']
-    measure = UNITS.get((match.get('unit') or '').strip().lower(), 0)
     arrival = float(match['price'])
+
+    measure = getattr(line, 'umag_new_measure', None)
+    if measure is None:
+        measure = UNITS.get((match.get('unit') or '').strip().lower(), 0)
+
+    name = (getattr(line, 'umag_new_name', '') or match['name'] or '')[:255]
+    selling = getattr(line, 'umag_new_selling_price', None)
+    chosen_category = getattr(line, 'umag_new_category_id', None) or category
 
     product = {
         'id': None,
-        'name': (match['name'] or '')[:255],
+        'name': name,
         'measure': measure,
         'type': _product_type(code, measure),
         # Код и штрихкод в карточке кабинета — одно и то же значение.
         'code': code,
         'barcode': code,
-        'categoryId': category,
+        'categoryId': chosen_category,
     }
     price = {
         'storeId': client.store_id,
         'productId': None,
         'arrivalCost': arrival,
-        'sellingPrice': arrival,
+        'sellingPrice': float(selling) if selling is not None else arrival,
         'wholesalePrice': 0,
         'isHiddenOnScale': False,
     }

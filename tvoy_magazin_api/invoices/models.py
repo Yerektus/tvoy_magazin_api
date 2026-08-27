@@ -188,6 +188,29 @@ class InvoiceLine(models.Model):
     price = models.DecimalField('цена по накладной', max_digits=12, decimal_places=2, null=True, blank=True)
     total = models.DecimalField('сумма', max_digits=12, decimal_places=2, null=True, blank=True)
 
+    # Такого товара в кабинете нет: штрихкод не нашёлся или его нет вовсе.
+    # Тогда карточку заводим мы сами при отправке, а что в ней написать —
+    # человек указывает здесь, в полях ниже.
+    umag_missing = models.BooleanField('нет в UMAG', default=False)
+
+    # Чем заполнить карточку нового товара. Пусто — берём то, что прочитано с
+    # бумаги: название строки, единицу и цену прихода.
+    umag_new_name = models.CharField('название для UMAG', max_length=255, blank=True)
+    umag_new_measure = models.PositiveSmallIntegerField(
+        'единица в UMAG',
+        null=True,
+        blank=True,
+        help_text='0 — штучный, 1 — весовой, 2 — разливной',
+    )
+    umag_new_category_id = models.PositiveBigIntegerField('категория в UMAG', null=True, blank=True)
+    umag_new_selling_price = models.DecimalField(
+        'цена продажи',
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+
     # Товар кабинета, которым эта строка является. По штрихкоду находится точно,
     # по названию его выбирает модель — тогда штрихкод в строку вписывает
     # человек, а до этого выбор живёт здесь и второй раз не оплачивается.

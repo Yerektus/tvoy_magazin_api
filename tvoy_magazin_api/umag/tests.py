@@ -519,6 +519,76 @@ class UmagSupplyTests(APITestCase):
             ],
         )
 
+    def test_new_card_is_filled_from_the_line(self):
+        """Что написать в карточке, человек указывает в самой позиции.
+
+        Иначе товар уезжал в «Незаданные» под названием с бумаги и с ценой,
+        равной приходу, — и всё это правили потом в кабинете руками.
+        """
+
+        line = self.invoice.lines.get()
+        line.barcode = '4870145009999'
+        line.umag_new_name = 'Пепси 1 л'
+        line.umag_new_measure = 2
+        line.umag_new_category_id = 901
+        line.umag_new_selling_price = 700
+        line.save()
+
+        fake = FakeUmag()
+        with patch('umag.client._request', new=fake):
+            self.client.post(
+                f'/api/umag/invoices/{self.invoice.pk}/',
+                {'agent_id': 1832935},
+                format='json',
+            )
+
+        created = fake.payload('nom/product/create')
+        product = created['productJson']
+        price = created['productStorePriceJson']
+
+        self.assertEqual(product['name'], 'Пепси 1 л')
+        self.assertEqual(product['measure'], 2)
+        self.assertEqual(product['categoryId'], 901)
+        self.assertEqual(price['sellingPrice'], 700)
+        # Цена прихода — из накладной, её человек не выдумывает.
+        self.assertEqual(price['arrivalCost'], 535.5)
+
+    def test_missing_product_is_marked_in_the_line(self):
+        """Строка знает, что товара в кабинете нет: по этому карточка позиции
+        и показывает поля новой карточки."""
+
+        line = self.invoice.lines.get()
+        line.barcode = '4870145009999'
+        line.save(update_fields=('barcode',))
+
+        fake = FakeUmag()
+        with patch('umag.client._request', new=fake):
+            self.client.get(f'/api/umag/invoices/{self.invoice.pk}/')
+
+        line.refresh_from_db()
+        self.assertTrue(line.umag_missing)
+
+        # Штрихкод поправили на знакомый — отметка снимается сама.
+        line.barcode = '4870145005545'
+        line.save(update_fields=('barcode',))
+
+        with patch('umag.client._request', new=fake):
+            self.client.get(f'/api/umag/invoices/{self.invoice.pk}/')
+
+        line.refresh_from_db()
+        self.assertFalse(line.umag_missing)
+
+    def test_categories_come_from_the_cabinet(self):
+        fake = FakeUmag()
+
+        with patch('umag.client._request', new=fake):
+            response = self.client.get('/api/umag/categories/')
+
+        self.assertEqual(
+            response.data['categories'],
+            [{'id': 900, 'name': 'Незаданные'}, {'id': 901, 'name': 'Напитки'}],
+        )
+
     def test_line_without_barcode_gets_an_inner_code(self):
         """Кода на упаковке нет — берём внутренний у кабинета и заводим товар.
 
