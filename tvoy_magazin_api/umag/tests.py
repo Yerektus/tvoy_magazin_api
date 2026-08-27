@@ -96,6 +96,8 @@ class FakeUmag:
             return self.answers.get('by_part', [])
         if path == 'nom/product/report':
             return self.answers.get('report', [])
+        if path == 'nom/product-v1/findNextInnerBarcode':
+            return {'barcode': 2110000043940}
         if path == 'opr/supplies/v2/create':
             return {'id': 122693174}
         if path == 'org/agent/create':
@@ -516,6 +518,74 @@ class UmagSupplyTests(APITestCase):
                 }
             ],
         )
+
+    def test_line_without_barcode_gets_an_inner_code(self):
+        """Кода на упаковке нет — берём внутренний у кабинета и заводим товар.
+
+        Раньше такая строка просто не давала отправить накладную, и человек
+        заводил товар руками, а потом искал, чем её сопоставить.
+        """
+
+        line = self.invoice.lines.get()
+        line.barcode = ''
+        line.save(update_fields=('barcode',))
+
+        fake = FakeUmag()
+        with patch('umag.client._request', new=fake):
+            response = self.client.post(
+                f'/api/umag/invoices/{self.invoice.pk}/',
+                {'agent_id': 1832935},
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 201)
+
+        created = fake.payload('nom/product/create')['productJson']
+        self.assertEqual(created['barcode'], '2110000043940')
+        # Внутренний код — своя разновидность карточки, кабинет их различает.
+        self.assertEqual(created['type'], 2)
+
+        # Строка накладной знает, под каким кодом уехал товар.
+        line.refresh_from_db()
+        self.assertEqual(line.barcode, '2110000043940')
+        self.assertTrue(line.barcode_auto)
+
+        # И этот же код уходит в приёмку.
+        products = fake.payload('add-products')['products']
+        self.assertEqual(products[0]['barcode'], 2110000043940)
+
+    def test_two_lines_without_barcodes_get_different_codes(self):
+        """Кабинет узнаёт о занятом коде только после создания товара."""
+
+        line = self.invoice.lines.get()
+        line.barcode = ''
+        line.save(update_fields=('barcode',))
+        InvoiceLine.objects.create(
+            invoice=self.invoice,
+            position=2,
+            name='Коржик Ромашка',
+            barcode='',
+            quantity=3,
+            unit='шт',
+            price=200,
+            total=600,
+        )
+
+        fake = FakeUmag()
+        with patch('umag.client._request', new=fake):
+            self.client.post(
+                f'/api/umag/invoices/{self.invoice.pk}/',
+                {'agent_id': 1832935},
+                format='json',
+            )
+
+        codes = [
+            call['payload']['productJson']['barcode']
+            for call in fake.calls
+            if call['path'] == 'nom/product/create'
+        ]
+
+        self.assertEqual(codes, ['2110000043940', '2110000043957'])
 
     def test_double_lines_go_as_one(self):
         """Модель прочитала строку бумаги дважды — в приёмку уходит одна.

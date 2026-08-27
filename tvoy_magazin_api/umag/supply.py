@@ -25,6 +25,10 @@ LINE_TYPE = 0
 
 #: Заведение товара в номенклатуре кабинета.
 CREATE_PRODUCT = 'nom/product/create'
+
+#: Следующий свободный внутренний штрихкод кабинета. Им кабинет и сам метит
+#: товары, у которых кода на упаковке нет.
+NEXT_INNER = 'nom/product-v1/findNextInnerBarcode'
 CATEGORIES = 'nom/category/find-categories'
 
 #: Куда кладём заведённый товар. Так кабинет называет категорию для тех, кому
@@ -83,14 +87,17 @@ def push(invoice, account, agent_id: int | None = None) -> int:
         raise NotReady('; '.join(problems))
 
     supply_id = _create_draft(client)
-    products = _products(matches)
 
     try:
         with _step('шапка приёмки'):
             _set_header(client, supply_id, invoice, supplier['agent_id'])
 
+        # Строки собираем после: у товаров без штрихкода код появляется только
+        # здесь — его выдаёт кабинет, когда заводит карточку.
         with _step('новые товары'):
-            _create_missing(client, matches, supplier['agent_id'])
+            _create_missing(client, invoice, matches, supplier['agent_id'])
+
+        products = _products(matches)
 
         with _step('позиции'):
             try:
@@ -217,8 +224,13 @@ def _inspect(invoice, client, create_supplier: bool = False) -> tuple[dict, list
     if not matches:
         problems.append('В накладной нет позиций')
 
-    # `new_product` не помеха: такой товар мы заведём сами при отправке.
-    stuck = [match for match in matches if match['status'] not in ('ok', 'new_product')]
+    # `new_product` и `no_barcode` не помеха: такой товар мы заведём сами при
+    # отправке — с кодом из накладной или с внутренним, выданным кабинетом.
+    stuck = [
+        match
+        for match in matches
+        if match['status'] not in ('ok', 'new_product', 'no_barcode')
+    ]
     if stuck:
         names = ', '.join(f'«{match["name"]}»' for match in stuck[:3])
         tail = f' и ещё {len(stuck) - 3}' if len(stuck) > 3 else ''
@@ -558,22 +570,95 @@ def _match_line(line, client) -> dict:
     return match
 
 
-def _create_missing(client, matches: list[dict], agent_id: int | None) -> None:
+def _create_missing(client, invoice, matches: list[dict], agent_id: int | None) -> None:
     """Заводит в кабинете товары, которых там ещё нет.
+
+    Их два вида. У одних штрихкод с бумаги есть, но карточки под него нет —
+    товар новый, заводим с этим кодом. У других кода нет вовсе: на упаковке его
+    не печатают, и в накладной пусто. Такому берём внутренний код у самого
+    кабинета — тем же способом, каким он метит товар без штрихкода, когда
+    карточку заводят руками.
 
     Зовётся только из `push`: осмотр обязан оставаться чтением, иначе один
     взгляд на вкладку «Проверка» плодил бы карточки.
     """
 
-    missing = [match for match in matches if match['status'] == 'new_product']
+    missing = [
+        match for match in matches if match['status'] in ('new_product', 'no_barcode')
+    ]
 
     if not missing:
         return
 
     category = _category_id(client)
+    lines = {line.pk: line for line in invoice.lines.all()}
+    taken: set[str] = set()
 
     for match in missing:
+        if not match['code']:
+            match['code'] = _inner_barcode(client, taken)
+            match['barcode'] = match['code']
+            _remember_code(lines.get(match['id']), match['code'])
+
+        taken.add(match['code'])
         _create_product(client, match, agent_id, category)
+        match['status'] = 'new_product'
+
+
+def _inner_barcode(client, taken: set[str]) -> str:
+    """Внутренний штрихкод от кабинета.
+
+    Кабинет отдаёт следующий свободный, но узнаёт о занятом только после того,
+    как товар создан, — а в одной накладной таких строк бывает несколько подряд.
+    Поэтому уже выданные в этой отправке пропускаем сами, пересчитывая
+    контрольную цифру.
+    """
+
+    body = client.get(NEXT_INNER)
+    code = str((body or {}).get('barcode') or '').strip()
+
+    if not code:
+        raise UmagError('UMAG не выдал внутренний штрихкод')
+
+    while code in taken:
+        code = _next_code(code)
+
+    return code
+
+
+def _next_code(code: str) -> str:
+    """Следующий код за этим: тело плюс один и новая контрольная цифра."""
+
+    body = str(int(code[:-1]) + 1).zfill(len(code) - 1)
+
+    return body + str(_check_digit(body))
+
+
+def _check_digit(body: str) -> int:
+    """Контрольная цифра EAN: веса 3 и 1 справа налево."""
+
+    checksum = sum(
+        int(digit) * (3 if position % 2 == 0 else 1)
+        for position, digit in enumerate(reversed(body))
+    )
+
+    return (10 - checksum % 10) % 10
+
+
+def _remember_code(line, code: str) -> None:
+    """Кладёт выданный код в строку накладной.
+
+    Иначе он остался бы только в кабинете: человек не увидел бы, под каким
+    кодом уехал товар, а следующая накладная с тем же названием завела бы ему
+    вторую карточку.
+    """
+
+    if line is None:
+        return
+
+    line.barcode = code
+    line.barcode_auto = True
+    line.save(update_fields=('barcode', 'barcode_auto'))
 
 
 def _create_product(client, match: dict, agent_id: int | None, category: int | None) -> None:
