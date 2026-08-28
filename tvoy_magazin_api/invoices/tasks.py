@@ -305,8 +305,10 @@ def _line(invoice: Invoice, position: int, line: dict) -> InvoiceLine:
     total = _decimal(line.get('total'))
 
     # Сумму строки модель то читает, то нет — там, где её просто не напечатали,
-    # считаем сами.
-    if total is None and quantity is not None and price is not None:
+    # считаем сами. Ноль при живых количестве и цене — это тоже «не прочитала»:
+    # товара на четыре штуки по 460 не бывает на ноль тенге, а в накладной такая
+    # строка портит итог и уезжает нулём в приёмку.
+    if not total and quantity is not None and price is not None:
         total = quantity * price
 
     return InvoiceLine(

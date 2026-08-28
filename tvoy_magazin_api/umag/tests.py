@@ -578,6 +578,36 @@ class UmagSupplyTests(APITestCase):
         line.refresh_from_db()
         self.assertFalse(line.umag_missing)
 
+    def test_scanner_asks_the_cabinet_about_the_barcode(self):
+        """Код считан — человек должен сразу увидеть, тот ли это товар."""
+
+        fake = FakeUmag()
+
+        with patch('umag.client._request', new=fake):
+            response = self.client.get('/api/umag/products/4870145005545/')
+
+        self.assertTrue(response.data['found'])
+        self.assertEqual(response.data['name'], 'Напиток PEPSI-COLA ПЭТ 1.0')
+        self.assertEqual(response.data['stock'], 165)
+        self.assertEqual(response.data['measure'], 'шт')
+
+    def test_unknown_barcode_is_not_an_error(self):
+        """Такого товара в кабинете нет — это ответ, а не поломка: заведём его
+        сами при отправке."""
+
+        fake = FakeUmag()
+
+        with patch('umag.client._request', new=fake):
+            response = self.client.get('/api/umag/products/4870145009999/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data['found'])
+
+    def test_barcode_with_letters_is_refused(self):
+        response = self.client.get('/api/umag/products/abc/')
+
+        self.assertEqual(response.status_code, 400)
+
     def test_categories_come_from_the_cabinet(self):
         fake = FakeUmag()
 

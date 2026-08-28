@@ -14,7 +14,8 @@ from PIL import Image, ImageDraw
 from rest_framework.test import APITestCase
 
 from accounts.tests import make_organization, make_user
-from umag.models import UmagAccount
+from umag import catalog as umag_catalog
+from umag.models import UmagAccount, UmagProduct
 from umag.tests import FakeUmag
 
 from . import openrouter, preview
@@ -395,6 +396,37 @@ class InvoiceTests(APITestCase):
         self.assertEqual(len(lines), 2)
         self.assertEqual(lines[0].barcode, '4870145005545')
         self.assertEqual(str(lines[0].price), '535.50')
+
+    def test_zero_total_is_counted_from_quantity_and_price(self):
+        """Ноль в сумме — это «модель не прочитала», а не «товар бесплатный».
+
+        Такая строка портила итог накладной и уезжала нулём в приёмку.
+        """
+
+        parsed = Parsed(
+            {
+                **PARSED,
+                'lines': [
+                    {
+                        'name': 'Рогалик с орехами',
+                        'quantity': 4,
+                        'unit': 'шт',
+                        'price': 460,
+                        'total': 0,
+                    }
+                ],
+            },
+            PARSE_RESULT.model,
+            PARSE_RESULT.cost,
+        )
+
+        with patch('invoices.tasks.parse_invoice', return_value=parsed):
+            response = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        invoice = Invoice.objects.get(pk=response.data['id'])
+
+        self.assertEqual(str(invoice.lines.get().total), '1840.00')
+        self.assertEqual(str(invoice.total), '1840.00')
 
     def test_upload_remembers_chosen_store(self):
         """Магазин выбирают в шапке и меняют когда угодно — накладная держится своего."""
@@ -1466,6 +1498,69 @@ class KnownBarcodeTests(APITestCase):
 
         self.assertEqual(line.barcode, '4870145005545')
         self.assertFalse(line.barcode_auto)
+
+    def known_card(self, name: str, barcode: str = '4870145005545', store_id: int = 17795):
+        """Карточка в нашей копии номенклатуры кабинета."""
+
+        return UmagProduct.objects.create(
+            store_id=store_id,
+            barcode=barcode,
+            name=name,
+            search_name=umag_catalog.normalize(name),
+            measure='шт',
+        )
+
+    def test_catalogue_helps_when_our_invoices_do_not(self):
+        """Товар приходит впервые, но в магазине он давно заведён."""
+
+        self.user.umag_account = UmagAccount.objects.create(
+            user=self.user,
+            phone='7474419654',
+            token='u33577.token',
+            store_id=17795,
+        )
+        self.known_card('Рогалик с орехами 80г')
+
+        line = self.upload('Рогалик с орехами 80 г')
+
+        self.assertEqual(line.barcode, '4870145005545')
+        self.assertTrue(line.barcode_auto)
+
+    def test_two_close_cards_are_left_to_the_human(self):
+        """Вкусы одного товара лежат в номенклатуре рядом.
+
+        Выбрать за человека нельзя: приход на чужую карточку — это пересорт,
+        который потом никто не распутает.
+        """
+
+        UmagAccount.objects.create(
+            user=self.user,
+            phone='7474419654',
+            token='u33577.token',
+            store_id=17795,
+        )
+        self.known_card('Сырок Чудо ваниль 40г', barcode='4607041420307')
+        self.known_card('Сырок Чудо шоколад 40г', barcode='4690228029943')
+
+        line = self.upload('Сырок Чудо 40г')
+
+        self.assertEqual(line.barcode, '')
+
+    def test_our_invoices_win_over_the_catalogue(self):
+        """Своя накладная точнее: там строку печатал тот же поставщик."""
+
+        UmagAccount.objects.create(
+            user=self.user,
+            phone='7474419654',
+            token='u33577.token',
+            store_id=17795,
+        )
+        self.known_line('Рогалик с орехами 80г', barcode='4870145005545')
+        self.known_card('Рогалик с орехами 80г', barcode='4690228029943')
+
+        line = self.upload('Рогалик с орехами 80г')
+
+        self.assertEqual(line.barcode, '4870145005545')
 
     def test_other_organization_is_not_looked_at(self):
         """Накладные соседнего магазина — чужие данные, и товар у него свой."""

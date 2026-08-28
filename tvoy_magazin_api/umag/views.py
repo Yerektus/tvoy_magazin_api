@@ -1,4 +1,5 @@
 import logging
+import re
 
 from rest_framework import generics, status
 from rest_framework.permissions import IsAuthenticated
@@ -149,6 +150,55 @@ class UmagCategoriesView(APIView):
                     for row in rows
                     if isinstance(row, dict) and row.get('id')
                 ]
+            }
+        )
+
+
+class UmagProductView(APIView):
+    """GET /api/umag/products/<barcode>/ — товар кабинета по штрихкоду.
+
+    Нужен сканеру: код считан, но человек ещё не знает, тот ли это товар. Ответ
+    показывают сразу, до сохранения строки, — сверить название с упаковкой
+    проще, чем потом искать пересорт в приёмке.
+
+    Ходим кабинетом того, кто сканирует: накладную мог загрузить сменщик, а
+    смотрит на неё сейчас этот человек.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, barcode: str):
+        code = re.sub(r'\D', '', barcode or '')
+        account = _account(request)
+
+        if not code:
+            return Response({'detail': 'Штрихкод — это цифры'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if account is None or not account.ready:
+            return Response({'detail': 'Сначала подключите UMAG'}, status=status.HTTP_409_CONFLICT)
+
+        try:
+            found = UmagClient(account).get('nom/product/findProductByBarcode', barcode=code)
+        except UmagError as error:
+            # 422 у кабинета означает «такого нет», а не поломку: товар новый,
+            # и заводить его будем при отправке.
+            if error.status == 422:
+                return Response({'found': False, 'barcode': code})
+
+            return Response({'detail': str(error)}, status=status.HTTP_502_BAD_GATEWAY)
+
+        product = found.get('product') or {}
+        prices = found.get('productStorePrice') or {}
+
+        return Response(
+            {
+                'found': True,
+                'barcode': code,
+                'id': product.get('id'),
+                'name': (product.get('name') or '').strip(),
+                'measure': supply.matching.unit_for(product.get('measure')),
+                'selling_price': prices.get('sellingPrice'),
+                'stock': found.get('stockQuantity'),
             }
         )
 
