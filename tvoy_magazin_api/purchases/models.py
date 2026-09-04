@@ -29,6 +29,11 @@ class PurchasePlan(models.Model):
     days = models.PositiveSmallIntegerField('период анализа, дней', default=30)
     horizon = models.PositiveSmallIntegerField('закупаем на, дней', default=14)
 
+    # Вычитать ли то, что уже лежит на полке. Обычно вычитаем: заказывать под
+    # полный горизонт поверх остатка значит везти второй запас того же. Но перед
+    # праздником или переездом склад в расчёт не берут — тогда снимают галочку.
+    use_stock = models.BooleanField('учитывать остаток', default=True)
+
     status = models.CharField('статус', max_length=16, choices=Status.choices, default=Status.BUILDING)
     error = models.TextField('ошибка', blank=True)
 

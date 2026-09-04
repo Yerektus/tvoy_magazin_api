@@ -39,6 +39,7 @@ class PurchasePlanSerializer(serializers.ModelSerializer):
             'store_name',
             'days',
             'horizon',
+            'use_stock',
             'items_total',
             'total_cost',
             'created_at',
@@ -52,3 +53,6 @@ class PurchasePlanRequestSerializer(serializers.Serializer):
 
     days = serializers.IntegerField(min_value=7, max_value=MAX_DAYS, required=False)
     horizon = serializers.IntegerField(min_value=1, max_value=MAX_HORIZON, required=False)
+
+    #: Вычитать ли остаток на полке из потребности.
+    use_stock = serializers.BooleanField(required=False)

@@ -7,6 +7,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.permissions import ManagesOrganization
+from extensions.models import Extension, ExtensionInstall
 from umag import matching, supply
 from umag.models import UmagAccount
 
@@ -19,6 +21,9 @@ from .serializers import (
     InvoiceListSerializer,
     check_photo,
 )
+
+# Код расширения в каталоге.
+SLUG = 'recognition'
 
 
 class InvoiceQuerysetMixin:
@@ -80,6 +85,15 @@ class InvoiceListCreateView(InvoiceQuerysetMixin, generics.ListCreateAPIView):
     #: не ограничение по смыслу: разбор всех листов идёт одним запросом к
     #: модели, и десяток фотографий в нём стоил бы дорого и читался бы хуже.
     MAX_PAGES = 5
+
+    def create(self, request, *args, **kwargs):
+        if not _installed(request.user):
+            return Response(
+                {'detail': 'Подключите расширение «Распознавание документов»'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        return super().create(request, *args, **kwargs)
 
     def perform_create(self, serializer):
         # Остальные листы приходят рядом с первым, полем `pages`: накладную на
@@ -265,6 +279,28 @@ def _account(user):
     return UmagAccount.objects.filter(user=user).first()
 
 
+def _installed(user) -> bool:
+    """Расширение включено у кого-то в организации.
+
+    Накладные общие: принимает сменщик, сверяет хозяин. Подключает владелец
+    один раз — и распознавать может вся смена.
+    """
+
+    if not user.organization_id:
+        return False
+
+    return ExtensionInstall.objects.filter(
+        user__organization_id=user.organization_id,
+        extension__slug=SLUG,
+    ).exists()
+
+
+def _state(user) -> dict:
+    """Состояние подключения — в том же виде, что у остальных расширений."""
+
+    return {'connected': _installed(user)}
+
+
 def _recount(line, changed: set) -> None:
     """Пересчитывает сумму строки после правки количества или цены.
 
@@ -335,10 +371,61 @@ class InvoiceCheckView(InvoiceQuerysetMixin, APIView):
         return Response(InvoiceDetailSerializer(invoice, context={'request': request}).data)
 
 
+class RecognitionAccessView(APIView):
+    """/api/invoices/access/ — подключение расширения «Распознавание документов».
+
+    Своего входа у него нет: это отметка, что организация им пользуется.
+    Накладные общие на смену, поэтому подключение одно на организацию, а не
+    на каждого сотрудника.
+
+    Читать состояние может любой — иначе список документов не поймёт, показывать
+    ему накладные или приглашение подключиться. Подключать и отключать
+    расширения — дело владельца и администратора.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get_permissions(self):
+        if self.request.method in ('POST', 'DELETE'):
+            return [IsAuthenticated(), ManagesOrganization()]
+
+        return super().get_permissions()
+
+    def get(self, request):
+        return Response(_state(request.user))
+
+    def post(self, request):
+        extension = Extension.objects.filter(slug=SLUG, is_active=True).first()
+
+        if extension is None:
+            return Response(
+                {'detail': 'Расширения нет в каталоге'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        ExtensionInstall.objects.get_or_create(user=request.user, extension=extension)
+        return Response(_state(request.user))
+
+    def delete(self, request):
+        # Снимаем со всех в организации: иначе владелец отключил, а накладные
+        # всё ещё распознаются от имени коллеги, у которого запись осталась.
+        ExtensionInstall.objects.filter(
+            user__organization_id=request.user.organization_id,
+            extension__slug=SLUG,
+        ).delete()
+        return Response(_state(request.user))
+
+
 class InvoiceRetryView(InvoiceQuerysetMixin, APIView):
     """POST /api/invoices/<id>/retry/ — перезапустить разбор."""
 
     def post(self, request, pk):
+        if not _installed(request.user):
+            return Response(
+                {'detail': 'Подключите расширение «Распознавание документов»'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
         invoice = generics.get_object_or_404(self.get_queryset(), pk=pk)
 
         if invoice.status == Invoice.Status.PROCESSING:

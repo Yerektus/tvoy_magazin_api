@@ -104,8 +104,10 @@ class PurchasePlanView(APIView):
             user=request.user,
             store_id=account.store_id,
             store_name=account.store_name,
-            # Чего не прислали — остаётся по умолчанию: 30 дней и горизонт в две недели.
-            **{key: value for key, value in form.validated_data.items() if value},
+            # Чего не прислали — остаётся по умолчанию: 30 дней, горизонт в две
+            # недели и учёт остатка. Пустые значения не отсеиваем: «не учитывать
+            # остаток» — это `False`, и по прежнему условию оно молча терялось.
+            **form.validated_data,
         )
 
         tasks.schedule(plan)

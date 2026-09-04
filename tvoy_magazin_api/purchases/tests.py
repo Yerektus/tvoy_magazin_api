@@ -134,6 +134,27 @@ class PlanningApiTests(APITestCase):
         self.connect_umag()
         return self.client.post('/api/purchases/access/', {}, format='json')
 
+    def test_stock_can_be_left_out_of_the_count(self):
+        """Перед праздником полку набивают заново, не глядя на остаток."""
+
+        self.install()
+        fake = FakeReport([product(saleQuantity=30, stockQuantity=10)])
+
+        with patch('umag.client._request', new=fake):
+            self.client.post(
+                '/api/purchases/plan/',
+                {'days': 30, 'horizon': 10, 'use_stock': False},
+                format='json',
+            )
+
+        plan = PurchasePlan.objects.get()
+        item = plan.items.get()
+
+        self.assertFalse(plan.use_stock)
+        # 30 продаж за 30 дней — это одна в день; на десять дней нужно десять,
+        # и лежащие на полке десять в расчёт не идут.
+        self.assertEqual(str(item.suggested), '10.000')
+
     def test_extension_needs_umag_first(self):
         response = self.client.post('/api/purchases/access/', {}, format='json')
 

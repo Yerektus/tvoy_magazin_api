@@ -63,7 +63,11 @@ def build(plan) -> None:
     except UmagError as error:
         raise PlanError(str(error)) from error
 
-    needed = [line for row in rows if (line := _line(row, plan.days, plan.horizon))]
+    needed = [
+        line
+        for row in rows
+        if (line := _line(row, plan.days, plan.horizon, plan.use_stock))
+    ]
 
     # Закупаются поставщиками, а не построчно, поэтому у каждой строки должен
     # быть свой. Не получилось — план всё равно нужен, просто без группировки.
@@ -189,7 +193,7 @@ def _name(item: dict) -> str:
     return (item.get('name') or item.get('supplierName') or '').strip()
 
 
-def _line(row: dict, days: int, horizon: int) -> dict | None:
+def _line(row: dict, days: int, horizon: int, use_stock: bool = True) -> dict | None:
     """Строка плана по товару. Пусто — заказывать нечего."""
 
     sold = _decimal(row.get('saleQuantity')) - _decimal(row.get('refundQuantity'))
@@ -204,7 +208,9 @@ def _line(row: dict, days: int, horizon: int) -> dict | None:
     measure = (row.get('measure') or '').strip()
 
     # Отрицательный остаток — пересорт в кабинете; для закупа это тот же ноль.
-    on_hand = max(stock, ZERO)
+    # А когда остаток не берут в расчёт, заказываем весь горизонт целиком: так
+    # считают перед праздником, когда полку хотят набить заново.
+    on_hand = max(stock, ZERO) if use_stock else ZERO
     suggested = _round(per_day * Decimal(horizon) - on_hand, measure)
 
     if suggested <= 0:

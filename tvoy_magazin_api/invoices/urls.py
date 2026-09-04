@@ -8,10 +8,12 @@ from .views import (
     InvoiceLineView,
     InvoiceListCreateView,
     InvoiceRetryView,
+    RecognitionAccessView,
 )
 
 urlpatterns = [
     path('', InvoiceListCreateView.as_view(), name='invoice-list'),
+    path('access/', RecognitionAccessView.as_view(), name='recognition-access'),
     path('counts/', InvoiceCountsView.as_view(), name='invoice-counts'),
     path('<int:pk>/', InvoiceDetailView.as_view(), name='invoice-detail'),
     path('<int:pk>/check/', InvoiceCheckView.as_view(), name='invoice-check'),
