@@ -9,13 +9,15 @@ from rest_framework.views import APIView
 
 from accounts.permissions import ManagesOrganization, UsesPurchases
 from extensions.models import Extension, ExtensionInstall
-from umag.models import UmagAccount
+from umag.models import UmagAccount, UmagSalesSync
 
-from . import tasks
+from . import products, tasks
 from .models import ApprovedPurchase, ApprovedPurchaseItem, PurchasePlan
 from .serializers import (
     ApproveSupplierSerializer,
     ApprovedPurchaseSerializer,
+    ProductsSnapshotSerializer,
+    PurchasePlanListSerializer,
     PurchasePlanRequestSerializer,
     PurchasePlanSerializer,
 )
@@ -69,8 +71,145 @@ class PlanningAccessView(APIView):
         return Response(_state(request.user))
 
 
+class StoreProductsView(APIView):
+    """GET /api/purchases/products/ — товары из продаж выбранного магазина.
+
+    POST запускает выгрузку чеков из UMAG. Пока она идёт, страница опрашивает
+    тот же GET: статус `syncing`, а список уже может быть непустым.
+    """
+
+    permission_classes = [IsAuthenticated, UsesPurchases]
+
+    def get(self, request):
+        return Response(ProductsSnapshotSerializer(products.snapshot(_account(request.user))).data)
+
+    def post(self, request):
+        if not _installed(request.user):
+            return Response(
+                {'detail': 'Подключите расширение «Планирование закупов»'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        account = _account(request.user)
+
+        if account is None or not account.ready:
+            return Response(
+                {'detail': 'Подключите UMAG и выберите магазин'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        state, created = UmagSalesSync.objects.get_or_create(
+            organization=account.user.organization,
+            store_id=account.store_id,
+        )
+
+        if created or state.status != UmagSalesSync.Status.SYNCING:
+            if not created:
+                state.status = UmagSalesSync.Status.SYNCING
+                state.error = ''
+                state.save(update_fields=('status', 'error'))
+
+            tasks.schedule_sales_sync(account)
+
+        return Response(
+            ProductsSnapshotSerializer(products.snapshot(account)).data,
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+
+class PurchasePlanListView(APIView):
+    """GET /api/purchases/plans/ — планировки выбранного магазина, без позиций."""
+
+    permission_classes = [IsAuthenticated, UsesPurchases]
+
+    def get(self, request):
+        account = _account(request.user)
+
+        if account is None or not account.store_id:
+            return Response([])
+
+        plans = PurchasePlan.objects.filter(user=request.user, store_id=account.store_id)
+        return Response(PurchasePlanListSerializer(plans, many=True).data)
+
+
+class PurchasePlanDetailView(APIView):
+    """GET/POST/DELETE /api/purchases/plans/<id>/ — одна планировка.
+
+    Пересчёт не создаёт новую запись: имя и место в списке остаются, меняются
+    условия и строки. Удаление убирает и готовый план, не только считающийся.
+    """
+
+    permission_classes = [IsAuthenticated, UsesPurchases]
+
+    def get(self, request, pk):
+        plan = _owned_plan(request, pk)
+
+        if plan is None:
+            return Response({'detail': 'План не найден'}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(PurchasePlanSerializer(plan).data)
+
+    def post(self, request, pk):
+        plan = _owned_plan(request, pk)
+
+        if plan is None:
+            return Response({'detail': 'План не найден'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not _installed(request.user):
+            return Response(
+                {'detail': 'Подключите расширение «Планирование закупов»'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        account = _account(request.user)
+
+        if account is None or not account.ready:
+            return Response(
+                {'detail': 'Подключите UMAG и выберите магазин'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        if plan.status == PurchasePlan.Status.BUILDING:
+            return Response(
+                {'detail': 'План ещё считается'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        form = PurchasePlanRequestSerializer(data=request.data)
+        form.is_valid(raise_exception=True)
+
+        for field, value in form.validated_data.items():
+            setattr(plan, field, value)
+
+        plan.status = PurchasePlan.Status.BUILDING
+        plan.error = ''
+        plan.items_total = 0
+        plan.total_cost = 0
+        plan.built_at = None
+        plan.save()
+        plan.items.all().delete()
+
+        tasks.schedule(plan)
+        plan.refresh_from_db()
+
+        return Response(PurchasePlanSerializer(plan).data)
+
+    def delete(self, request, pk):
+        plan = _owned_plan(request, pk)
+
+        if plan is None:
+            return Response({'detail': 'План не найден'}, status=status.HTTP_404_NOT_FOUND)
+
+        plan.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class PurchasePlanView(APIView):
-    """/api/purchases/plan/ — последний план по выбранному магазину и пересчёт."""
+    """/api/purchases/plan/ — последний план по выбранному магазину и новая планировка.
+
+    Список живёт отдельно: телефон по-прежнему читает последний план, а
+    кабинет открывает конкретную запись. Прошлые планировки больше не стираем.
+    """
 
     permission_classes = [IsAuthenticated, UsesPurchases]
 
@@ -105,9 +244,6 @@ class PurchasePlanView(APIView):
 
         form = PurchasePlanRequestSerializer(data=request.data)
         form.is_valid(raise_exception=True)
-
-        # Прошлый план по этому магазину больше не нужен: считаем заново.
-        PurchasePlan.objects.filter(user=request.user, store_id=account.store_id).delete()
 
         plan = PurchasePlan.objects.create(
             user=request.user,
@@ -182,12 +318,14 @@ class ApproveSupplierView(APIView):
         form = ApproveSupplierSerializer(data=request.data)
         form.is_valid(raise_exception=True)
         supplier = form.validated_data['supplier']
+        plan_id = form.validated_data.get('plan')
 
-        plan = PurchasePlan.objects.filter(
+        plans = PurchasePlan.objects.filter(
             user=request.user,
             store_id=account.store_id,
             status=PurchasePlan.Status.READY,
-        ).first()
+        )
+        plan = plans.filter(pk=plan_id).first() if plan_id else plans.first()
 
         if plan is None:
             return Response(
@@ -233,6 +371,10 @@ class ApproveSupplierView(APIView):
                         safety_stock=line.safety_stock,
                         holiday_factor=line.holiday_factor,
                         forecast_error=line.forecast_error,
+                        is_perishable=line.is_perishable,
+                        shelf_life_days=line.shelf_life_days,
+                        purchase_horizon=line.purchase_horizon,
+                        perishability_source=line.perishability_source,
                         suggested=line.suggested,
                         price=line.price,
                         cost=line.cost,
@@ -268,6 +410,21 @@ class ApprovedPurchaseListView(APIView):
         )
 
         return Response(ApprovedPurchaseSerializer(purchases, many=True).data)
+
+
+def _owned_plan(request, pk) -> PurchasePlan | None:
+    """План этого сотрудника и выбранного магазина. Чужой — как будто нет."""
+
+    account = _account(request.user)
+
+    if account is None or not account.store_id:
+        return None
+
+    return PurchasePlan.objects.filter(
+        pk=pk,
+        user=request.user,
+        store_id=account.store_id,
+    ).first()
 
 
 def _refresh_plan(plan: PurchasePlan) -> None:

@@ -38,6 +38,35 @@ class Forecast:
     holiday_factor: Decimal
     error: Decimal
     observations: int
+    daily: tuple[Decimal, ...]
+    daily_error: Decimal
+
+    def limited_to(self, days: int) -> 'Forecast':
+        """Тот же прогноз, но только до срока безопасной продажи товара."""
+
+        days = max(1, min(days, len(self.daily)))
+
+        if days == len(self.daily):
+            return self
+
+        daily = self.daily[:days]
+        demand = sum(daily, ZERO)
+        safety = min(
+            SERVICE_LEVEL_Z * float(self.daily_error) * sqrt(days),
+            float(demand) * 0.5,
+        )
+
+        return Forecast(
+            model=self.model,
+            quantity=demand.quantize(THREE),
+            per_day=(demand / Decimal(days)).quantize(THREE),
+            safety_stock=_amount(safety),
+            holiday_factor=self.holiday_factor,
+            error=self.error,
+            observations=self.observations,
+            daily=daily,
+            daily_error=self.daily_error,
+        )
 
 
 def for_products(
@@ -110,6 +139,8 @@ def for_products(
             holiday_factor=Decimal(str(holiday_factor)).quantize(THREE),
             error=Decimal(str(min(99_999.0, max(0.0, error)))).quantize(THREE),
             observations=len(values),
+            daily=tuple(_amount(value) for value in adjusted),
+            daily_error=_amount(daily_mae),
         )
 
     return forecasts
@@ -160,6 +191,8 @@ def predict(
         holiday_factor=Decimal(str(holiday_factor)).quantize(THREE),
         error=Decimal(str(min(99_999.0, max(0.0, error)))).quantize(THREE),
         observations=len(clean),
+        daily=tuple(_amount(value) for value in adjusted),
+        daily_error=_amount(daily_mae),
     )
 
 

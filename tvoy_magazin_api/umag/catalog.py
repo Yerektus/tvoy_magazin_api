@@ -114,6 +114,11 @@ def refresh(client, store_id: int) -> int:
     if not rows:
         return 0
 
+    # Ручной срок годности — наша настройка, кабинет о ней не знает. Полная
+    # замена каталога не должна стирать внесённые человеком ограничения.
+    shelf_lives = dict(
+        UmagProduct.objects.filter(store_id=store_id).values_list('barcode', 'shelf_life_days')
+    )
     products = {}
 
     for row in rows:
@@ -127,6 +132,9 @@ def refresh(client, store_id: int) -> int:
                 barcode=barcode[:64],
                 name=name[:255],
                 measure=(row.get('measure') or '').strip()[:32],
+                category=(row.get('category') or '').strip()[:255],
+                subcategory=(row.get('subCategory') or row.get('subcategory') or '').strip()[:255],
+                shelf_life_days=shelf_lives.get(barcode),
                 search_name=normalize(name)[:255],
             )
 

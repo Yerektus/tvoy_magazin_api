@@ -16,7 +16,7 @@ class PurchasePlanItemInline(admin.TabularInline):
 
 @admin.register(PurchasePlan)
 class PurchasePlanAdmin(admin.ModelAdmin):
-    list_display = ('created_at', 'user', 'store_name', 'status', 'items_total', 'total_cost')
+    list_display = ('name', 'created_at', 'user', 'store_name', 'status', 'items_total', 'total_cost')
     list_filter = ('status',)
     search_fields = ('user__email', 'store_name')
     inlines = [PurchasePlanItemInline]

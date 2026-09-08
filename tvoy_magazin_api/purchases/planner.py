@@ -2,8 +2,8 @@
 
 Отчёт `report/list-product-report` отдаёт актуальный остаток и закупочную цену.
 Спрос берём из локальной копии всех чеков и возвратов: по дневному ряду можно
-увидеть тренд, неделю, годовой сезон и прошлые праздники. Сам прогноз выбирает
-подходящую объёму истории модель в `forecast.py`.
+увидеть тренд, неделю, годовой сезон и прошлые праздники. Чеки заранее
+забирает вкладка «Товары»; если их ещё нет, первый расчёт догрузит историю сам.
 """
 
 import logging
@@ -18,6 +18,8 @@ from umag.client import UmagClient, UmagError
 from umag.models import UmagAccount
 
 from . import forecast as demand_forecast
+from . import perishability
+from . import products as store_products
 from .models import PurchasePlan, PurchasePlanItem
 
 logger = logging.getLogger(__name__)
@@ -63,13 +65,14 @@ def build(plan) -> None:
 
     try:
         # UMAG жёстко ограничивает отчёт тремя месяцами. Полная история для
-        # модели лежит в чеках; отсюда нужны только текущие остатки и цены.
+        # модели лежит в чеках — их забирают со вкладки «Товары». Отсюда нужны
+        # только текущие остатки и цены.
         rows = report(client, plan.days, max_rows=None)
         _still_building(plan)
-        # В первый раз это полная история чеков, дальше — только недельный
-        # перекрывающийся хвост. Расчёт уже фоновый, поэтому UI продолжает
-        # показывать BUILDING и может отменить долгую первичную загрузку.
-        umag_sales.sync(account, progress=lambda: _still_building(plan))
+        if not store_products.sales_ready(account):
+            # Чеков ещё нет: первый расчёт сам догрузит историю, чтобы с телефона
+            # план не зависел от вкладки в кабинете.
+            umag_sales.sync(account, progress=lambda: _still_building(plan))
     except UmagError as error:
         raise PlanError(str(error)) from error
     except (RuntimeError, ValueError) as error:
@@ -93,6 +96,7 @@ def build(plan) -> None:
         if barcode not in present and prediction.quantity + prediction.safety_stock > 0
     ]
     prepared.extend(_live_rows(client, missing))
+    restrictions = perishability.for_rows(plan.store_id, prepared)
 
     needed = [
         line
@@ -104,6 +108,7 @@ def build(plan) -> None:
                 plan.horizon,
                 plan.use_stock,
                 predictions.get(str(row.get('barcode') or '')),
+                restrictions.get(str(row.get('barcode') or '')),
             )
         )
     ]
@@ -290,6 +295,7 @@ def _line(
     horizon: int,
     use_stock: bool = True,
     prediction: demand_forecast.Forecast | None = None,
+    restriction: perishability.Restriction | None = None,
 ) -> dict | None:
     """Строка плана по товару. Пусто — заказывать нечего."""
 
@@ -303,12 +309,16 @@ def _line(
     per_day = sold / Decimal(days) if sold > 0 else ZERO
     stock = _decimal(row.get('stockQuantity'))
     measure = (row.get('measure') or '').strip()
+    purchase_horizon = min(horizon, restriction.purchase_days) if restriction else horizon
+
+    if prediction is not None and purchase_horizon < horizon:
+        prediction = prediction.limited_to(purchase_horizon)
 
     # Отрицательный остаток — пересорт в кабинете; для закупа это тот же ноль.
     # А когда остаток не берут в расчёт, заказываем весь горизонт целиком: так
     # считают перед праздником, когда полку хотят набить заново.
     on_hand = max(stock, ZERO) if use_stock else ZERO
-    forecast_quantity = prediction.quantity if prediction else per_day * Decimal(horizon)
+    forecast_quantity = prediction.quantity if prediction else per_day * Decimal(purchase_horizon)
     forecast_per_day = prediction.per_day if prediction else per_day
     safety_stock = prediction.safety_stock if prediction else ZERO
     suggested = _round(forecast_quantity + safety_stock - on_hand, measure)
@@ -332,6 +342,10 @@ def _line(
         'safety_stock': _quantity(safety_stock),
         'holiday_factor': prediction.holiday_factor if prediction else Decimal('1.000'),
         'forecast_error': prediction.error if prediction else None,
+        'is_perishable': restriction is not None,
+        'shelf_life_days': restriction.shelf_life_days if restriction else None,
+        'purchase_horizon': purchase_horizon,
+        'perishability_source': restriction.source if restriction else '',
         'suggested': suggested,
         'price': price,
         'cost': (suggested * price).quantize(Decimal('0.01')) if price is not None else None,

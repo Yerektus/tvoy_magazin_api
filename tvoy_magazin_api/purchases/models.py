@@ -26,6 +26,10 @@ class PurchasePlan(models.Model):
     store_id = models.PositiveIntegerField('магазин', null=True, blank=True)
     store_name = models.CharField('название магазина', max_length=255, blank=True)
 
+    # Как назвали планировку в кабинете. С телефона имя может не прийти —
+    # тогда в списке показываем горизонт и дату.
+    name = models.CharField('название', max_length=255, blank=True)
+
     days = models.PositiveSmallIntegerField('период анализа, дней', default=30)
     horizon = models.PositiveSmallIntegerField('закупаем на, дней', default=14)
 
@@ -51,7 +55,8 @@ class PurchasePlan(models.Model):
         ordering = ('-created_at',)
 
     def __str__(self):
-        return f'План закупа от {self.created_at:%d.%m.%Y} — {self.store_name or self.store_id}'
+        title = self.name or f'План закупа от {self.created_at:%d.%m.%Y}'
+        return f'{title} — {self.store_name or self.store_id}'
 
 
 class PurchasePlanItem(models.Model):
@@ -106,6 +111,21 @@ class PurchasePlanItem(models.Model):
         max_digits=8,
         decimal_places=3,
         null=True,
+        blank=True,
+    )
+    is_perishable = models.BooleanField('скоропортящийся', default=False)
+    shelf_life_days = models.PositiveSmallIntegerField(
+        'срок годности, дней',
+        null=True,
+        blank=True,
+    )
+    purchase_horizon = models.PositiveSmallIntegerField(
+        'эффективный горизонт закупа',
+        default=0,
+    )
+    perishability_source = models.CharField(
+        'источник срока годности',
+        max_length=16,
         blank=True,
     )
     suggested = models.DecimalField('заказать', max_digits=12, decimal_places=3)
@@ -204,6 +224,21 @@ class ApprovedPurchaseItem(models.Model):
         max_digits=8,
         decimal_places=3,
         null=True,
+        blank=True,
+    )
+    is_perishable = models.BooleanField('скоропортящийся', default=False)
+    shelf_life_days = models.PositiveSmallIntegerField(
+        'срок годности, дней',
+        null=True,
+        blank=True,
+    )
+    purchase_horizon = models.PositiveSmallIntegerField(
+        'эффективный горизонт закупа',
+        default=0,
+    )
+    perishability_source = models.CharField(
+        'источник срока годности',
+        max_length=16,
         blank=True,
     )
     suggested = models.DecimalField('заказать', max_digits=12, decimal_places=3)

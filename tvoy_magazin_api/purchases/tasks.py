@@ -1,8 +1,9 @@
-"""Фоновый пересчёт плана закупа.
+"""Фоновый пересчёт плана закупа и выгрузка чеков.
 
 Отчёт по товарам приходит страницами по тысяче строк — это несколько секунд.
 Держать на них открытый запрос незачем: страница опрашивает статус плана, как
-и при разборе накладной.
+и при разборе накладной. Полная история продаж живёт отдельно: её забирают
+со вкладки «Товары», а план потом читает уже готовую копию.
 """
 
 import logging
@@ -69,6 +70,60 @@ def run(plan_id: int) -> None:
 
     if not updated:
         PurchasePlanItem.objects.filter(plan_id=plan.pk).delete()
+
+
+def schedule_sales_sync(account) -> None:
+    """Ставит выгрузку чеков в фон — вкладка опрашивает статус, как план."""
+
+    if settings.INVOICE_PARSE_INLINE:
+        run_sales_sync(account.pk)
+        return
+
+    transaction.on_commit(
+        lambda: threading.Thread(
+            target=_run_sales_sync_in_thread,
+            args=(account.pk,),
+            daemon=True,
+        ).start()
+    )
+
+
+def _run_sales_sync_in_thread(account_id: int) -> None:
+    close_old_connections()
+    try:
+        run_sales_sync(account_id)
+    finally:
+        close_old_connections()
+
+
+def run_sales_sync(account_id: int) -> None:
+    from umag import sales as umag_sales
+    from umag.models import UmagAccount
+
+    try:
+        account = UmagAccount.objects.select_related('user__organization').get(pk=account_id)
+    except UmagAccount.DoesNotExist:
+        return
+
+    try:
+        umag_sales.sync(account)
+    except Exception as error:  # noqa: BLE001 — иначе поток умрёт молча
+        logger.exception('Не удалось синхронизировать продажи %s', account_id)
+        _fail_sales_sync(account, str(error))
+
+
+def _fail_sales_sync(account, message: str) -> None:
+    from umag.models import UmagSalesSync
+
+    organization = account.user.organization
+
+    if organization is None or not account.store_id:
+        return
+
+    UmagSalesSync.objects.filter(organization=organization, store_id=account.store_id).update(
+        status=UmagSalesSync.Status.FAILED,
+        error=message[:1000],
+    )
 
 
 def _fail(plan: PurchasePlan, message: str) -> None:

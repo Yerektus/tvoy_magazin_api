@@ -244,6 +244,37 @@ class CatalogTests(APITestCase):
             ['Хлеб черный Ер'],
         )
 
+    def test_refresh_keeps_manual_shelf_life_and_updates_category(self):
+        product = UmagProduct.objects.get(store_id=17795, barcode='4870215285914')
+        product.shelf_life_days = 4
+        product.save(update_fields=('shelf_life_days',))
+        fake = FakeUmag(
+            report=[
+                {
+                    'name': 'Пряник шоколадный',
+                    'barcode': 4870215285914,
+                    'measure': 'шт',
+                    'category': 'Выпечка',
+                    'subCategory': 'Пряники',
+                },
+            ]
+        )
+        account = UmagAccount.objects.create(
+            user=make_user(email='shelf@tvoymagazin.kz', password='tainy-parol-123'),
+            phone='7474419654',
+            token='u33577.token',
+            store_id=17795,
+            store_name='Каратал Ерентал',
+        )
+
+        with patch('umag.client._request', new=fake):
+            catalog.refresh(UmagClient(account, 17795), 17795)
+
+        product = UmagProduct.objects.get(store_id=17795, barcode='4870215285914')
+        self.assertEqual(product.shelf_life_days, 4)
+        self.assertEqual(product.category, 'Выпечка')
+        self.assertEqual(product.subcategory, 'Пряники')
+
 
 class UmagAccountTests(APITestCase):
     def setUp(self):

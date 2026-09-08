@@ -9,7 +9,16 @@ from rest_framework.test import APITestCase
 
 from accounts.tests import make_user
 from umag.client import UmagError
-from umag.models import UmagAccount, UmagSale, UmagSaleItem
+from umag.models import (
+    UmagAccount,
+    UmagProduct,
+    UmagRefund,
+    UmagRefundItem,
+    UmagSale,
+    UmagSaleItem,
+    UmagSalesSync,
+)
+from umag.test_sales import SalesApi
 
 from . import planner
 from .models import PurchasePlan
@@ -255,6 +264,38 @@ class PlanningApiTests(APITestCase):
         self.assertTrue(fake.report_spans)
         self.assertLessEqual(max(fake.report_spans), 90.01)
 
+    def test_plan_caps_perishable_product_to_safe_horizon(self):
+        self.install()
+        UmagProduct.objects.create(
+            store_id=17795,
+            barcode='111',
+            name='Молоко пастеризованное',
+            category='Молочные продукты',
+        )
+        fake = FakeReport(
+            [
+                product(
+                    productName='Молоко пастеризованное',
+                    barcode=111,
+                    saleQuantity=60,
+                    stockQuantity=0,
+                )
+            ]
+        )
+
+        with patch('umag.client._request', new=fake):
+            response = self.client.post(
+                '/api/purchases/plan/',
+                {'days': 30, 'horizon': 30},
+                format='json',
+            )
+
+        item = response.data['items'][0]
+        self.assertTrue(item['is_perishable'])
+        self.assertEqual(item['shelf_life_days'], 7)
+        self.assertEqual(item['purchase_horizon'], 5)
+        self.assertEqual(item['suggested'], '10.000')
+
     def test_plan_uses_synced_transactions_for_forecast(self):
         self.install()
         now = timezone.now()
@@ -438,6 +479,88 @@ class PlanningApiTests(APITestCase):
         self.assertEqual(self.client.get('/api/purchases/plan/').status_code, 204)
         self.assertFalse(PurchasePlan.objects.exists())
 
+    def test_creating_a_plan_keeps_the_previous_one(self):
+        """В списке несколько планировок: новую больше не ставим на место старой."""
+
+        self.install()
+        fake = FakeReport([product()])
+
+        with patch('umag.client._request', new=fake):
+            first = self.client.post(
+                '/api/purchases/plan/',
+                {'name': 'На неделю', 'horizon': 7},
+                format='json',
+            )
+            second = self.client.post(
+                '/api/purchases/plan/',
+                {'name': 'На месяц', 'horizon': 30},
+                format='json',
+            )
+
+        self.assertEqual(PurchasePlan.objects.count(), 2)
+        self.assertEqual(first.data['name'], 'На неделю')
+        self.assertEqual(second.data['name'], 'На месяц')
+
+        listed = self.client.get('/api/purchases/plans/').data
+        self.assertEqual([row['name'] for row in listed], ['На месяц', 'На неделю'])
+        self.assertNotIn('items', listed[0])
+
+        opened = self.client.get(f'/api/purchases/plans/{second.data["id"]}/')
+        self.assertEqual(opened.status_code, 200)
+        self.assertEqual(opened.data['name'], 'На месяц')
+        self.assertEqual(opened.data['items'][0]['name'], 'Пепси 1 л')
+
+    def test_plan_list_hides_other_store(self):
+        self.install()
+        PurchasePlan.objects.create(user=self.user, store_id=999, name='Чужой магазин')
+
+        self.assertEqual(self.client.get('/api/purchases/plans/').data, [])
+
+    def test_plan_detail_is_hidden_from_another_user(self):
+        self.install()
+        other = make_user(email='other@tvoymagazin.kz', password='tainy-parol-123')
+        plan = PurchasePlan.objects.create(user=other, store_id=17795, name='Чужой')
+
+        response = self.client.get(f'/api/purchases/plans/{plan.pk}/')
+        self.assertEqual(response.status_code, 404)
+
+    def test_ready_plan_can_be_deleted(self):
+        self.install()
+        plan = PurchasePlan.objects.create(
+            user=self.user,
+            store_id=17795,
+            status=PurchasePlan.Status.READY,
+            name='Старая',
+        )
+
+        response = self.client.delete(f'/api/purchases/plans/{plan.pk}/')
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(PurchasePlan.objects.filter(pk=plan.pk).exists())
+
+    def test_approve_uses_the_given_plan(self):
+        """Одобрение идёт из открытой планировки, а не из самой свежей."""
+
+        self.install()
+        pepsi = product()
+        milk = product(productName='Молоко', barcode=111)
+        fake = FakeReport([pepsi, milk], by_supplier={7: [pepsi], 8: [milk]})
+
+        with patch('umag.client._request', new=fake):
+            older = self.client.post('/api/purchases/plan/', {'name': 'Старая'}, format='json')
+            self.client.post('/api/purchases/plan/', {'name': 'Новая'}, format='json')
+
+        response = self.client.post(
+            '/api/purchases/plan/approve/',
+            {'supplier': 'Поставщик 7', 'plan': older.data['id']},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 201)
+        old_plan = self.client.get(f'/api/purchases/plans/{older.data["id"]}/').data
+        self.assertEqual(old_plan['items_total'], 1)
+        self.assertEqual(old_plan['items'][0]['supplier'], 'Поставщик 8')
+
     def test_cancel_does_not_drop_a_ready_plan(self):
         self.install()
         PurchasePlan.objects.create(
@@ -470,3 +593,106 @@ class PlanningApiTests(APITestCase):
             tasks.run(plan.pk)
 
         self.assertFalse(PurchasePlan.objects.filter(pk=plan.pk).exists())
+
+    def test_products_are_empty_until_synced(self):
+        self.install()
+
+        response = self.client.get('/api/purchases/products/')
+
+        self.assertEqual(response.data['status'], 'idle')
+        self.assertEqual(response.data['items'], [])
+
+    def test_products_come_from_sales(self):
+        """Список на вкладке — то, что продавали, а не вся номенклатура кабинета."""
+
+        self.install()
+        now = timezone.now()
+        first = UmagSale.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            external_id='1',
+            occurred_at=now - timedelta(days=2),
+            amount=400,
+        )
+        second = UmagSale.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            external_id='2',
+            occurred_at=now,
+            amount=200,
+        )
+        UmagSaleItem.objects.create(
+            sale=first,
+            position=1,
+            barcode='111',
+            name='Молоко',
+            measure='шт',
+            quantity=2,
+        )
+        UmagSaleItem.objects.create(
+            sale=second,
+            position=1,
+            barcode='111',
+            name='Молоко',
+            measure='шт',
+            quantity=1,
+        )
+        refund = UmagRefund.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            external_id='20',
+            occurred_at=now,
+            amount=200,
+            sale=first,
+        )
+        UmagRefundItem.objects.create(
+            refund=refund,
+            position=1,
+            barcode='111',
+            name='Молоко',
+            measure='шт',
+            quantity=1,
+        )
+
+        response = self.client.get('/api/purchases/products/')
+        item = response.data['items'][0]
+
+        self.assertEqual(item['barcode'], '111')
+        self.assertEqual(item['name'], 'Молоко')
+        self.assertEqual(item['sold'], '2.000')
+        self.assertEqual(response.data['items_total'], 1)
+
+    def test_products_sync_loads_umag_sales(self):
+        self.install()
+
+        with (
+            patch('umag.client._request', new=SalesApi()),
+            patch('umag.sales.WINDOW', timedelta(days=20_000)),
+        ):
+            response = self.client.post('/api/purchases/products/', {}, format='json')
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.data['status'], UmagSalesSync.Status.READY)
+        self.assertEqual(response.data['items_total'], 1)
+        self.assertEqual(response.data['items'][0]['name'], 'Молоко')
+        self.assertEqual(UmagSale.objects.count(), 3)
+
+    def test_plan_skips_sales_sync_when_products_are_ready(self):
+        """После выгрузки чеков расчёт больше не ходит в UMAG за историей."""
+
+        self.install()
+        UmagSalesSync.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            status=UmagSalesSync.Status.READY,
+            synced_at=timezone.now(),
+        )
+
+        with (
+            patch('umag.sales.sync') as sync,
+            patch('umag.client._request', new=FakeReport([product()])),
+        ):
+            response = self.client.post('/api/purchases/plan/', {}, format='json')
+
+        self.assertEqual(response.data['status'], PurchasePlan.Status.READY)
+        sync.assert_not_called()

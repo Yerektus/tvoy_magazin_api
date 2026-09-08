@@ -62,6 +62,16 @@ class UmagProduct(models.Model):
     barcode = models.CharField('штрихкод', max_length=64)
     name = models.CharField('товар', max_length=255)
     measure = models.CharField('единица', max_length=32, blank=True)
+    category = models.CharField('категория', max_length=255, blank=True)
+    subcategory = models.CharField('подкатегория', max_length=255, blank=True)
+    # Ручной срок важнее автоматического правила. Пусто — определяем по
+    # категории и названию; 0 — явно считать товар нескоропортящимся.
+    shelf_life_days = models.PositiveSmallIntegerField(
+        'срок годности, дней',
+        null=True,
+        blank=True,
+        help_text='Пусто — определить автоматически; 0 — не ограничивать закуп',
+    )
     # Название, приведённое к виду для сравнения: считать его на каждый поиск
     # по шести тысячам строк — впустую.
     search_name = models.CharField('название для поиска', max_length=255, blank=True)

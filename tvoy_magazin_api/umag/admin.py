@@ -13,9 +13,17 @@ class UmagAccountAdmin(admin.ModelAdmin):
 
 @admin.register(UmagProduct)
 class UmagProductAdmin(admin.ModelAdmin):
-    list_display = ('name', 'barcode', 'measure', 'store_id', 'updated_at')
-    search_fields = ('name', 'barcode')
-    list_filter = ('store_id',)
+    list_display = (
+        'name',
+        'barcode',
+        'category',
+        'measure',
+        'shelf_life_days',
+        'store_id',
+        'updated_at',
+    )
+    search_fields = ('name', 'barcode', 'category', 'subcategory')
+    list_filter = ('store_id', 'category')
 
 
 @admin.register(SupplierLink)
