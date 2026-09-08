@@ -20,6 +20,7 @@ from django.db import close_old_connections, transaction
 from django.utils import timezone
 
 from .client import UmagClient, UmagError
+from .matching import unit_for
 from .models import UmagProduct
 
 logger = logging.getLogger(__name__)
@@ -131,7 +132,7 @@ def refresh(client, store_id: int) -> int:
                 store_id=store_id,
                 barcode=barcode[:64],
                 name=name[:255],
-                measure=(row.get('measure') or '').strip()[:32],
+                measure=unit_for(row.get('measure')),
                 category=(row.get('category') or '').strip()[:255],
                 subcategory=(row.get('subCategory') or row.get('subcategory') or '').strip()[:255],
                 shelf_life_days=shelf_lives.get(barcode),

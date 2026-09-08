@@ -24,7 +24,22 @@ PRODUCT_TYPE = 0
 
 
 def unit_for(measure) -> str:
-    """Единица измерения из карточки товара. Незнакомый код не выдумываем."""
+    """Единица измерения: код карточки (0/1/2) или уже готовая подпись.
+
+    Ноль — штучный товар, а `value or ''` его проглатывает, поэтому код
+    проверяем явно. Строку вроде «шт» оставляем как есть.
+    """
+
+    if isinstance(measure, str):
+        text = measure.strip()
+        if not text:
+            return ''
+        if text.isdigit():
+            return MEASURES.get(int(text), '')
+        return text[:32]
+
+    if isinstance(measure, float) and measure.is_integer():
+        measure = int(measure)
 
     return MEASURES.get(measure, '')
 

@@ -118,6 +118,25 @@ class SalesSyncTests(TestCase):
         self.assertEqual(UmagSaleItem.objects.count(), 3)
         self.assertEqual(UmagSale.objects.get(external_id='10').amount, 1300)
 
+    def test_numeric_measure_code_is_saved_as_unit(self):
+        """Ноль в карточке — штуки; через `_text` он превращался в пустую строку."""
+
+        api = SalesApi()
+
+        def with_code(method, path, params=None, payload=None, form=None, auth=''):
+            body = api(method, path, params, payload, form, auth)
+            if path.startswith('opr/sale/get/'):
+                body['products'][0]['measure'] = 0
+            return body
+
+        with (
+            patch('umag.client._request', new=with_code),
+            patch.object(sales, 'WINDOW', timedelta(days=20_000)),
+        ):
+            sales.sync(self.account, full=True)
+
+        self.assertEqual(UmagSaleItem.objects.first().measure, 'шт')
+
     def test_broken_pagination_stops_instead_of_looping(self):
         api = SalesApi()
 

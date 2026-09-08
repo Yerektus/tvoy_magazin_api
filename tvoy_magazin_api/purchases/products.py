@@ -8,7 +8,8 @@ from decimal import Decimal
 
 from django.db.models import Max, Sum
 
-from umag.models import UmagRefundItem, UmagSaleItem, UmagSalesSync
+from umag.matching import unit_for
+from umag.models import UmagProduct, UmagRefundItem, UmagSaleItem, UmagSalesSync
 
 ZERO = Decimal('0')
 IDLE = 'idle'
@@ -66,6 +67,13 @@ def catalog(organization, store_id: int) -> list[dict]:
         .values('barcode')
         .annotate(qty=Sum('quantity'))
     }
+    units = {
+        barcode: unit_for(measure)
+        for barcode, measure in UmagProduct.objects.filter(store_id=store_id).values_list(
+            'barcode',
+            'measure',
+        )
+    }
     items = []
 
     for row in sold:
@@ -74,7 +82,7 @@ def catalog(organization, store_id: int) -> list[dict]:
             {
                 'barcode': row['barcode'],
                 'name': (row['name'] or '').strip() or row['barcode'],
-                'measure': row['measure'] or '',
+                'measure': unit_for(row['measure']) or units.get(row['barcode'], ''),
                 'sold': max(net, ZERO),
                 'last_sold': row['last_sold'],
             }

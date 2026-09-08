@@ -16,6 +16,7 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
+from . import matching
 from .client import UmagClient
 from .models import (
     UmagRefund,
@@ -310,7 +311,9 @@ def _save_sale(organization, store_id: int, summary: dict, body) -> None:
                     or product.get('fullName'),
                     255,
                 ),
-                measure=_text(row.get('measure') or product.get('measure'), 32),
+                measure=_measure(
+                    product.get('measure') if row.get('measure') is None else row['measure']
+                ),
                 quantity=_quantity(quantity),
                 price=price,
                 price_before=_nullable_money(row.get('priceBefore')),
@@ -377,7 +380,7 @@ def _save_refund(organization, store_id: int, summary: dict, body) -> None:
                 position=position,
                 barcode=_text(row.get('barcode'), 64),
                 name=_text(row.get('name') or row.get('fullName'), 255),
-                measure=_text(row.get('measure'), 32),
+                measure=_measure(row.get('measure')),
                 quantity=_quantity(quantity),
                 price=price,
                 total=total,
@@ -428,6 +431,11 @@ def _millis(moment: datetime) -> int:
 
 def _text(value, limit: int) -> str:
     return str(value or '').strip()[:limit]
+
+
+def _measure(value) -> str:
+    # Ноль — штуки, его нельзя скормить `_text`: `0 or ''` стирает единицу.
+    return matching.unit_for(value)
 
 
 def _decimal(value) -> Decimal:

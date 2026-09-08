@@ -659,8 +659,40 @@ class PlanningApiTests(APITestCase):
 
         self.assertEqual(item['barcode'], '111')
         self.assertEqual(item['name'], 'Молоко')
+        self.assertEqual(item['measure'], 'шт')
         self.assertEqual(item['sold'], '2.000')
         self.assertEqual(response.data['items_total'], 1)
+
+    def test_products_take_measure_from_catalog_when_sale_lost_it(self):
+        """В чеке ноль — штуки, а `0 or ''` его стирал. Берём единицу из номенклатуры."""
+
+        self.install()
+        now = timezone.now()
+        sale = UmagSale.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            external_id='1',
+            occurred_at=now,
+            amount=400,
+        )
+        UmagSaleItem.objects.create(
+            sale=sale,
+            position=1,
+            barcode='111',
+            name='Молоко',
+            measure='',
+            quantity=2,
+        )
+        UmagProduct.objects.create(
+            store_id=17795,
+            barcode='111',
+            name='Молоко',
+            measure='0',
+        )
+
+        response = self.client.get('/api/purchases/products/')
+
+        self.assertEqual(response.data['items'][0]['measure'], 'шт')
 
     def test_products_sync_loads_umag_sales(self):
         self.install()
