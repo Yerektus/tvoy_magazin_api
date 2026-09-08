@@ -290,7 +290,7 @@ OPENROUTER_FALLBACK_MODELS = [
 # Версии клиента лежат в заголовках: без них сервер считает нас устаревшими.
 UMAG_BASE_URL = os.environ.get('UMAG_BASE_URL', 'https://api.umag.kz/rest/cabinet/')
 UMAG_API_VERSION = os.environ.get('UMAG_API_VERSION', '1.4')
-UMAG_CLIENT_VERSION = os.environ.get('UMAG_CLIENT_VERSION', 'angular_cabinet_20.0.24')
+UMAG_CLIENT_VERSION = os.environ.get('UMAG_CLIENT_VERSION', 'angular_cabinet_20.1.4')
 UMAG_TIMEOUT = int(os.environ.get('UMAG_TIMEOUT', '30'))
 
 # Сколько накладных разбираем одновременно.

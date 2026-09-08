@@ -1,12 +1,15 @@
+from datetime import timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import SimpleTestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from accounts.tests import make_user
-from umag.models import UmagAccount
+from umag.client import UmagError
+from umag.models import UmagAccount, UmagSale, UmagSaleItem
 
 from . import planner
 from .models import PurchasePlan
@@ -63,6 +66,25 @@ class FakeReport:
 
     def by_supplier_names(self) -> list[tuple[int, str]]:
         return [(agent, f'Поставщик {agent}') for agent in self.by_supplier]
+
+
+class ThreeMonthReport(FakeReport):
+    """Повторяет ограничение UMAG: товарный отчёт не принимает больше 90 дней."""
+
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.report_spans = []
+
+    def __call__(self, method, path, params=None, payload=None, form=None, auth=''):
+        if path == planner.REPORT:
+            params = params or {}
+            span = (params['toTime'] - params['fromTime']) / 86_400_000
+            self.report_spans.append(span)
+
+            if span > 90.01:
+                raise UmagError('Диапазон дат не может быть больше 3 месяцев')
+
+        return super().__call__(method, path, params, payload, form, auth)
 
 
 class PlannerMathTests(SimpleTestCase):
@@ -218,6 +240,68 @@ class PlanningApiTests(APITestCase):
         self.assertEqual(item['suggested'], '18.000')
         self.assertEqual(response.data['total_cost'], '9000.00')
 
+    def test_plan_never_requests_report_beyond_umag_three_month_limit(self):
+        self.install()
+        fake = ThreeMonthReport([product()])
+
+        with patch('umag.client._request', new=fake):
+            response = self.client.post(
+                '/api/purchases/plan/',
+                {'days': 90, 'horizon': 14},
+                format='json',
+            )
+
+        self.assertEqual(response.data['status'], PurchasePlan.Status.READY)
+        self.assertTrue(fake.report_spans)
+        self.assertLessEqual(max(fake.report_spans), 90.01)
+
+    def test_plan_uses_synced_transactions_for_forecast(self):
+        self.install()
+        now = timezone.now()
+        sales = UmagSale.objects.bulk_create(
+            [
+                UmagSale(
+                    organization=self.user.organization,
+                    store_id=17795,
+                    external_id=str(index),
+                    occurred_at=now - timedelta(days=60 - index),
+                    amount=2000,
+                )
+                for index in range(60)
+            ]
+        )
+        UmagSaleItem.objects.bulk_create(
+            [
+                UmagSaleItem(
+                    sale=sale,
+                    position=1,
+                    barcode='4870145005545',
+                    name='Пепси 1 л',
+                    measure='шт',
+                    quantity=4,
+                    price=500,
+                    total=2000,
+                )
+                for sale in sales
+            ]
+        )
+
+        with patch('umag.client._request', new=FakeReport([product()])):
+            response = self.client.post(
+                '/api/purchases/plan/',
+                {'days': 30, 'horizon': 14},
+                format='json',
+            )
+
+        item = response.data['items'][0]
+        self.assertIn(
+            item['forecast_model'],
+            {'average', 'weighted_average', 'holt', 'holt_winters_weekly'},
+        )
+        self.assertGreater(Decimal(item['forecast_quantity']), Decimal('50'))
+        self.assertGreater(Decimal(item['suggested']), Decimal('40'))
+        self.assertIn('holiday_factor', item)
+
     def test_plan_knows_the_supplier_of_each_line(self):
         """Закупаются поставщиками — у строки должен быть свой."""
 
@@ -281,3 +365,108 @@ class PlanningApiTests(APITestCase):
         PurchasePlan.objects.create(user=other, store_id=17795, status=PurchasePlan.Status.READY)
 
         self.assertEqual(self.client.get('/api/purchases/plan/').status_code, 204)
+
+    def test_approving_a_supplier_moves_their_lines_out_of_the_plan(self):
+        """Одобрили поставщика — его позиции уезжают в отдельный закуп."""
+
+        self.install()
+        pepsi = product()
+        milk = product(productName='Молоко', barcode=111)
+
+        fake = FakeReport([pepsi, milk], by_supplier={7: [pepsi], 8: [milk]})
+
+        with patch('umag.client._request', new=fake):
+            self.client.post('/api/purchases/plan/', {}, format='json')
+
+        response = self.client.post(
+            '/api/purchases/plan/approve/',
+            {'supplier': 'Поставщик 7'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['supplier'], 'Поставщик 7')
+        self.assertEqual(response.data['items_total'], 1)
+        self.assertEqual(response.data['items'][0]['name'], 'Пепси 1 л')
+
+        plan = self.client.get('/api/purchases/plan/').data
+        self.assertEqual(plan['items_total'], 1)
+        self.assertEqual(plan['items'][0]['supplier'], 'Поставщик 8')
+
+        approved = self.client.get('/api/purchases/approved/').data
+        self.assertEqual(len(approved), 1)
+        self.assertEqual(approved[0]['supplier'], 'Поставщик 7')
+
+    def test_cannot_approve_the_same_supplier_twice(self):
+        self.install()
+        fake = FakeReport([product()], by_supplier={7: [product()]})
+
+        with patch('umag.client._request', new=fake):
+            self.client.post('/api/purchases/plan/', {}, format='json')
+
+        self.client.post('/api/purchases/plan/approve/', {'supplier': 'Поставщик 7'}, format='json')
+        again = self.client.post(
+            '/api/purchases/plan/approve/',
+            {'supplier': 'Поставщик 7'},
+            format='json',
+        )
+
+        self.assertEqual(again.status_code, 404)
+
+    def test_approve_needs_a_ready_plan(self):
+        self.install()
+        response = self.client.post(
+            '/api/purchases/plan/approve/',
+            {'supplier': 'Поставщик 7'},
+            format='json',
+        )
+
+        self.assertEqual(response.status_code, 409)
+
+    def test_cancel_drops_a_building_plan(self):
+        self.install()
+        PurchasePlan.objects.create(
+            user=self.user,
+            store_id=17795,
+            store_name='Каратал Ерентал',
+            status=PurchasePlan.Status.BUILDING,
+        )
+
+        response = self.client.delete('/api/purchases/plan/')
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(self.client.get('/api/purchases/plan/').status_code, 204)
+        self.assertFalse(PurchasePlan.objects.exists())
+
+    def test_cancel_does_not_drop_a_ready_plan(self):
+        self.install()
+        PurchasePlan.objects.create(
+            user=self.user,
+            store_id=17795,
+            status=PurchasePlan.Status.READY,
+        )
+
+        self.assertEqual(self.client.delete('/api/purchases/plan/').status_code, 204)
+        self.assertEqual(PurchasePlan.objects.get().status, PurchasePlan.Status.READY)
+
+    def test_cancelled_count_is_not_saved(self):
+        """Пока ходили в UMAG, расчёт бросили — готовый план не должен появиться."""
+
+        self.install()
+        plan = PurchasePlan.objects.create(
+            user=self.user,
+            store_id=17795,
+            store_name='Каратал Ерентал',
+            status=PurchasePlan.Status.BUILDING,
+        )
+
+        def drop(*args, **kwargs):
+            PurchasePlan.objects.filter(pk=plan.pk).delete()
+            return [product()]
+
+        with patch('purchases.planner.report', side_effect=drop):
+            from . import tasks
+
+            tasks.run(plan.pk)
+
+        self.assertFalse(PurchasePlan.objects.filter(pk=plan.pk).exists())

@@ -14,6 +14,7 @@
 import base64
 import json
 import logging
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -21,6 +22,10 @@ import urllib.request
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
+
+# Закрытый API иногда закрывает чтение по таймауту. GET безопасно повторить:
+# он не создаёт приёмки, товары или контрагентов.
+GET_RETRY_DELAYS = (1, 3)
 
 
 class UmagError(Exception):
@@ -92,7 +97,25 @@ class UmagClient:
         self.store_id = store_id or account.store_id
 
     def get(self, path: str, **params):
-        return self._call('GET', path, params=params)
+        for attempt, delay in enumerate((*GET_RETRY_DELAYS, None)):
+            try:
+                return self._call('GET', path, params=params)
+            except UmagError as error:
+                # 4xx и 5xx — настоящий ответ кабинета, повторять его без
+                # изменения запроса бессмысленно. Повторяем только сеть/таймаут.
+                if error.status is not None or delay is None:
+                    raise
+
+                logger.warning(
+                    'Повторяем UMAG GET %s после сетевой ошибки (%s/%s): %s',
+                    path,
+                    attempt + 1,
+                    len(GET_RETRY_DELAYS),
+                    error,
+                )
+                time.sleep(delay)
+
+        raise AssertionError('цикл повторов GET должен завершиться')
 
     def post(self, path: str, payload: dict | None = None, **params):
         return self._call('POST', path, params=params, payload=payload or {})
@@ -192,6 +215,8 @@ def _request(
         raise UmagError(detail or f'UMAG ответил {error.code}', error.code) from error
     except urllib.error.URLError as error:
         raise UmagError(f'UMAG недоступен: {error.reason}') from error
+    except TimeoutError as error:
+        raise UmagError('UMAG не ответил вовремя') from error
 
 
 def _parse(raw: bytes):

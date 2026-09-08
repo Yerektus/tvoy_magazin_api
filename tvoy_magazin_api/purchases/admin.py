@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import PurchasePlan, PurchasePlanItem
+from .models import ApprovedPurchase, ApprovedPurchaseItem, PurchasePlan, PurchasePlanItem
 
 
 class PurchasePlanItemInline(admin.TabularInline):
@@ -20,3 +20,31 @@ class PurchasePlanAdmin(admin.ModelAdmin):
     list_filter = ('status',)
     search_fields = ('user__email', 'store_name')
     inlines = [PurchasePlanItemInline]
+
+
+class ApprovedPurchaseItemInline(admin.TabularInline):
+    model = ApprovedPurchaseItem
+    extra = 0
+    can_delete = False
+    readonly_fields = (
+        'position',
+        'name',
+        'barcode',
+        'sold',
+        'stock',
+        'per_day',
+        'cover_days',
+        'suggested',
+        'price',
+        'cost',
+    )
+
+    def has_add_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(ApprovedPurchase)
+class ApprovedPurchaseAdmin(admin.ModelAdmin):
+    list_display = ('approved_at', 'user', 'store_name', 'supplier', 'items_total', 'total_cost')
+    search_fields = ('user__email', 'store_name', 'supplier')
+    inlines = [ApprovedPurchaseItemInline]

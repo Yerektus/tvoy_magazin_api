@@ -1,12 +1,9 @@
 """Товарный отчёт UMAG → план закупа.
 
-Отчёт `report/list-product-report` отдаёт по каждому товару продажи за период и
-остаток на сейчас — этого хватает, чтобы посчитать расход в день и понять, чего
-не доживёт до следующего завоза. Продажи в кабинете есть только так: отдельного
-API продаж по товарам у UMAG нет.
-
-Считаем без хитростей: сколько продавалось в день, на сколько дней хватит
-остатка и сколько дозаказать, чтобы хватило на горизонт планирования.
+Отчёт `report/list-product-report` отдаёт актуальный остаток и закупочную цену.
+Спрос берём из локальной копии всех чеков и возвратов: по дневному ряду можно
+увидеть тренд, неделю, годовой сезон и прошлые праздники. Сам прогноз выбирает
+подходящую объёму истории модель в `forecast.py`.
 """
 
 import logging
@@ -16,10 +13,12 @@ from decimal import Decimal, InvalidOperation, ROUND_UP
 
 from django.utils import timezone
 
+from umag import matching, sales as umag_sales
 from umag.client import UmagClient, UmagError
 from umag.models import UmagAccount
 
-from .models import PurchasePlanItem
+from . import forecast as demand_forecast
+from .models import PurchasePlan, PurchasePlanItem
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +31,9 @@ AGENTS = 'org/agent/list-agent-names'
 SUPPLIER_THREADS = 6
 AGENTS_PAGE = 1000
 
-# Отчёт отдаёт тысячами строк, берём страницами. Дальше пяти тысяч — хвост,
-# который продаётся раз в месяц, планировать там нечего.
+# Отчёт отдаёт тысячами строк, берём страницами. Быстрые просмотры по умолчанию
+# ограничены пятью тысячами; полный план явно снимает предел, чтобы не потерять
+# редкий сезонный товар.
 PAGE = 1000
 MAX_ROWS = 5000
 
@@ -47,9 +47,12 @@ class PlanError(RuntimeError):
     """План не посчитать — человеку нужно что-то поправить."""
 
 
+class Cancelled(Exception):
+    """Расчёт бросили — результат сохранять не нужно."""
+
+
 def build(plan) -> None:
     """Считает план и заполняет его строки. Ошибку поднимает наверх."""
-
 
     account = UmagAccount.objects.filter(user=plan.user).first()
 
@@ -59,19 +62,57 @@ def build(plan) -> None:
     client = UmagClient(account, plan.store_id or account.store_id)
 
     try:
-        rows = report(client, plan.days)
+        # UMAG жёстко ограничивает отчёт тремя месяцами. Полная история для
+        # модели лежит в чеках; отсюда нужны только текущие остатки и цены.
+        rows = report(client, plan.days, max_rows=None)
+        _still_building(plan)
+        # В первый раз это полная история чеков, дальше — только недельный
+        # перекрывающийся хвост. Расчёт уже фоновый, поэтому UI продолжает
+        # показывать BUILDING и может отменить долгую первичную загрузку.
+        umag_sales.sync(account, progress=lambda: _still_building(plan))
     except UmagError as error:
         raise PlanError(str(error)) from error
+    except (RuntimeError, ValueError) as error:
+        raise PlanError(str(error)) from error
+
+    _still_building(plan)
+
+    # Прогнозируем всю сохранённую номенклатуру, а не только товары с продажей
+    # в выбранном коротком периоде: так в план возвращаются сезонные позиции.
+    predictions = demand_forecast.for_products(
+        plan.user.organization,
+        plan.store_id,
+        None,
+        plan.horizon,
+    )
+    prepared = [dict(row) for row in rows]
+    present = {str(row.get('barcode') or '') for row in prepared}
+    missing = [
+        barcode
+        for barcode, prediction in predictions.items()
+        if barcode not in present and prediction.quantity + prediction.safety_stock > 0
+    ]
+    prepared.extend(_live_rows(client, missing))
 
     needed = [
         line
-        for row in rows
-        if (line := _line(row, plan.days, plan.horizon, plan.use_stock))
+        for row in prepared
+        if (
+            line := _line(
+                row,
+                plan.days,
+                plan.horizon,
+                plan.use_stock,
+                predictions.get(str(row.get('barcode') or '')),
+            )
+        )
     ]
 
     # Закупаются поставщиками, а не построчно, поэтому у каждой строки должен
     # быть свой. Не получилось — план всё равно нужен, просто без группировки.
+    _still_building(plan)
     known = suppliers(client, plan.days)
+    _still_building(plan)
 
     for line in needed:
         line['supplier'] = known.get(line['barcode'], '')
@@ -85,13 +126,59 @@ def build(plan) -> None:
 
     # Строки сохраняем все: закуп идёт по поставщикам, и обрезанный список
     # оставил бы часть из них без половины заказа.
+    _still_building(plan)
     PurchasePlanItem.objects.bulk_create(
         PurchasePlanItem(plan=plan, position=position, **line)
         for position, line in enumerate(needed, start=1)
     )
 
 
-def report(client, days: int, max_rows: int = MAX_ROWS, **filters) -> list[dict]:
+def _live_rows(client, barcodes: list[str]) -> list[dict]:
+    """Актуальные остатки сезонных товаров, которых нет в коротком отчёте."""
+
+    if not barcodes:
+        return []
+
+    with ThreadPoolExecutor(max_workers=SUPPLIER_THREADS) as pool:
+        rows = pool.map(lambda barcode: _live_row(client, barcode), barcodes)
+
+    return [row for row in rows if row is not None]
+
+
+def _live_row(client, barcode: str) -> dict | None:
+    try:
+        found = client.get('nom/product/findProductByBarcode', barcode=barcode)
+    except UmagError as error:
+        # Карточку могли удалить после прошлогоднего сезона. Основной план из-за
+        # одной такой позиции не теряем.
+        logger.warning('UMAG не отдал сезонный товар %s: %s', barcode, error)
+        return None
+
+    if not isinstance(found, dict):
+        return None
+
+    card = found.get('product') or {}
+    prices = found.get('productStorePrice') or {}
+
+    return {
+        'barcode': barcode,
+        'productName': (card.get('name') or '').strip(),
+        'measure': matching.unit_for(card.get('measure')),
+        'saleQuantity': 0,
+        'refundQuantity': 0,
+        'stockQuantity': found.get('stockQuantity'),
+        '_price': prices.get('arrivalCost'),
+    }
+
+
+def _still_building(plan) -> None:
+    """Бросает, если план уже удалили или перестали считать."""
+
+    if not PurchasePlan.objects.filter(pk=plan.pk, status=PurchasePlan.Status.BUILDING).exists():
+        raise Cancelled()
+
+
+def report(client, days: int, max_rows: int | None = MAX_ROWS, **filters) -> list[dict]:
     """Товарный отчёт за период, страницами. `filters` — например `supplierId`.
 
     `max_rows` — где остановиться. Плану нужен весь ассортимент, а тому, кто
@@ -105,7 +192,7 @@ def report(client, days: int, max_rows: int = MAX_ROWS, **filters) -> list[dict]
 
     rows: list[dict] = []
 
-    while len(rows) < max_rows:
+    while max_rows is None or len(rows) < max_rows:
         body = client.get(
             REPORT,
             fromTime=from_time,
@@ -119,10 +206,14 @@ def report(client, days: int, max_rows: int = MAX_ROWS, **filters) -> list[dict]
         rows.extend(page)
 
         # Страница неполная или отчёт закончился — дальше ходить незачем.
-        if len(page) < PAGE or len(rows) >= (body.get('count') or 0):
+        if (
+            len(page) < PAGE
+            or len(rows) >= (body.get('count') or 0)
+            or (max_rows is not None and len(rows) >= max_rows)
+        ):
             break
 
-    return rows
+    return rows if max_rows is None else rows[:max_rows]
 
 
 def suppliers(client, days: int) -> dict[str, str]:
@@ -162,7 +253,7 @@ def _of(client, agent: dict, days: int) -> list[dict]:
     """Товары одного поставщика. Ошибка — просто строка без группы."""
 
     try:
-        return report(client, days, supplierId=agent.get('id'))
+        return report(client, days, max_rows=None, supplierId=agent.get('id'))
     except UmagError as error:
         logger.warning('UMAG не отдал товары поставщика %s: %s', agent.get('id'), error)
         return []
@@ -193,17 +284,23 @@ def _name(item: dict) -> str:
     return (item.get('name') or item.get('supplierName') or '').strip()
 
 
-def _line(row: dict, days: int, horizon: int, use_stock: bool = True) -> dict | None:
+def _line(
+    row: dict,
+    days: int,
+    horizon: int,
+    use_stock: bool = True,
+    prediction: demand_forecast.Forecast | None = None,
+) -> dict | None:
     """Строка плана по товару. Пусто — заказывать нечего."""
 
     sold = _decimal(row.get('saleQuantity')) - _decimal(row.get('refundQuantity'))
 
-    # Не продавался — планировать нечего: заводить запас под ноль продаж
-    # значит замораживать деньги на полке.
-    if sold <= 0:
+    # Без сохранённой истории остаётся прежняя безопасная формула. Это важно
+    # при первом развёртывании и для тестового кабинета без чеков.
+    if prediction is None and sold <= 0:
         return None
 
-    per_day = sold / Decimal(days)
+    per_day = sold / Decimal(days) if sold > 0 else ZERO
     stock = _decimal(row.get('stockQuantity'))
     measure = (row.get('measure') or '').strip()
 
@@ -211,9 +308,12 @@ def _line(row: dict, days: int, horizon: int, use_stock: bool = True) -> dict | 
     # А когда остаток не берут в расчёт, заказываем весь горизонт целиком: так
     # считают перед праздником, когда полку хотят набить заново.
     on_hand = max(stock, ZERO) if use_stock else ZERO
-    suggested = _round(per_day * Decimal(horizon) - on_hand, measure)
+    forecast_quantity = prediction.quantity if prediction else per_day * Decimal(horizon)
+    forecast_per_day = prediction.per_day if prediction else per_day
+    safety_stock = prediction.safety_stock if prediction else ZERO
+    suggested = _round(forecast_quantity + safety_stock - on_hand, measure)
 
-    if suggested <= 0:
+    if forecast_quantity <= 0 or forecast_per_day <= 0 or suggested <= 0:
         return None
 
     price = _price(row)
@@ -225,7 +325,13 @@ def _line(row: dict, days: int, horizon: int, use_stock: bool = True) -> dict | 
         'sold': _quantity(sold),
         'stock': _quantity(stock),
         'per_day': _quantity(per_day),
-        'cover_days': (on_hand / per_day).quantize(Decimal('0.1')),
+        'cover_days': (on_hand / forecast_per_day).quantize(Decimal('0.1')),
+        'forecast_model': prediction.model if prediction else 'average',
+        'forecast_quantity': _quantity(forecast_quantity),
+        'forecast_per_day': _quantity(forecast_per_day),
+        'safety_stock': _quantity(safety_stock),
+        'holiday_factor': prediction.holiday_factor if prediction else Decimal('1.000'),
+        'forecast_error': prediction.error if prediction else None,
         'suggested': suggested,
         'price': price,
         'cost': (suggested * price).quantize(Decimal('0.01')) if price is not None else None,
@@ -234,6 +340,9 @@ def _line(row: dict, days: int, horizon: int, use_stock: bool = True) -> dict | 
 
 def _price(row: dict) -> Decimal | None:
     """Средняя закупочная за период: сумма прихода на проданное количество."""
+
+    if row.get('_price') is not None:
+        return _decimal(row['_price']).quantize(Decimal('0.01'))
 
     quantity = _decimal(row.get('saleQuantity'))
     amount = _decimal(row.get('saleArrivalAmount'))

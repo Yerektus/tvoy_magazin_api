@@ -229,6 +229,7 @@ class RoleTests(APITestCase):
         self.assertEqual(self.client.get('/api/purchases/access/').status_code, 403)
         self.assertEqual(self.client.get('/api/purchases/plan/').status_code, 403)
         self.assertEqual(self.client.get('/api/assistant/chat/').status_code, 403)
+        self.assertEqual(self.client.get('/api/invoices/access/').status_code, 200)
 
     def test_manager_with_access_gets_the_sections_but_not_the_settings(self):
         """Доступ выдают руками в админке — по одной галочке на раздел.
@@ -250,6 +251,10 @@ class RoleTests(APITestCase):
 
         self.assertEqual(self.client.post('/api/purchases/access/').status_code, 403)
         self.assertEqual(self.client.delete('/api/purchases/access/').status_code, 403)
+
+        self.assertEqual(self.client.get('/api/invoices/access/').status_code, 200)
+        self.assertEqual(self.client.post('/api/invoices/access/').status_code, 403)
+        self.assertEqual(self.client.delete('/api/invoices/access/').status_code, 403)
 
     def test_sections_of_the_person_are_told_at_login(self):
         """Приложение прячет разделы по ответу `/auth/me/`, а не по роли: доступ
@@ -378,6 +383,9 @@ class InvoiceTests(APITestCase):
     def setUp(self):
         self.user = make_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
         self.client.force_authenticate(self.user)
+        # Разбор — расширение: без подключения загрузка отказывает, а эти тесты
+        # про накладную, а не про каталог. Подключаем один раз на набор.
+        self.client.post('/api/invoices/access/', {}, format='json')
 
     def test_upload_schedules_parsing_and_stores_lines(self):
         with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
@@ -1398,6 +1406,67 @@ class InvoiceTests(APITestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    def test_recognition_is_in_the_catalogue(self):
+        slugs = [item['slug'] for item in self.client.get('/api/extensions/').data]
+        self.assertIn('recognition', slugs)
+
+    def test_upload_needs_the_extension(self):
+        """Список без расширения открывается, а загрузить фото — нет."""
+
+        self.client.delete('/api/invoices/access/')
+
+        self.assertEqual(self.client.get('/api/invoices/').status_code, 200)
+
+        response = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+        self.assertEqual(response.status_code, 409)
+
+    def test_retry_needs_the_extension(self):
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            created = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        self.client.delete('/api/invoices/access/')
+        response = self.client.post(f'/api/invoices/{created.data["id"]}/retry/')
+
+        self.assertEqual(response.status_code, 409)
+
+    def test_extension_connects_and_disconnects(self):
+        self.assertTrue(self.client.get('/api/invoices/access/').data['connected'])
+
+        self.assertFalse(self.client.delete('/api/invoices/access/').data['connected'])
+        self.assertTrue(self.client.post('/api/invoices/access/', {}, format='json').data['connected'])
+
+    def test_owner_connects_for_the_whole_shift(self):
+        """Подключает владелец — снимать накладные может и сменщик."""
+
+        colleague = make_user(
+            email='smena@tvoymagazin.kz',
+            password='tainy-parol-123',
+            organization=self.user.organization,
+            role=User.Role.MANAGER,
+        )
+        self.client.force_authenticate(colleague)
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            response = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_disconnect_stops_the_whole_shift(self):
+        """Владелец выключил — сменщик тоже больше не распознаёт."""
+
+        self.client.delete('/api/invoices/access/')
+
+        colleague = make_user(
+            email='smena@tvoymagazin.kz',
+            password='tainy-parol-123',
+            organization=self.user.organization,
+            role=User.Role.MANAGER,
+        )
+        self.client.force_authenticate(colleague)
+
+        response = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+        self.assertEqual(response.status_code, 409)
+
 
 @override_settings(INVOICE_PARSE_INLINE=True)
 class KnownBarcodeTests(APITestCase):
@@ -1406,6 +1475,7 @@ class KnownBarcodeTests(APITestCase):
     def setUp(self):
         self.user = make_user(email='shop@tvoymagazin.kz', password='tainy-parol-123')
         self.client.force_authenticate(self.user)
+        self.client.post('/api/invoices/access/', {}, format='json')
 
     def known_line(self, name: str, barcode: str = '4870145005545', user=None):
         """Прошлая накладная, в которой у этой строки штрихкод уже стоял."""

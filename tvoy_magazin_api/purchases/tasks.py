@@ -13,7 +13,7 @@ from django.db import close_old_connections, transaction
 from django.utils import timezone
 
 from . import planner
-from .models import PurchasePlan
+from .models import PurchasePlan, PurchasePlanItem
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,8 @@ def run(plan_id: int) -> None:
 
     try:
         planner.build(plan)
+    except planner.Cancelled:
+        return
     except planner.PlanError as error:
         _fail(plan, str(error))
         return
@@ -55,10 +57,18 @@ def run(plan_id: int) -> None:
         _fail(plan, f'Внутренняя ошибка: {error}')
         return
 
-    plan.status = PurchasePlan.Status.READY
-    plan.error = ''
-    plan.built_at = timezone.now()
-    plan.save(update_fields=('status', 'error', 'built_at', 'items_total', 'total_cost'))
+    # Пока считали, расчёт могли отменить: тогда READY писать нельзя, иначе
+    # брошенный план всплывёт на странице после «Отменить».
+    updated = PurchasePlan.objects.filter(pk=plan.pk, status=PurchasePlan.Status.BUILDING).update(
+        status=PurchasePlan.Status.READY,
+        error='',
+        built_at=timezone.now(),
+        items_total=plan.items_total,
+        total_cost=plan.total_cost,
+    )
+
+    if not updated:
+        PurchasePlanItem.objects.filter(plan_id=plan.pk).delete()
 
 
 def _fail(plan: PurchasePlan, message: str) -> None:

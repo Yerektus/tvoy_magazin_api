@@ -102,3 +102,187 @@ class SupplierLink(models.Model):
 
     def __str__(self):
         return f'{self.name} → {self.agent_name or self.agent_id}'
+
+
+class UmagSalesSync(models.Model):
+    """До какой точки локальная копия продаж догнала кабинет UMAG."""
+
+    class Status(models.TextChoices):
+        SYNCING = 'syncing', 'Загружается'
+        READY = 'ready', 'Готово'
+        FAILED = 'failed', 'Ошибка'
+
+    organization = models.ForeignKey(
+        'accounts.Organization',
+        verbose_name='организация',
+        on_delete=models.CASCADE,
+        related_name='umag_sales_syncs',
+    )
+    store_id = models.PositiveIntegerField('магазин')
+    status = models.CharField(
+        'статус',
+        max_length=16,
+        choices=Status.choices,
+        default=Status.SYNCING,
+    )
+    history_from = models.DateTimeField('история начинается', null=True, blank=True)
+    synced_until = models.DateTimeField('синхронизировано по', null=True, blank=True)
+    synced_at = models.DateTimeField('синхронизировано', null=True, blank=True)
+    error = models.TextField('ошибка', blank=True)
+
+    class Meta:
+        verbose_name = 'синхронизация продаж UMAG'
+        verbose_name_plural = 'синхронизации продаж UMAG'
+        constraints = [
+            models.UniqueConstraint(
+                fields=('organization', 'store_id'),
+                name='unique_organization_store_sales_sync',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.organization} → {self.store_id}: {self.get_status_display()}'
+
+
+class UmagSale(models.Model):
+    """Чек продажи без персональных данных покупателя."""
+
+    organization = models.ForeignKey(
+        'accounts.Organization',
+        verbose_name='организация',
+        on_delete=models.CASCADE,
+        related_name='umag_sales',
+    )
+    store_id = models.PositiveIntegerField('магазин')
+    external_id = models.CharField('ID в UMAG', max_length=64)
+    occurred_at = models.DateTimeField('продажа', db_index=True)
+    receipt_no = models.CharField('номер чека', max_length=64, blank=True)
+    pos_id = models.CharField('касса', max_length=64, blank=True)
+    amount = models.DecimalField('сумма', max_digits=16, decimal_places=2, default=0)
+    comment = models.TextField('комментарий', blank=True)
+    is_ofd = models.BooleanField('фискализирован', null=True, blank=True)
+    updated_at = models.DateTimeField('обновлено', auto_now=True)
+
+    class Meta:
+        verbose_name = 'продажа UMAG'
+        verbose_name_plural = 'продажи UMAG'
+        constraints = [
+            models.UniqueConstraint(
+                fields=('organization', 'store_id', 'external_id'),
+                name='unique_organization_store_sale',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=('organization', 'store_id', 'occurred_at')),
+        ]
+
+    def __str__(self):
+        return f'{self.receipt_no or self.external_id} — {self.occurred_at:%d.%m.%Y %H:%M}'
+
+
+class UmagSaleItem(models.Model):
+    """Товарная строка чека — исходный спрос для прогноза."""
+
+    sale = models.ForeignKey(
+        UmagSale,
+        verbose_name='продажа',
+        on_delete=models.CASCADE,
+        related_name='items',
+    )
+    position = models.PositiveSmallIntegerField('№')
+    barcode = models.CharField('штрихкод', max_length=64, blank=True, db_index=True)
+    name = models.CharField('товар', max_length=255, blank=True)
+    measure = models.CharField('единица', max_length=32, blank=True)
+    quantity = models.DecimalField('количество', max_digits=14, decimal_places=3)
+    price = models.DecimalField('цена', max_digits=14, decimal_places=2, null=True, blank=True)
+    price_before = models.DecimalField(
+        'цена до скидки',
+        max_digits=14,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    total = models.DecimalField('сумма', max_digits=16, decimal_places=2, null=True, blank=True)
+
+    class Meta:
+        verbose_name = 'строка продажи UMAG'
+        verbose_name_plural = 'строки продаж UMAG'
+        ordering = ('position',)
+        constraints = [
+            models.UniqueConstraint(fields=('sale', 'position'), name='unique_sale_position'),
+        ]
+
+    def __str__(self):
+        return f'{self.name or self.barcode} — {self.quantity}'
+
+
+class UmagRefund(models.Model):
+    """Возврат по чеку; связь с продажей позволяет вернуть спрос в исходный день."""
+
+    organization = models.ForeignKey(
+        'accounts.Organization',
+        verbose_name='организация',
+        on_delete=models.CASCADE,
+        related_name='umag_refunds',
+    )
+    store_id = models.PositiveIntegerField('магазин')
+    external_id = models.CharField('ID в UMAG', max_length=64)
+    sale_external_id = models.CharField('ID продажи в UMAG', max_length=64, blank=True)
+    sale = models.ForeignKey(
+        UmagSale,
+        verbose_name='продажа',
+        on_delete=models.SET_NULL,
+        related_name='refunds',
+        null=True,
+        blank=True,
+    )
+    occurred_at = models.DateTimeField('возврат', db_index=True)
+    amount = models.DecimalField('сумма', max_digits=16, decimal_places=2, default=0)
+    paid_amount = models.DecimalField('выплачено', max_digits=16, decimal_places=2, default=0)
+    note = models.TextField('комментарий', blank=True)
+    updated_at = models.DateTimeField('обновлено', auto_now=True)
+
+    class Meta:
+        verbose_name = 'возврат UMAG'
+        verbose_name_plural = 'возвраты UMAG'
+        constraints = [
+            models.UniqueConstraint(
+                fields=('organization', 'store_id', 'external_id'),
+                name='unique_organization_store_refund',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=('organization', 'store_id', 'occurred_at')),
+        ]
+
+    def __str__(self):
+        return f'Возврат {self.external_id} — {self.occurred_at:%d.%m.%Y %H:%M}'
+
+
+class UmagRefundItem(models.Model):
+    """Возвращённый товар, который вычитается из исторического спроса."""
+
+    refund = models.ForeignKey(
+        UmagRefund,
+        verbose_name='возврат',
+        on_delete=models.CASCADE,
+        related_name='items',
+    )
+    position = models.PositiveSmallIntegerField('№')
+    barcode = models.CharField('штрихкод', max_length=64, blank=True, db_index=True)
+    name = models.CharField('товар', max_length=255, blank=True)
+    measure = models.CharField('единица', max_length=32, blank=True)
+    quantity = models.DecimalField('количество', max_digits=14, decimal_places=3)
+    price = models.DecimalField('цена', max_digits=14, decimal_places=2, null=True, blank=True)
+    total = models.DecimalField('сумма', max_digits=16, decimal_places=2, null=True, blank=True)
+
+    class Meta:
+        verbose_name = 'строка возврата UMAG'
+        verbose_name_plural = 'строки возврата UMAG'
+        ordering = ('position',)
+        constraints = [
+            models.UniqueConstraint(fields=('refund', 'position'), name='unique_refund_position'),
+        ]
+
+    def __str__(self):
+        return f'{self.name or self.barcode} — {self.quantity}'

@@ -81,7 +81,8 @@ uv run python tvoy_magazin_api/manage.py parse_invoice ~/Downloads/nakladnaya.jp
 | `POST` | `/api/auth/login/` | `{email, password}` → `{access, user}` |
 | `GET` | `/api/auth/me/` | Текущий пользователь |
 | `GET` | `/api/invoices/` | Свои накладные, постранично по 20 |
-| `POST` | `/api/invoices/` | `multipart/form-data` с полем `image` → `{id, status: "pending"}` |
+| `GET/POST/DELETE` | `/api/invoices/access/` | Подключение расширения «Распознавание документов» |
+| `POST` | `/api/invoices/` | `multipart/form-data` с полем `image` → `{id, status: "pending"}`. Нужно подключённое расширение |
 | `GET` | `/api/invoices/<id>/` | Накладная с позициями и статусом разбора |
 | `POST` | `/api/invoices/<id>/retry/` | Перезапустить разбор |
 | `DELETE` | `/api/invoices/<id>/` | Удалить накладную |
@@ -108,9 +109,18 @@ uv run python tvoy_magazin_api/manage.py parse_invoice ~/Downloads/nakladnaya.jp
 | --- | --- | --- |
 | `UMAG_BASE_URL` | `https://api.umag.kz/rest/cabinet/` | Адрес кабинета |
 | `UMAG_API_VERSION` | `1.4` | Заголовок `api-ver`, без него ответ 400 |
-| `UMAG_CLIENT_VERSION` | `angular_cabinet_20.0.24` | Заголовок `client-ver` |
+| `UMAG_CLIENT_VERSION` | `angular_cabinet_20.1.4` | Заголовок `client-ver` |
 | `UMAG_TIMEOUT` | `30` | Таймаут запроса, секунды |
 | `UMAG_SUPPLY_URL` | `https://web.umag.kz/store/0/supplies/{id}/edit` | Ссылка на черновик для интерфейса |
+
+История для прогноза закупа берётся из всех чеков и возвратов выбранного
+магазина. Первый запуск может идти долго: на каждый чек кабинет отдаёт строки
+отдельным запросом. Для первоначальной загрузки и ночного обновления:
+
+```bash
+uv run python tvoy_magazin_api/manage.py sync_sales
+uv run python tvoy_magazin_api/manage.py sync_sales --store 17795 --full
+```
 
 ### Как идёт разбор
 
