@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from django.db import transaction
 from django.db.models import Sum
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -16,10 +17,13 @@ from .models import ApprovedPurchase, ApprovedPurchaseItem, PurchasePlan
 from .serializers import (
     ApproveSupplierSerializer,
     ApprovedPurchaseSerializer,
+    ProductDetailQuerySerializer,
+    ProductsQuerySerializer,
     ProductsSnapshotSerializer,
     PurchasePlanListSerializer,
     PurchasePlanRequestSerializer,
     PurchasePlanSerializer,
+    StoreProductDetailSerializer,
 )
 
 # Код расширения в каталоге.
@@ -81,7 +85,13 @@ class StoreProductsView(APIView):
     permission_classes = [IsAuthenticated, UsesPurchases]
 
     def get(self, request):
-        return Response(ProductsSnapshotSerializer(products.snapshot(_account(request.user))).data)
+        listing = ProductsQuerySerializer(data=request.query_params)
+        listing.is_valid(raise_exception=True)
+        return Response(
+            ProductsSnapshotSerializer(
+                products.snapshot(_account(request.user), **listing.validated_data)
+            ).data
+        )
 
     def post(self, request):
         if not _installed(request.user):
@@ -103,18 +113,47 @@ class StoreProductsView(APIView):
             store_id=account.store_id,
         )
 
-        if created or state.status != UmagSalesSync.Status.SYNCING:
-            if not created:
-                state.status = UmagSalesSync.Status.SYNCING
-                state.error = ''
-                state.save(update_fields=('status', 'error'))
-
+        if created or state.status != UmagSalesSync.Status.SYNCING or products.sync_is_stale(state):
+            state.status = UmagSalesSync.Status.SYNCING
+            state.error = ''
+            state.heartbeat_at = timezone.now()
+            state.save(update_fields=('status', 'error', 'heartbeat_at'))
             tasks.schedule_sales_sync(account)
 
+        listing = ProductsQuerySerializer(data=request.query_params)
+        listing.is_valid(raise_exception=True)
+
         return Response(
-            ProductsSnapshotSerializer(products.snapshot(account)).data,
+            ProductsSnapshotSerializer(
+                products.snapshot(account, **listing.validated_data)
+            ).data,
             status=status.HTTP_202_ACCEPTED,
         )
+
+
+class StoreProductDetailView(APIView):
+    """GET /api/purchases/products/<barcode>/ — продажи и прогноз одного товара."""
+
+    permission_classes = [IsAuthenticated, UsesPurchases]
+
+    def get(self, request, barcode):
+        query = ProductDetailQuerySerializer(data=request.query_params)
+
+        if not query.is_valid():
+            return Response(query.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        account = _account(request.user)
+        detail = products.detail(
+            account,
+            barcode,
+            horizon=query.validated_data['horizon'],
+            history_days=query.validated_data['history_days'],
+        )
+
+        if detail is None:
+            return Response({'detail': 'Товар не найден'}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(StoreProductDetailSerializer(detail).data)
 
 
 class PurchasePlanListView(APIView):

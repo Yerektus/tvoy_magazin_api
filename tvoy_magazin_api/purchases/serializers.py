@@ -91,15 +91,109 @@ class StoreProductSerializer(serializers.Serializer):
     last_sold = serializers.DateTimeField(allow_null=True)
 
 
+class ProductsQuerySerializer(serializers.Serializer):
+    """Страница списка товаров: поиск, сортировка и номер страницы."""
+
+    q = serializers.CharField(required=False, allow_blank=True, default='')
+    page = serializers.IntegerField(min_value=1, required=False, default=1)
+    page_size = serializers.IntegerField(
+        min_value=1,
+        max_value=100,
+        required=False,
+        default=50,
+    )
+    sort = serializers.ChoiceField(
+        choices=('name', 'sold', 'last'),
+        required=False,
+        default='sold',
+    )
+    order = serializers.ChoiceField(
+        choices=('asc', 'desc'),
+        required=False,
+        default='desc',
+    )
+    last_from = serializers.DateField(required=False, allow_null=True, default=None)
+    last_to = serializers.DateField(required=False, allow_null=True, default=None)
+    sold_from = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        min_value=0,
+        required=False,
+        allow_null=True,
+        default=None,
+    )
+    sold_to = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        min_value=0,
+        required=False,
+        allow_null=True,
+        default=None,
+    )
+
+
 class ProductsSnapshotSerializer(serializers.Serializer):
-    """Вкладка «Товары»: выгрузка чеков и собранный по ним список."""
+    """Вкладка «Товары»: выгрузка чеков и одна страница списка."""
 
     status = serializers.CharField()
     synced_at = serializers.DateTimeField(allow_null=True)
     history_from = serializers.DateTimeField(allow_null=True)
     error = serializers.CharField(allow_blank=True)
     items_total = serializers.IntegerField()
+    page = serializers.IntegerField()
+    page_size = serializers.IntegerField()
     items = StoreProductSerializer(many=True)
+
+
+class DailySoldSerializer(serializers.Serializer):
+    """Один день на графике: дата и сколько ушло с полки."""
+
+    date = serializers.DateField()
+    sold = serializers.DecimalField(max_digits=14, decimal_places=3)
+
+
+class ProductForecastSerializer(serializers.Serializer):
+    """Прогноз спроса: модель, итог на горизонт и дневной ряд вперёд."""
+
+    model = serializers.CharField()
+    quantity = serializers.DecimalField(max_digits=14, decimal_places=3)
+    per_day = serializers.DecimalField(max_digits=14, decimal_places=3)
+    safety_stock = serializers.DecimalField(max_digits=14, decimal_places=3)
+    holiday_factor = serializers.DecimalField(max_digits=8, decimal_places=3)
+    error = serializers.DecimalField(max_digits=14, decimal_places=3)
+    observations = serializers.IntegerField()
+    series = DailySoldSerializer(many=True)
+
+
+class StoreProductDetailSerializer(serializers.Serializer):
+    """Карточка товара: кто это, сколько продали и куда движется спрос."""
+
+    barcode = serializers.CharField()
+    name = serializers.CharField()
+    measure = serializers.CharField(allow_blank=True)
+    sold = serializers.DecimalField(max_digits=14, decimal_places=3)
+    last_sold = serializers.DateTimeField(allow_null=True)
+    horizon = serializers.IntegerField()
+    history_days = serializers.IntegerField()
+    history = DailySoldSerializer(many=True)
+    forecast = ProductForecastSerializer(allow_null=True)
+
+
+class ProductDetailQuerySerializer(serializers.Serializer):
+    """Параметры карточки: горизонт прогноза и длина истории на графике."""
+
+    horizon = serializers.IntegerField(
+        min_value=1,
+        max_value=MAX_HORIZON,
+        required=False,
+        default=14,
+    )
+    history_days = serializers.IntegerField(
+        min_value=7,
+        max_value=MAX_DAYS,
+        required=False,
+        default=60,
+    )
 
 
 class PurchasePlanRequestSerializer(serializers.Serializer):

@@ -6,6 +6,7 @@ from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
 
 from accounts.tests import make_user
+from umag.demand import rebuild_store
 from umag.models import UmagRefund, UmagRefundItem, UmagSale, UmagSaleItem
 
 from . import forecast
@@ -77,6 +78,26 @@ class ForecastModelTests(SimpleTestCase):
         self.assertGreater(result.safety_stock, 0)
         self.assertLessEqual(result.safety_stock, result.quantity / 2)
 
+    def test_promo_spike_is_clipped_before_forecast(self):
+        dates = [date(2024, 1, 1) + timedelta(days=offset) for offset in range(28)]
+        values = [10.0] * 27 + [40.0]
+        promo = [0.0] * 27 + [40.0]
+        clipped = forecast.predict(values, 7, dates=dates, promo_values=promo)
+        raw = forecast.predict(values, 7, dates=dates)
+
+        self.assertLess(clipped.quantity, raw.quantity)
+
+    def test_standing_discount_is_kept_as_normal_demand(self):
+        """Цена всегда ниже ценника — это не акция, ряд не трогаем."""
+
+        dates = [date(2024, 1, 1) + timedelta(days=offset) for offset in range(28)]
+        values = [10.0] * 28
+        promo = [10.0] * 28
+        standing = forecast.predict(values, 7, dates=dates, promo_values=promo)
+        raw = forecast.predict(values, 7, dates=dates)
+
+        self.assertEqual(standing.quantity, raw.quantity)
+
 
 class ForecastHistoryTests(TestCase):
     def test_refund_reduces_demand_on_original_sale_day(self):
@@ -108,6 +129,8 @@ class ForecastHistoryTests(TestCase):
             barcode='4870',
             quantity=Decimal('1'),
         )
+
+        rebuild_store(user.organization, 17795)
 
         history = forecast._daily_quantities(user.organization, 17795)
         sale_day = timezone.localtime(sold_at).date()

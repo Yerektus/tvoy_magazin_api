@@ -1,32 +1,29 @@
 """Прогноз спроса по дневным продажам.
 
-Модели намеренно небольшие и без тяжёлого ML-стека: для каждого товара
-доступные алгоритмы зависят от длины и разреженности ряда, а лучший выбирается
-по отложенному хвосту. Это важнее одной сложной модели — у нового йогурта и у
-хлеба с трёхлетней историей принципиально разное количество сигнала.
+Модели намеренно небольшие: доступные алгоритмы зависят от длины ряда, а лучший
+выбирается по отложенному хвосту. Акционный всплеск не должен стать нормой —
+скидку снимаем с ряда до отбора модели, на графике оставляем факт.
 """
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from math import isfinite, sqrt
 from statistics import median
-from zoneinfo import ZoneInfo
 
 import holidays
-from django.conf import settings
-from django.db.models import Sum
-from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
 
-from umag.models import UmagRefundItem, UmagSaleItem
+from umag.models import UmagDailyDemand
 
 ZERO = Decimal('0')
 THREE = Decimal('0.001')
 MAX_HOLIDAY_FACTOR = 3.0
 MIN_HOLIDAY_FACTOR = 0.5
 SERVICE_LEVEL_Z = 1.28  # около 90% при близких к нормальным остатках ошибки
+# День считаем акционным, если хотя бы треть объёма ушла дешевле обычной цены.
+PROMO_SHARE = 0.3
 
 
 @dataclass(frozen=True)
@@ -84,7 +81,7 @@ def for_products(
 
     as_of = as_of or timezone.localdate()
     history_end = as_of - timedelta(days=1)
-    sparse = _daily_quantities(organization, store_id)
+    sparse, promos = _daily_history(organization, store_id)
     wanted = {
         barcode: rows
         for barcode, rows in sparse.items()
@@ -114,36 +111,143 @@ def for_products(
         if not values:
             continue
 
-        model, base, error, daily_mae = _select(values, horizon)
-        adjusted, holiday_factor = _with_holidays(
-            base,
-            dates,
+        _, promo_values = _series(promos.get(barcode, {}), first_day, history_end)
+        forecasts[barcode] = _build(
             values,
+            dates,
+            horizon,
             future_dates,
             calendar,
             store_dates,
             store_values,
             store_factor_cache,
-        )
-        demand = max(0.0, sum(adjusted))
-        safety = min(
-            SERVICE_LEVEL_Z * daily_mae * sqrt(horizon),
-            demand * 0.5,
-        )
-
-        forecasts[barcode] = Forecast(
-            model=model,
-            quantity=_amount(demand),
-            per_day=_amount(demand / horizon),
-            safety_stock=_amount(max(0.0, safety)),
-            holiday_factor=Decimal(str(holiday_factor)).quantize(THREE),
-            error=Decimal(str(min(99_999.0, max(0.0, error)))).quantize(THREE),
-            observations=len(values),
-            daily=tuple(_amount(value) for value in adjusted),
-            daily_error=_amount(daily_mae),
+            promo_values,
         )
 
     return forecasts
+
+
+def for_barcode(
+    organization,
+    store_id: int,
+    barcode: str,
+    horizon: int,
+    *,
+    history_days: int = 60,
+    as_of: date | None = None,
+) -> dict | None:
+    """История продаж и прогноз одного товара — для карточки на графике.
+
+    История обрезается до `history_days`: полный ряд нужен модели, а на
+    экране длинный хвост только мешает читать ближайшие недели.
+    """
+
+    if not barcode or horizon <= 0:
+        return None
+
+    as_of = as_of or timezone.localdate()
+    history_end = as_of - timedelta(days=1)
+    sparse, promos = _daily_history(organization, store_id)
+    rows = sparse.get(barcode)
+
+    if not rows:
+        return None
+
+    store_sparse: dict[date, float] = defaultdict(float)
+
+    for product_rows in sparse.values():
+        for day, quantity in product_rows.items():
+            store_sparse[day] += quantity
+
+    first_day = min(rows)
+    dates, values = _series(rows, first_day, history_end)
+
+    if not values:
+        return None
+
+    first_store_day = min(store_sparse)
+    calendar = _calendar(first_store_day, as_of + timedelta(days=horizon))
+    store_dates, store_values = _series(store_sparse, first_store_day, history_end)
+    future_dates = [as_of + timedelta(days=offset) for offset in range(horizon)]
+    _, promo_values = _series(promos.get(barcode, {}), first_day, history_end)
+    prediction = _build(
+        values,
+        dates,
+        horizon,
+        future_dates,
+        calendar,
+        store_dates,
+        store_values,
+        {},
+        promo_values,
+    )
+
+    chart_dates, chart_values = _series(rows, first_day, as_of)
+
+    if not chart_dates:
+        chart_dates, chart_values = dates, values
+
+    if history_days > 0 and len(chart_dates) > history_days:
+        chart_dates = chart_dates[-history_days:]
+        chart_values = chart_values[-history_days:]
+
+    return {
+        'history': [
+            {'date': day, 'sold': _amount(quantity)}
+            for day, quantity in zip(chart_dates, chart_values)
+        ],
+        'forecast': prediction,
+        'series': [
+            {'date': day, 'sold': quantity}
+            for day, quantity in zip(future_dates, prediction.daily)
+        ],
+        'as_of': as_of,
+        'history_end': history_end,
+    }
+
+
+def _build(
+    values: list[float],
+    dates: list[date],
+    horizon: int,
+    future_dates: list[date],
+    calendar: dict[date, str],
+    store_dates: list[date],
+    store_values: list[float],
+    store_factor_cache: dict[tuple[str, int], tuple[float, int]],
+    promo_values: list[float] | None = None,
+) -> Forecast:
+    """Одна модель: отбор, скидки, праздники и страховой запас."""
+
+    values = _clip_promos(dates, values, promo_values)
+    model, base, error, daily_mae = _select(values, horizon)
+    adjusted, holiday_factor = _with_holidays(
+        base,
+        dates,
+        values,
+        future_dates,
+        calendar,
+        store_dates,
+        store_values,
+        store_factor_cache,
+    )
+    demand = max(0.0, sum(adjusted))
+    safety = min(
+        SERVICE_LEVEL_Z * daily_mae * sqrt(horizon),
+        demand * 0.5,
+    )
+
+    return Forecast(
+        model=model,
+        quantity=_amount(demand),
+        per_day=_amount(demand / horizon),
+        safety_stock=_amount(max(0.0, safety)),
+        holiday_factor=Decimal(str(holiday_factor)).quantize(THREE),
+        error=Decimal(str(min(99_999.0, max(0.0, error)))).quantize(THREE),
+        observations=len(values),
+        daily=tuple(_amount(value) for value in adjusted),
+        daily_error=_amount(daily_mae),
+    )
 
 
 def predict(
@@ -155,6 +259,7 @@ def predict(
     holiday_calendar: dict[date, str] | None = None,
     store_values: list[float] | None = None,
     store_dates: list[date] | None = None,
+    promo_values: list[float] | None = None,
 ) -> Forecast:
     """Чистая точка входа для тестов и повторного использования без БД."""
 
@@ -164,8 +269,9 @@ def predict(
         raise ValueError('История продаж пуста')
 
     clean = [max(0.0, float(value)) for value in values]
-    model, base, error, daily_mae = _select(clean, horizon)
     dates = dates or [date(2000, 1, 1) + timedelta(days=index) for index in range(len(clean))]
+    clean = _clip_promos(dates, clean, promo_values)
+    model, base, error, daily_mae = _select(clean, horizon)
     future_dates = future_dates or [
         dates[-1] + timedelta(days=index + 1) for index in range(horizon)
     ]
@@ -197,54 +303,111 @@ def predict(
 
 
 def _daily_quantities(organization, store_id: int) -> dict[str, dict[date, float]]:
-    """Net-demand: продажи минус возвраты, привязанные к дню исходного чека."""
+    quantities, _ = _daily_history(organization, store_id)
+    return quantities
 
-    tz = ZoneInfo(settings.TIME_ZONE)
-    result: dict[str, dict[date, float]] = defaultdict(lambda: defaultdict(float))
-    sold = (
-        UmagSaleItem.objects.filter(
-            sale__organization=organization,
-            sale__store_id=store_id,
-        )
-        .exclude(barcode='')
-        .annotate(day=TruncDate('sale__occurred_at', tzinfo=tz))
-        .values('barcode', 'day')
-        .annotate(total=Sum('quantity'))
-    )
 
-    for row in sold:
-        if row['day'] is not None:
-            result[row['barcode']][row['day']] += float(row['total'] or 0)
+def _daily_history(
+    organization,
+    store_id: int,
+) -> tuple[dict[str, dict[date, float]], dict[str, dict[date, float]]]:
+    """Net-demand и сколько из него ушло со скидкой."""
 
-    returned_at = Coalesce('refund__sale__occurred_at', 'refund__occurred_at')
-    refunded = (
-        UmagRefundItem.objects.filter(
-            refund__organization=organization,
-            refund__store_id=store_id,
-        )
-        .exclude(barcode='')
-        .annotate(day=TruncDate(returned_at, tzinfo=tz))
-        .values('barcode', 'day')
-        .annotate(total=Sum('quantity'))
-    )
+    quantities: dict[str, dict[date, float]] = defaultdict(lambda: defaultdict(float))
+    promos: dict[str, dict[date, float]] = defaultdict(lambda: defaultdict(float))
 
-    for row in refunded:
-        if row['day'] is not None:
-            result[row['barcode']][row['day']] -= float(row['total'] or 0)
+    for row in UmagDailyDemand.objects.filter(
+        organization=organization,
+        store_id=store_id,
+    ).values('barcode', 'day', 'quantity', 'promo_quantity'):
+        day = _as_date(row['day'])
+        if day is None:
+            continue
+        quantities[row['barcode']][day] = max(0.0, float(row['quantity'] or 0))
+        promos[row['barcode']][day] = max(0.0, float(row['promo_quantity'] or 0))
 
-    return {
-        barcode: {day: max(0.0, quantity) for day, quantity in rows.items()}
-        for barcode, rows in result.items()
-    }
+    return quantities, promos
+
+
+def _as_date(value) -> date | None:
+    """День из агрегата или из TruncDate — сводим к date."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    text = str(value)
+
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
 
 
 def _series(rows: dict[date, float], first: date, last: date) -> tuple[list[date], list[float]]:
-    if first > last:
+    first = _as_date(first)
+    last = _as_date(last)
+
+    if first is None or last is None or first > last:
         return [], []
 
+    keyed = {
+        converted: quantity
+        for day, quantity in rows.items()
+        if (converted := _as_date(day)) is not None
+    }
     days = (last - first).days + 1
     dates = [first + timedelta(days=offset) for offset in range(days)]
-    return dates, [max(0.0, rows.get(day, 0.0)) for day in dates]
+    return dates, [max(0.0, keyed.get(day, 0.0)) for day in dates]
+
+
+def _clip_promos(
+    dates: list[date],
+    values: list[float],
+    promo_values: list[float] | None,
+) -> list[float]:
+    """Акционный всплеск не должен стать нормой после окончания скидки.
+
+    Постоянная «скидка» на все дни (карта лояльности, цена ниже ценника) не
+    трогаем: это уже обычный спрос. Режем только дни, где акция выделяется
+    на фоне остальных.
+    """
+
+    if not promo_values or len(promo_values) != len(values) or len(dates) != len(values):
+        return values
+
+    flagged = [
+        value > 0 and promo / value >= PROMO_SHARE
+        for value, promo in zip(values, promo_values)
+    ]
+
+    if not any(flagged) or all(flagged):
+        return values
+
+    by_weekday: dict[int, list[float]] = defaultdict(list)
+    rest = []
+
+    for day, value, is_promo in zip(dates, values, flagged):
+        if not is_promo:
+            by_weekday[day.weekday()].append(value)
+            rest.append(value)
+
+    typical_all = median(rest) if rest else None
+    cleaned = []
+
+    for day, value, is_promo in zip(dates, values, flagged):
+        if not is_promo:
+            cleaned.append(value)
+            continue
+
+        bucket = by_weekday[day.weekday()]
+        typical = median(bucket) if bucket else typical_all
+        cleaned.append(min(value, typical) if typical is not None else value)
+
+    return cleaned
 
 
 def _select(values: list[float], horizon: int) -> tuple[str, list[float], float, float]:

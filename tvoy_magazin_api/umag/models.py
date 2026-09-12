@@ -138,6 +138,7 @@ class UmagSalesSync(models.Model):
     history_from = models.DateTimeField('история начинается', null=True, blank=True)
     synced_until = models.DateTimeField('синхронизировано по', null=True, blank=True)
     synced_at = models.DateTimeField('синхронизировано', null=True, blank=True)
+    heartbeat_at = models.DateTimeField('последняя активность', null=True, blank=True)
     error = models.TextField('ошибка', blank=True)
 
     class Meta:
@@ -155,7 +156,11 @@ class UmagSalesSync(models.Model):
 
 
 class UmagSale(models.Model):
-    """Чек продажи без персональных данных покупателя."""
+    """Свежий чек: нужен, чтобы пересчитать последние дни, если UMAG правил продажу.
+
+    Двухлетняя история живёт в дневных агрегатах. Сами чеки держим только на
+    окно перекрытия синхронизации — иначе миллионы строк ради прогноза.
+    """
 
     organization = models.ForeignKey(
         'accounts.Organization',
@@ -166,11 +171,6 @@ class UmagSale(models.Model):
     store_id = models.PositiveIntegerField('магазин')
     external_id = models.CharField('ID в UMAG', max_length=64)
     occurred_at = models.DateTimeField('продажа', db_index=True)
-    receipt_no = models.CharField('номер чека', max_length=64, blank=True)
-    pos_id = models.CharField('касса', max_length=64, blank=True)
-    amount = models.DecimalField('сумма', max_digits=16, decimal_places=2, default=0)
-    comment = models.TextField('комментарий', blank=True)
-    is_ofd = models.BooleanField('фискализирован', null=True, blank=True)
     updated_at = models.DateTimeField('обновлено', auto_now=True)
 
     class Meta:
@@ -187,11 +187,11 @@ class UmagSale(models.Model):
         ]
 
     def __str__(self):
-        return f'{self.receipt_no or self.external_id} — {self.occurred_at:%d.%m.%Y %H:%M}'
+        return f'{self.external_id} — {self.occurred_at:%d.%m.%Y %H:%M}'
 
 
 class UmagSaleItem(models.Model):
-    """Товарная строка чека — исходный спрос для прогноза."""
+    """Строка свежего чека. Название нужно, пока товар не попал в номенклатуру."""
 
     sale = models.ForeignKey(
         UmagSale,
@@ -204,15 +204,8 @@ class UmagSaleItem(models.Model):
     name = models.CharField('товар', max_length=255, blank=True)
     measure = models.CharField('единица', max_length=32, blank=True)
     quantity = models.DecimalField('количество', max_digits=14, decimal_places=3)
-    price = models.DecimalField('цена', max_digits=14, decimal_places=2, null=True, blank=True)
-    price_before = models.DecimalField(
-        'цена до скидки',
-        max_digits=14,
-        decimal_places=2,
-        null=True,
-        blank=True,
-    )
-    total = models.DecimalField('сумма', max_digits=16, decimal_places=2, null=True, blank=True)
+    # Цена не храним: для прогноза достаточно знать, что строка ушла со скидкой.
+    on_promo = models.BooleanField('со скидкой', default=False)
 
     class Meta:
         verbose_name = 'строка продажи UMAG'
@@ -227,7 +220,7 @@ class UmagSaleItem(models.Model):
 
 
 class UmagRefund(models.Model):
-    """Возврат по чеку; связь с продажей позволяет вернуть спрос в исходный день."""
+    """Возврат по чеку; спрос снимаем с дня исходной продажи, не с дня возврата."""
 
     organization = models.ForeignKey(
         'accounts.Organization',
@@ -246,10 +239,11 @@ class UmagRefund(models.Model):
         null=True,
         blank=True,
     )
+    # Чек могли уже выкинуть из окна перекрытия — день спроса тогда берём отсюда.
+    sale_occurred_at = models.DateTimeField('продажа', null=True, blank=True)
     occurred_at = models.DateTimeField('возврат', db_index=True)
-    amount = models.DecimalField('сумма', max_digits=16, decimal_places=2, default=0)
-    paid_amount = models.DecimalField('выплачено', max_digits=16, decimal_places=2, default=0)
-    note = models.TextField('комментарий', blank=True)
+    # Поздний возврат на уже свёрнутый день вычитаем один раз и больше не трогаем.
+    folded = models.BooleanField('учтён в спросе', default=False)
     updated_at = models.DateTimeField('обновлено', auto_now=True)
 
     class Meta:
@@ -280,11 +274,7 @@ class UmagRefundItem(models.Model):
     )
     position = models.PositiveSmallIntegerField('№')
     barcode = models.CharField('штрихкод', max_length=64, blank=True, db_index=True)
-    name = models.CharField('товар', max_length=255, blank=True)
-    measure = models.CharField('единица', max_length=32, blank=True)
     quantity = models.DecimalField('количество', max_digits=14, decimal_places=3)
-    price = models.DecimalField('цена', max_digits=14, decimal_places=2, null=True, blank=True)
-    total = models.DecimalField('сумма', max_digits=16, decimal_places=2, null=True, blank=True)
 
     class Meta:
         verbose_name = 'строка возврата UMAG'
@@ -295,4 +285,75 @@ class UmagRefundItem(models.Model):
         ]
 
     def __str__(self):
-        return f'{self.name or self.barcode} — {self.quantity}'
+        return f'{self.barcode} — {self.quantity}'
+
+
+class UmagDailyDemand(models.Model):
+    """Спрос за день: продажи минус возвраты, одна строка на штрихкод."""
+
+    organization = models.ForeignKey(
+        'accounts.Organization',
+        verbose_name='организация',
+        on_delete=models.CASCADE,
+        related_name='umag_daily_demands',
+    )
+    store_id = models.PositiveIntegerField('магазин')
+    barcode = models.CharField('штрихкод', max_length=64)
+    day = models.DateField('день')
+    quantity = models.DecimalField('количество', max_digits=14, decimal_places=3)
+    promo_quantity = models.DecimalField(
+        'со скидкой',
+        max_digits=14,
+        decimal_places=3,
+        default=0,
+    )
+
+    class Meta:
+        verbose_name = 'дневной спрос UMAG'
+        verbose_name_plural = 'дневной спрос UMAG'
+        constraints = [
+            models.UniqueConstraint(
+                fields=('organization', 'store_id', 'barcode', 'day'),
+                name='unique_organization_store_barcode_day',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=('organization', 'store_id', 'day')),
+            models.Index(fields=('organization', 'store_id', 'barcode')),
+        ]
+
+    def __str__(self):
+        return f'{self.barcode} {self.day}: {self.quantity}'
+
+
+class UmagSoldProduct(models.Model):
+    """Товар, который продавался: сумма и последняя продажа для списка."""
+
+    organization = models.ForeignKey(
+        'accounts.Organization',
+        verbose_name='организация',
+        on_delete=models.CASCADE,
+        related_name='umag_sold_products',
+    )
+    store_id = models.PositiveIntegerField('магазин')
+    barcode = models.CharField('штрихкод', max_length=64)
+    name = models.CharField('товар', max_length=255, blank=True)
+    measure = models.CharField('единица', max_length=32, blank=True)
+    sold = models.DecimalField('продано', max_digits=14, decimal_places=3, default=0)
+    last_sold = models.DateTimeField('последняя продажа', null=True, blank=True)
+
+    class Meta:
+        verbose_name = 'проданный товар UMAG'
+        verbose_name_plural = 'проданные товары UMAG'
+        constraints = [
+            models.UniqueConstraint(
+                fields=('organization', 'store_id', 'barcode'),
+                name='unique_organization_store_sold_product',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=('organization', 'store_id')),
+        ]
+
+    def __str__(self):
+        return f'{self.name or self.barcode} — {self.sold}'

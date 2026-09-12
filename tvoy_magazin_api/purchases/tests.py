@@ -9,6 +9,7 @@ from rest_framework.test import APITestCase
 
 from accounts.tests import make_user
 from umag.client import UmagError
+from umag.demand import rebuild_store
 from umag.models import (
     UmagAccount,
     UmagProduct,
@@ -306,7 +307,6 @@ class PlanningApiTests(APITestCase):
                     store_id=17795,
                     external_id=str(index),
                     occurred_at=now - timedelta(days=60 - index),
-                    amount=2000,
                 )
                 for index in range(60)
             ]
@@ -320,12 +320,12 @@ class PlanningApiTests(APITestCase):
                     name='Пепси 1 л',
                     measure='шт',
                     quantity=4,
-                    price=500,
-                    total=2000,
                 )
                 for sale in sales
             ]
         )
+
+        rebuild_store(self.user.organization, 17795)
 
         with patch('umag.client._request', new=FakeReport([product()])):
             response = self.client.post(
@@ -602,6 +602,118 @@ class PlanningApiTests(APITestCase):
         self.assertEqual(response.data['status'], 'idle')
         self.assertEqual(response.data['items'], [])
 
+    def test_stuck_products_sync_becomes_ready_when_sales_exist(self):
+        """Поток умер, статус остался syncing — кнопка не должна крутиться вечно."""
+
+        self.install()
+        occurred = timezone.now() - timedelta(days=1)
+        sale = UmagSale.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            external_id='1',
+            occurred_at=occurred,
+        )
+        UmagSaleItem.objects.create(
+            sale=sale,
+            position=1,
+            barcode='111',
+            name='Молоко',
+            measure='шт',
+            quantity=2,
+        )
+        UmagSale.objects.filter(pk=sale.pk).update(
+            updated_at=timezone.now() - timedelta(minutes=20),
+        )
+        UmagSalesSync.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            status=UmagSalesSync.Status.SYNCING,
+        )
+
+        response = self.client.get('/api/purchases/products/')
+
+        self.assertEqual(response.data['status'], UmagSalesSync.Status.READY)
+        self.assertEqual(response.data['items_total'], 1)
+        state = UmagSalesSync.objects.get()
+        self.assertEqual(state.status, UmagSalesSync.Status.READY)
+        self.assertEqual(state.synced_until, occurred)
+
+    def test_stuck_products_sync_without_sales_fails(self):
+        self.install()
+        UmagSalesSync.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            status=UmagSalesSync.Status.SYNCING,
+        )
+
+        response = self.client.get('/api/purchases/products/')
+
+        self.assertEqual(response.data['status'], UmagSalesSync.Status.FAILED)
+        self.assertIn('прервалась', response.data['error'])
+
+    def test_live_products_sync_stays_syncing(self):
+        self.install()
+        UmagSalesSync.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            status=UmagSalesSync.Status.SYNCING,
+            heartbeat_at=timezone.now(),
+        )
+
+        response = self.client.get('/api/purchases/products/')
+
+        self.assertEqual(response.data['status'], UmagSalesSync.Status.SYNCING)
+
+    def test_recent_sale_writes_keep_sync_alive(self):
+        """Месяц чеков качается дольше трёх минут — это не мёртвый поток."""
+
+        self.install()
+        UmagSale.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            external_id='1',
+            occurred_at=timezone.now() - timedelta(days=1),
+        )
+        UmagSalesSync.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            status=UmagSalesSync.Status.SYNCING,
+            heartbeat_at=timezone.now() - timedelta(minutes=4),
+        )
+
+        response = self.client.get('/api/purchases/products/')
+
+        self.assertEqual(response.data['status'], UmagSalesSync.Status.SYNCING)
+
+    def test_stale_products_sync_can_be_restarted(self):
+        self.install()
+        UmagSalesSync.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            status=UmagSalesSync.Status.SYNCING,
+        )
+
+        with patch('purchases.tasks.schedule_sales_sync') as schedule:
+            response = self.client.post('/api/purchases/products/', {}, format='json')
+
+        schedule.assert_called_once()
+        self.assertEqual(response.data['status'], UmagSalesSync.Status.SYNCING)
+        self.assertIsNotNone(UmagSalesSync.objects.get().heartbeat_at)
+
+    def test_live_products_sync_is_not_restarted(self):
+        self.install()
+        UmagSalesSync.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            status=UmagSalesSync.Status.SYNCING,
+            heartbeat_at=timezone.now(),
+        )
+
+        with patch('purchases.tasks.schedule_sales_sync') as schedule:
+            self.client.post('/api/purchases/products/', {}, format='json')
+
+        schedule.assert_not_called()
+
     def test_products_come_from_sales(self):
         """Список на вкладке — то, что продавали, а не вся номенклатура кабинета."""
 
@@ -612,14 +724,12 @@ class PlanningApiTests(APITestCase):
             store_id=17795,
             external_id='1',
             occurred_at=now - timedelta(days=2),
-            amount=400,
         )
         second = UmagSale.objects.create(
             organization=self.user.organization,
             store_id=17795,
             external_id='2',
             occurred_at=now,
-            amount=200,
         )
         UmagSaleItem.objects.create(
             sale=first,
@@ -642,17 +752,17 @@ class PlanningApiTests(APITestCase):
             store_id=17795,
             external_id='20',
             occurred_at=now,
-            amount=200,
             sale=first,
+            sale_occurred_at=first.occurred_at,
         )
         UmagRefundItem.objects.create(
             refund=refund,
             position=1,
             barcode='111',
-            name='Молоко',
-            measure='шт',
             quantity=1,
         )
+
+        rebuild_store(self.user.organization, 17795)
 
         response = self.client.get('/api/purchases/products/')
         item = response.data['items'][0]
@@ -662,6 +772,75 @@ class PlanningApiTests(APITestCase):
         self.assertEqual(item['measure'], 'шт')
         self.assertEqual(item['sold'], '2.000')
         self.assertEqual(response.data['items_total'], 1)
+        self.assertEqual(response.data['page'], 1)
+        self.assertEqual(response.data['page_size'], 50)
+
+    def test_products_are_paginated_and_sorted(self):
+        """Список режется и сортируется на сервере — все 10 тысяч на клиент не едут."""
+
+        self.install()
+        now = timezone.now()
+
+        for barcode, name, quantity, days in (
+            ('111', 'Хлеб', 1, 3),
+            ('222', 'Молоко', 5, 2),
+            ('333', 'Айран', 3, 1),
+        ):
+            sale = UmagSale.objects.create(
+                organization=self.user.organization,
+                store_id=17795,
+                external_id=barcode,
+                occurred_at=now - timedelta(days=days),
+            )
+            UmagSaleItem.objects.create(
+                sale=sale,
+                position=1,
+                barcode=barcode,
+                name=name,
+                measure='шт',
+                quantity=quantity,
+            )
+
+        rebuild_store(self.user.organization, 17795)
+
+        page = self.client.get(
+            '/api/purchases/products/',
+            {'page': 2, 'page_size': 2, 'sort': 'sold', 'order': 'desc'},
+        )
+
+        self.assertEqual(page.data['items_total'], 3)
+        self.assertEqual(page.data['page'], 2)
+        self.assertEqual(page.data['page_size'], 2)
+        self.assertEqual([item['barcode'] for item in page.data['items']], ['111'])
+
+        names = self.client.get(
+            '/api/purchases/products/',
+            {'sort': 'name', 'order': 'asc'},
+        )
+        self.assertEqual(
+            [item['name'] for item in names.data['items']],
+            ['Айран', 'Молоко', 'Хлеб'],
+        )
+
+        found = self.client.get('/api/purchases/products/', {'q': '222'})
+        self.assertEqual(found.data['items_total'], 1)
+        self.assertEqual(found.data['items'][0]['name'], 'Молоко')
+
+        recent = self.client.get(
+            '/api/purchases/products/',
+            {'last_from': (now - timedelta(days=1)).date().isoformat()},
+        )
+        self.assertEqual(recent.data['items_total'], 1)
+        self.assertEqual(recent.data['items'][0]['name'], 'Айран')
+
+        sold = self.client.get(
+            '/api/purchases/products/',
+            {'sold_from': '3', 'sold_to': '5'},
+        )
+        self.assertEqual(
+            [item['name'] for item in sold.data['items']],
+            ['Молоко', 'Айран'],
+        )
 
     def test_products_take_measure_from_catalog_when_sale_lost_it(self):
         """В чеке ноль — штуки, а `0 or ''` его стирал. Берём единицу из номенклатуры."""
@@ -673,7 +852,6 @@ class PlanningApiTests(APITestCase):
             store_id=17795,
             external_id='1',
             occurred_at=now,
-            amount=400,
         )
         UmagSaleItem.objects.create(
             sale=sale,
@@ -690,9 +868,60 @@ class PlanningApiTests(APITestCase):
             measure='0',
         )
 
+        rebuild_store(self.user.organization, 17795)
+
         response = self.client.get('/api/purchases/products/')
 
         self.assertEqual(response.data['items'][0]['measure'], 'шт')
+
+    def test_product_detail_returns_history_and_forecast(self):
+        """Карточка товара — дневные продажи и прогноз на горизонт."""
+
+        self.install()
+        now = timezone.now()
+
+        for offset in range(21):
+            sale = UmagSale.objects.create(
+                organization=self.user.organization,
+                store_id=17795,
+                external_id=str(offset),
+                occurred_at=now - timedelta(days=21 - offset),
+            )
+            UmagSaleItem.objects.create(
+                sale=sale,
+                position=1,
+                barcode='2110000003685',
+                name='Яйцо каратал',
+                measure='шт',
+                quantity=10 + (offset % 3),
+            )
+
+        rebuild_store(self.user.organization, 17795)
+
+        response = self.client.get(
+            '/api/purchases/products/2110000003685/',
+            {'horizon': 7, 'history_days': 14},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['barcode'], '2110000003685')
+        self.assertEqual(response.data['name'], 'Яйцо каратал')
+        self.assertEqual(response.data['horizon'], 7)
+        self.assertLessEqual(len(response.data['history']), 14)
+        self.assertIsNotNone(response.data['forecast'])
+        self.assertEqual(len(response.data['forecast']['series']), 7)
+        self.assertGreater(Decimal(response.data['forecast']['quantity']), 0)
+        self.assertGreater(
+            max(Decimal(row['sold']) for row in response.data['history']),
+            0,
+        )
+
+    def test_product_detail_missing_is_404(self):
+        self.install()
+
+        response = self.client.get('/api/purchases/products/missing/')
+
+        self.assertEqual(response.status_code, 404)
 
     def test_products_sync_loads_umag_sales(self):
         self.install()

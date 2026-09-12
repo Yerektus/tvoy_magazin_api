@@ -12,12 +12,12 @@
 """
 
 import base64
+import http.client
 import json
 import logging
+import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 
 from django.conf import settings
 
@@ -26,6 +26,18 @@ logger = logging.getLogger(__name__)
 # Закрытый API иногда закрывает чтение по таймауту. GET безопасно повторить:
 # он не создаёт приёмки, товары или контрагентов.
 GET_RETRY_DELAYS = (1, 3)
+
+# Одно HTTPS-соединение на поток: выгрузка чеков — тысячи GET, и TLS на каждый
+# из них дороже самого ответа. Сломанное keep-alive просто открываем заново.
+_local = threading.local()
+_DEAD_CONNECTION = (
+    http.client.RemoteDisconnected,
+    http.client.CannotSendRequest,
+    http.client.ResponseNotReady,
+    http.client.IncompleteRead,
+    ConnectionResetError,
+    BrokenPipeError,
+)
 
 
 class UmagError(Exception):
@@ -180,6 +192,7 @@ def _request(
         'Accept': 'application/json',
         'api-ver': settings.UMAG_API_VERSION,
         'client-ver': settings.UMAG_CLIENT_VERSION,
+        'Connection': 'keep-alive',
     }
 
     if auth:
@@ -200,23 +213,88 @@ def _request(
         data = json.dumps(payload).encode()
         headers['Content-Type'] = 'application/json'
 
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    parsed = urllib.parse.urlsplit(url)
+    target = parsed.path + (f'?{parsed.query}' if parsed.query else '')
 
     try:
-        with urllib.request.urlopen(request, timeout=settings.UMAG_TIMEOUT) as response:
-            return _parse(response.read())
-    except urllib.error.HTTPError as error:
-        detail = _detail(error.read())
-        logger.warning('UMAG %s %s → %s: %s', method, path, error.code, detail[:200])
-
-        if error.code in (401, 403):
-            raise UmagAuthError(detail or 'UMAG не принял токен', error.code) from error
-
-        raise UmagError(detail or f'UMAG ответил {error.code}', error.code) from error
-    except urllib.error.URLError as error:
-        raise UmagError(f'UMAG недоступен: {error.reason}') from error
+        status, raw = _send(parsed, method, target, headers, data)
     except TimeoutError as error:
+        _drop_connection()
         raise UmagError('UMAG не ответил вовремя') from error
+    except OSError as error:
+        _drop_connection()
+        raise UmagError(f'UMAG недоступен: {error}') from error
+
+    if status >= 400:
+        detail = _detail(raw)
+        logger.warning('UMAG %s %s → %s: %s', method, path, status, detail[:200])
+
+        if status in (401, 403):
+            raise UmagAuthError(detail or 'UMAG не принял токен', status)
+
+        raise UmagError(detail or f'UMAG ответил {status}', status)
+
+    return _parse(raw)
+
+
+def _send(parsed, method: str, target: str, headers: dict, data: bytes | None):
+    """Отправляет запрос по keep-alive. Мёртвое соединение открываем ещё раз."""
+
+    try:
+        return _exchange(parsed, method, target, headers, data)
+    except _DEAD_CONNECTION:
+        _drop_connection()
+        # Повтор POST мог бы создать вторую приёмку. GET безопасно повторить.
+        if method != 'GET':
+            raise
+        return _exchange(parsed, method, target, headers, data)
+
+
+def _exchange(parsed, method: str, target: str, headers: dict, data: bytes | None):
+    conn = _connection(parsed)
+    conn.request(method, target, body=data, headers=headers)
+    response = conn.getresponse()
+    raw = response.read()
+
+    if response.will_close:
+        _drop_connection()
+
+    return response.status, raw
+
+
+def _connection(parsed):
+    key = (parsed.scheme, parsed.hostname, parsed.port)
+    slot = getattr(_local, 'slot', None)
+
+    if slot is not None and slot[0] == key:
+        return slot[1]
+
+    _drop_connection()
+    timeout = settings.UMAG_TIMEOUT
+    host = parsed.hostname or ''
+    port = parsed.port
+
+    if parsed.scheme == 'https':
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+
+    _local.slot = (key, conn)
+    return conn
+
+
+def _drop_connection() -> None:
+    slot = getattr(_local, 'slot', None)
+
+    if slot is None:
+        return
+
+    try:
+        slot[1].close()
+    except Exception:  # noqa: BLE001 — закрыть мёртвый сокет важнее причины
+        pass
+
+    _local.slot = None
 
 
 def _parse(raw: bytes):
