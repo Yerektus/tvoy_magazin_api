@@ -13,4 +13,5 @@ dependencies = [
     "pillow>=12.3.0",
     "pillow-heif>=1.5.0",
     "psycopg[binary]>=3.3.4",
+    "statsforecast>=2.1.1",
 ]

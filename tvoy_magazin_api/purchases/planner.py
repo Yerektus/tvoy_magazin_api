@@ -2,8 +2,9 @@
 
 Отчёт `report/list-product-report` отдаёт актуальный остаток и закупочную цену.
 Спрос берём из локальной копии: чеки сворачиваются в дневной ряд, по нему
-видно тренд, неделю, годовой сезон и прошлые праздники. Выгрузку заранее
-делает вкладка «Товары»; если её ещё нет, первый расчёт догрузит историю сам.
+StatsForecast видит тренд, неделю, годовой сезон и прошлые праздники. Выгрузку
+заранее делает вкладка «Товары»; если её ещё нет, первый расчёт догрузит
+историю сам.
 """
 
 import logging
@@ -11,16 +12,17 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation, ROUND_UP
 
+from django.db.models import Q
 from django.utils import timezone
 
 from umag import matching, sales as umag_sales
 from umag.client import UmagClient, UmagError
-from umag.models import UmagAccount
+from umag.models import UmagAccount, UmagDailyDemand, UmagProduct
 
 from . import forecast as demand_forecast
 from . import perishability
 from . import products as store_products
-from .models import PurchasePlan, PurchasePlanItem
+from .models import ApprovedPurchaseItem, PurchasePlan, PurchasePlanItem
 
 logger = logging.getLogger(__name__)
 
@@ -80,22 +82,34 @@ def build(plan) -> None:
 
     _still_building(plan)
 
-    # Прогнозируем всю сохранённую номенклатуру, а не только товары с продажей
-    # в выбранном коротком периоде: так в план возвращаются сезонные позиции.
+    prepared = [dict(row) for row in rows]
+    present = {str(row.get('barcode') or '') for row in prepared if row.get('barcode')}
+    seasonal = _seasonal(plan, present)
+
+    # Считаем только тех, кто в отчёте. Сезонные без текущих продаж берём
+    # из того же календаря прошлых лет — иначе модель видит нули и выкидывает.
     predictions = demand_forecast.for_products(
         plan.user.organization,
         plan.store_id,
-        None,
+        present,
         plan.horizon,
+        models=demand_forecast.PLAN_MODELS,
+        max_days=demand_forecast.PLAN_FIT_DAYS,
     )
-    prepared = [dict(row) for row in rows]
-    present = {str(row.get('barcode') or '') for row in prepared}
+    predictions.update(
+        demand_forecast.for_same_season(
+            plan.user.organization,
+            plan.store_id,
+            seasonal,
+            plan.horizon,
+        )
+    )
     missing = [
         barcode
         for barcode, prediction in predictions.items()
         if barcode not in present and prediction.quantity + prediction.safety_stock > 0
     ]
-    prepared.extend(_live_rows(client, missing))
+    prepared.extend(_catalog_rows(plan.store_id, missing))
     restrictions = perishability.for_rows(plan.store_id, prepared)
 
     needed = [
@@ -116,7 +130,11 @@ def build(plan) -> None:
     # Закупаются поставщиками, а не построчно, поэтому у каждой строки должен
     # быть свой. Не получилось — план всё равно нужен, просто без группировки.
     _still_building(plan)
-    known = suppliers(client, plan.days)
+    barcodes = {line['barcode'] for line in needed if line['barcode']}
+    known = _remembered_suppliers(plan.store_id, barcodes)
+    leftover = barcodes - known.keys()
+    if leftover:
+        known.update(suppliers(client, plan.days, barcodes=leftover))
     _still_building(plan)
 
     for line in needed:
@@ -138,42 +156,100 @@ def build(plan) -> None:
     )
 
 
-def _live_rows(client, barcodes: list[str]) -> list[dict]:
-    """Актуальные остатки сезонных товаров, которых нет в коротком отчёте."""
+def _catalog_rows(store_id: int | None, barcodes: list[str]) -> list[dict]:
+    """Сезонный товар, которого нет в коротком отчёте: имя из номенклатуры.
 
-    if not barcodes:
+    В UMAG за каждым штрихкодом не ходим: это тысячи запросов. Нет в отчёте —
+    продаж за период не было, остаток считаем нулём и заказываем под прогноз.
+    """
+
+    if not store_id or not barcodes:
         return []
 
-    with ThreadPoolExecutor(max_workers=SUPPLIER_THREADS) as pool:
-        rows = pool.map(lambda barcode: _live_row(client, barcode), barcodes)
+    wanted = set(barcodes)
+    products = UmagProduct.objects.filter(store_id=store_id, barcode__in=wanted)
 
-    return [row for row in rows if row is not None]
+    return [
+        {
+            'barcode': product.barcode,
+            'productName': product.name,
+            'measure': matching.unit_for(product.measure),
+            'saleQuantity': 0,
+            'refundQuantity': 0,
+            'stockQuantity': 0,
+        }
+        for product in products
+        if product.barcode in wanted
+    ]
 
 
-def _live_row(client, barcode: str) -> dict | None:
-    try:
-        found = client.get('nom/product/findProductByBarcode', barcode=barcode)
-    except UmagError as error:
-        # Карточку могли удалить после прошлогоднего сезона. Основной план из-за
-        # одной такой позиции не теряем.
-        logger.warning('UMAG не отдал сезонный товар %s: %s', barcode, error)
-        return None
+def _seasonal(plan, present: set[str]) -> set[str]:
+    """Штрихкоды, которые в это же время продавались в прошлые годы."""
 
-    if not isinstance(found, dict):
-        return None
+    organization = plan.user.organization
 
-    card = found.get('product') or {}
-    prices = found.get('productStorePrice') or {}
+    if organization is None or not plan.store_id:
+        return set()
 
-    return {
-        'barcode': barcode,
-        'productName': (card.get('name') or '').strip(),
-        'measure': matching.unit_for(card.get('measure')),
-        'saleQuantity': 0,
-        'refundQuantity': 0,
-        'stockQuantity': found.get('stockQuantity'),
-        '_price': prices.get('arrivalCost'),
-    }
+    as_of = timezone.localdate()
+    windows = Q()
+
+    for years in (1, 2):
+        start = demand_forecast.shift_years(as_of, years) - timedelta(days=7)
+        end = demand_forecast.shift_years(as_of, years) + timedelta(days=plan.horizon + 7)
+        windows |= Q(day__gte=start, day__lte=end)
+
+    found = set(
+        UmagDailyDemand.objects.filter(
+            organization=organization,
+            store_id=plan.store_id,
+        )
+        .filter(windows)
+        .exclude(barcode='')
+        .values_list('barcode', flat=True)
+        .distinct()
+    )
+    return found - present
+
+
+def _remembered_suppliers(store_id: int | None, barcodes: set[str]) -> dict[str, str]:
+    """Поставщик с прошлого плана или одобренного закупа — без похода в UMAG."""
+
+    if not store_id or not barcodes:
+        return {}
+
+    found: dict[str, str] = {}
+    planned = (
+        PurchasePlanItem.objects.filter(
+            plan__store_id=store_id,
+            plan__status=PurchasePlan.Status.READY,
+            barcode__in=barcodes,
+        )
+        .exclude(supplier='')
+        .order_by('-plan__built_at', '-id')
+        .values_list('barcode', 'supplier')
+    )
+
+    for barcode, supplier in planned:
+        found.setdefault(barcode, supplier)
+
+    missing = barcodes - found.keys()
+
+    if missing:
+        bought = (
+            ApprovedPurchaseItem.objects.filter(
+                purchase__store_id=store_id,
+                barcode__in=missing,
+            )
+            .exclude(purchase__supplier='')
+            .order_by('-purchase__approved_at', '-id')
+            .values_list('barcode', 'purchase__supplier')
+        )
+
+        for barcode, supplier in bought:
+            found.setdefault(barcode, supplier)
+
+    return found
 
 
 def _still_building(plan) -> None:
@@ -221,12 +297,17 @@ def report(client, days: int, max_rows: int | None = MAX_ROWS, **filters) -> lis
     return rows if max_rows is None else rows[:max_rows]
 
 
-def suppliers(client, days: int) -> dict[str, str]:
+def suppliers(client, days: int, barcodes: set[str] | None = None) -> dict[str, str]:
     """Штрихкод → поставщик, у которого этот товар берут.
 
     В товарном отчёте поставщика нет, зато он принимает `supplierId` — так и
     собираем карту: спрашиваем отчёт по каждому поставщику с продажами.
     """
+
+    wanted = {barcode for barcode in barcodes if barcode} if barcodes is not None else None
+
+    if wanted is not None and not wanted:
+        return {}
 
     try:
         selling = _selling(client, days)
@@ -243,15 +324,25 @@ def suppliers(client, days: int) -> dict[str, str]:
     found: dict[str, tuple[Decimal, str]] = {}
 
     with ThreadPoolExecutor(max_workers=SUPPLIER_THREADS) as pool:
-        for agent, rows in zip(agents, pool.map(lambda item: _of(client, item, days), agents)):
-            for row in rows:
-                barcode = str(row.get('barcode') or '')
-                quantity = _decimal(row.get('saleQuantity'))
+        remaining = list(agents)
 
-                if barcode and quantity > found.get(barcode, (ZERO, ''))[0]:
-                    found[barcode] = (quantity, _name(agent))
+        while remaining and (wanted is None or not wanted.issubset(found)):
+            batch = remaining[:SUPPLIER_THREADS]
+            remaining = remaining[SUPPLIER_THREADS:]
+            reports = list(pool.map(lambda item: _of(client, item, days), batch))
 
-    return {barcode: name for barcode, (_, name) in found.items()}
+            for agent, rows in zip(batch, reports):
+                for row in rows:
+                    barcode = str(row.get('barcode') or '')
+                    quantity = _decimal(row.get('saleQuantity'))
+
+                    if barcode and quantity > found.get(barcode, (ZERO, ''))[0]:
+                        found[barcode] = (quantity, _name(agent))
+
+    if wanted is None:
+        return {barcode: name for barcode, (_, name) in found.items()}
+
+    return {barcode: found[barcode][1] for barcode in wanted if barcode in found}
 
 
 def _of(client, agent: dict, days: int) -> list[dict]:

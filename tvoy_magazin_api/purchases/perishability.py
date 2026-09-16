@@ -92,11 +92,10 @@ RULES = (
 
 
 def for_rows(store_id: int, rows: list[dict]) -> dict[str, Restriction]:
-    barcodes = {str(row.get('barcode') or '') for row in rows}
+    barcodes = {str(row.get('barcode') or '') for row in rows if row.get('barcode')}
     products = {
         product.barcode: product
-        for product in UmagProduct.objects.filter(store_id=store_id)
-        if product.barcode in barcodes
+        for product in UmagProduct.objects.filter(store_id=store_id, barcode__in=barcodes)
     }
     result = {}
 

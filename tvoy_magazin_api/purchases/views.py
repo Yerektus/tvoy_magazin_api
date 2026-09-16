@@ -148,6 +148,8 @@ class StoreProductDetailView(APIView):
             barcode,
             horizon=query.validated_data['horizon'],
             history_days=query.validated_data['history_days'],
+            model=query.validated_data.get('model') or None,
+            forecast=query.validated_data['forecast'],
         )
 
         if detail is None:
@@ -255,7 +257,9 @@ class PurchasePlanView(APIView):
     def get(self, request):
         account = _account(request.user)
         plan = (
-            PurchasePlan.objects.filter(user=request.user, store_id=account.store_id).first()
+            PurchasePlan.objects.filter(user=request.user, store_id=account.store_id)
+            .prefetch_related('items')
+            .first()
             if account
             else None
         )
@@ -459,11 +463,15 @@ def _owned_plan(request, pk) -> PurchasePlan | None:
     if account is None or not account.store_id:
         return None
 
-    return PurchasePlan.objects.filter(
-        pk=pk,
-        user=request.user,
-        store_id=account.store_id,
-    ).first()
+    return (
+        PurchasePlan.objects.filter(
+            pk=pk,
+            user=request.user,
+            store_id=account.store_id,
+        )
+        .prefetch_related('items')
+        .first()
+    )
 
 
 def _refresh_plan(plan: PurchasePlan) -> None:

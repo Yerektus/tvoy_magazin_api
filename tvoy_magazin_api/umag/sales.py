@@ -9,10 +9,12 @@
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Callable
+from zoneinfo import ZoneInfo
 
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -120,7 +122,7 @@ def sync(
         store_id=account.store_id,
     )
     until = timezone.now()
-    since = _history_from(full, state.synced_until, until)
+    since = _day_start(_history_from(full, state.synced_until, until))
 
     state.status = UmagSalesSync.Status.SYNCING
     state.error = ''
@@ -128,7 +130,7 @@ def sync(
     state.save(update_fields=('status', 'error', 'heartbeat_at'))
 
     client = UmagClient(account, account.store_id)
-    keep_after = until - OVERLAP
+    keep_after = _day_start(until - OVERLAP)
     sales_count = 0
     refunds_count = 0
 
@@ -187,6 +189,21 @@ def sync(
 
 def _touch(state_id: int) -> None:
     UmagSalesSync.objects.filter(pk=state_id).update(heartbeat_at=timezone.now())
+
+
+def _day_start(moment: datetime) -> datetime:
+    """Полночь местного дня — окна выгрузки не должны резать сутки пополам.
+
+    Агрегат пересчитывается целыми днями: окно с середины дня удаляло весь
+    первый день, а чеков для него привозило только хвост. Так каждые 31 день
+    (граница окна) и каждый первый день перекрытия занижались до пары часов
+    продаж вместо полных суток.
+    """
+
+    tz = ZoneInfo(settings.TIME_ZONE)
+    if timezone.is_naive(moment):
+        moment = timezone.make_aware(moment)
+    return datetime.combine(moment.astimezone(tz).date(), time.min, tzinfo=tz)
 
 
 def _history_from(full: bool, synced_until: datetime | None, until: datetime) -> datetime:

@@ -7,7 +7,7 @@
 from datetime import timedelta
 from math import ceil
 
-from django.db.models import Max, Min, Q
+from django.db.models import Max, Min
 from django.db.models.functions import Lower
 from django.utils import timezone
 
@@ -24,6 +24,7 @@ DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 100
 SORT_FIELDS = {
     'name': 'name',
+    'barcode': 'barcode',
     'sold': 'sold',
     'last': 'last_sold',
 }
@@ -36,6 +37,7 @@ def snapshot(
     account,
     *,
     q: str = '',
+    barcode: str = '',
     page: int = 1,
     page_size: int = DEFAULT_PAGE_SIZE,
     sort: str = 'sold',
@@ -64,6 +66,7 @@ def snapshot(
         organization,
         store_id,
         q=q,
+        barcode=barcode,
         page=page,
         page_size=page_size,
         sort=sort,
@@ -152,6 +155,7 @@ def catalog(
     store_id: int,
     *,
     q: str = '',
+    barcode: str = '',
     page: int = 1,
     page_size: int = DEFAULT_PAGE_SIZE,
     sort: str = 'sold',
@@ -165,9 +169,13 @@ def catalog(
 
     rows = _grouped(organization, store_id)
     needle = q.strip()
+    code = barcode.strip()
 
     if needle:
-        rows = rows.filter(Q(name__icontains=needle) | Q(barcode__icontains=needle))
+        rows = rows.filter(name__icontains=needle)
+
+    if code:
+        rows = rows.filter(barcode__icontains=code)
 
     if last_from:
         rows = rows.filter(last_sold__date__gte=last_from)
@@ -231,6 +239,8 @@ def detail(
     *,
     horizon: int = DEFAULT_HORIZON,
     history_days: int = DEFAULT_HISTORY_DAYS,
+    model: str | None = None,
+    forecast: bool = True,
 ) -> dict | None:
     """Карточка товара: продажи, дневной ряд и прогноз на горизонт."""
 
@@ -252,7 +262,11 @@ def detail(
         barcode,
         horizon,
         history_days=history_days,
+        model=model,
+        forecast=forecast,
     )
+
+    item['supplier'] = _supplier(store_id, barcode)
 
     if outlook is None:
         return {
@@ -264,6 +278,15 @@ def detail(
         }
 
     prediction = outlook['forecast']
+
+    if prediction is None:
+        return {
+            **item,
+            'horizon': horizon,
+            'history_days': history_days,
+            'history': outlook['history'],
+            'forecast': None,
+        }
 
     return {
         **item,
@@ -281,6 +304,40 @@ def detail(
             'series': outlook['series'],
         },
     }
+
+
+def _supplier(store_id: int, barcode: str) -> str:
+    """У кого этот товар берут — из последней готовой планировки или закупа."""
+
+    from .models import ApprovedPurchaseItem, PurchasePlan, PurchasePlanItem
+
+    planned = (
+        PurchasePlanItem.objects.filter(
+            plan__store_id=store_id,
+            plan__status=PurchasePlan.Status.READY,
+            barcode=barcode,
+        )
+        .exclude(supplier='')
+        .order_by('-plan__built_at', '-id')
+        .values_list('supplier', flat=True)
+        .first()
+    )
+
+    if planned:
+        return planned
+
+    bought = (
+        ApprovedPurchaseItem.objects.filter(
+            purchase__store_id=store_id,
+            barcode=barcode,
+        )
+        .exclude(purchase__supplier='')
+        .order_by('-purchase__approved_at', '-id')
+        .values_list('purchase__supplier', flat=True)
+        .first()
+    )
+
+    return bought or ''
 
 
 def _empty() -> dict:

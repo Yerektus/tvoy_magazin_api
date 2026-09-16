@@ -1,5 +1,6 @@
 from rest_framework import serializers
 
+from .forecast import MODELS
 from .models import ApprovedPurchase, ApprovedPurchaseItem, PurchasePlan, PurchasePlanItem
 
 # Дольше двух месяцев считать бессмысленно: ассортимент за это время меняется.
@@ -95,6 +96,7 @@ class ProductsQuerySerializer(serializers.Serializer):
     """Страница списка товаров: поиск, сортировка и номер страницы."""
 
     q = serializers.CharField(required=False, allow_blank=True, default='')
+    barcode = serializers.CharField(required=False, allow_blank=True, default='')
     page = serializers.IntegerField(min_value=1, required=False, default=1)
     page_size = serializers.IntegerField(
         min_value=1,
@@ -103,7 +105,7 @@ class ProductsQuerySerializer(serializers.Serializer):
         default=50,
     )
     sort = serializers.ChoiceField(
-        choices=('name', 'sold', 'last'),
+        choices=('name', 'barcode', 'sold', 'last'),
         required=False,
         default='sold',
     )
@@ -171,6 +173,7 @@ class StoreProductDetailSerializer(serializers.Serializer):
     barcode = serializers.CharField()
     name = serializers.CharField()
     measure = serializers.CharField(allow_blank=True)
+    supplier = serializers.CharField(allow_blank=True)
     sold = serializers.DecimalField(max_digits=14, decimal_places=3)
     last_sold = serializers.DateTimeField(allow_null=True)
     horizon = serializers.IntegerField()
@@ -194,6 +197,13 @@ class ProductDetailQuerySerializer(serializers.Serializer):
         required=False,
         default=60,
     )
+    model = serializers.ChoiceField(
+        choices=['', *MODELS],
+        required=False,
+        allow_blank=True,
+        default='',
+    )
+    forecast = serializers.BooleanField(required=False, default=True)
 
 
 class PurchasePlanRequestSerializer(serializers.Serializer):

@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -21,8 +21,8 @@ from umag.models import (
 )
 from umag.test_sales import SalesApi
 
-from . import planner
-from .models import PurchasePlan
+from . import forecast, planner
+from .models import PurchasePlan, PurchasePlanItem
 
 User = get_user_model()
 
@@ -145,6 +145,9 @@ class PlannerMathTests(SimpleTestCase):
 
         # Чуть больше одной штуки в день — заказываем две, а не 1.03.
         self.assertEqual(line['suggested'], Decimal('2'))
+
+    def test_leap_day_shifts_to_february_28(self):
+        self.assertEqual(forecast.shift_years(date(2024, 2, 29), 1), date(2023, 2, 28))
 
 
 @override_settings(INVOICE_PARSE_INLINE=True)
@@ -335,10 +338,7 @@ class PlanningApiTests(APITestCase):
             )
 
         item = response.data['items'][0]
-        self.assertIn(
-            item['forecast_model'],
-            {'average', 'weighted_average', 'holt', 'holt_winters_weekly'},
-        )
+        self.assertIn(item['forecast_model'], forecast.MODELS)
         self.assertGreater(Decimal(item['forecast_quantity']), Decimal('50'))
         self.assertGreater(Decimal(item['suggested']), Decimal('40'))
         self.assertIn('holiday_factor', item)
@@ -383,6 +383,85 @@ class PlanningApiTests(APITestCase):
 
         self.assertEqual(response.data['status'], PurchasePlan.Status.READY)
         self.assertEqual(response.data['items'][0]['supplier'], '')
+
+    def test_plan_reuses_supplier_from_the_last_count(self):
+        """Второй расчёт не ходит в UMAG за поставщиками, если они уже известны."""
+
+        self.install()
+        pepsi = product()
+        fake = FakeReport([pepsi], by_supplier={7: [pepsi]})
+
+        with patch('umag.client._request', new=fake):
+            self.client.post('/api/purchases/plan/', {}, format='json')
+
+        again = FakeReport([pepsi])
+
+        with patch('umag.client._request', new=again):
+            response = self.client.post('/api/purchases/plan/', {}, format='json')
+
+        self.assertEqual(response.data['items'][0]['supplier'], 'Поставщик 7')
+        self.assertNotIn(planner.SUPPLIER_REPORT, again.calls)
+        self.assertNotIn(planner.AGENTS, again.calls)
+
+    def test_plan_does_not_lookup_seasonal_products_in_umag(self):
+        """Прошлогодний товар берём из номенклатуры, а не по одному из кабинета."""
+
+        self.install()
+        UmagSalesSync.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            status=UmagSalesSync.Status.READY,
+            history_from=timezone.now() - timedelta(days=400),
+            synced_until=timezone.now(),
+            synced_at=timezone.now(),
+        )
+        UmagProduct.objects.create(
+            store_id=17795,
+            barcode='999',
+            name='Ёлка',
+            measure='шт',
+        )
+        last_year = forecast.shift_years(timezone.localdate(), 1)
+        sales = UmagSale.objects.bulk_create(
+            [
+                UmagSale(
+                    organization=self.user.organization,
+                    store_id=17795,
+                    external_id=f'tree-{index}',
+                    occurred_at=timezone.make_aware(
+                        datetime.combine(last_year + timedelta(days=index), time(12, 0))
+                    ),
+                )
+                for index in range(14)
+            ]
+        )
+        UmagSaleItem.objects.bulk_create(
+            [
+                UmagSaleItem(
+                    sale=sale,
+                    position=1,
+                    barcode='999',
+                    name='Ёлка',
+                    measure='шт',
+                    quantity=20,
+                )
+                for sale in sales
+            ]
+        )
+        rebuild_store(self.user.organization, 17795)
+
+        fake = FakeReport([product()])
+
+        with patch('umag.client._request', new=fake):
+            response = self.client.post(
+                '/api/purchases/plan/',
+                {'days': 30, 'horizon': 14},
+                format='json',
+            )
+
+        self.assertNotIn('nom/product/findProductByBarcode', fake.calls)
+        names = {item['name'] for item in response.data['items']}
+        self.assertIn('Ёлка', names)
 
     def test_plan_reports_broken_umag(self):
         self.install()
@@ -822,7 +901,20 @@ class PlanningApiTests(APITestCase):
             ['Айран', 'Молоко', 'Хлеб'],
         )
 
-        found = self.client.get('/api/purchases/products/', {'q': '222'})
+        codes = self.client.get(
+            '/api/purchases/products/',
+            {'sort': 'barcode', 'order': 'asc'},
+        )
+        self.assertEqual(
+            [item['barcode'] for item in codes.data['items']],
+            ['111', '222', '333'],
+        )
+
+        found = self.client.get('/api/purchases/products/', {'q': 'Молоко'})
+        self.assertEqual(found.data['items_total'], 1)
+        self.assertEqual(found.data['items'][0]['name'], 'Молоко')
+
+        found = self.client.get('/api/purchases/products/', {'barcode': '222'})
         self.assertEqual(found.data['items_total'], 1)
         self.assertEqual(found.data['items'][0]['name'], 'Молоко')
 
@@ -916,12 +1008,74 @@ class PlanningApiTests(APITestCase):
             0,
         )
 
+        chosen = self.client.get(
+            '/api/purchases/products/2110000003685/',
+            {'horizon': 7, 'history_days': 14, 'model': 'average'},
+        )
+
+        self.assertEqual(chosen.status_code, 200)
+        self.assertEqual(chosen.data['forecast']['model'], 'average')
+
+        sales = self.client.get(
+            '/api/purchases/products/2110000003685/',
+            {'history_days': 14, 'forecast': False},
+        )
+
+        self.assertEqual(sales.status_code, 200)
+        self.assertIsNone(sales.data['forecast'])
+        self.assertGreater(len(sales.data['history']), 0)
+
     def test_product_detail_missing_is_404(self):
         self.install()
 
         response = self.client.get('/api/purchases/products/missing/')
 
         self.assertEqual(response.status_code, 404)
+
+    def test_product_detail_includes_supplier_from_plan(self):
+        """Поставщика берём из последней готовой планировки этого магазина."""
+
+        self.install()
+        now = timezone.now()
+        sale = UmagSale.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            external_id='1',
+            occurred_at=now,
+        )
+        UmagSaleItem.objects.create(
+            sale=sale,
+            position=1,
+            barcode='2110000003685',
+            name='Яйцо каратал',
+            measure='шт',
+            quantity=10,
+        )
+        rebuild_store(self.user.organization, 17795)
+
+        plan = PurchasePlan.objects.create(
+            user=self.user,
+            store_id=17795,
+            status=PurchasePlan.Status.READY,
+            built_at=now,
+        )
+        PurchasePlanItem.objects.create(
+            plan=plan,
+            position=1,
+            barcode='2110000003685',
+            name='Яйцо каратал',
+            supplier='Поставщик 7',
+            sold=10,
+            stock=0,
+            per_day=1,
+            suggested=14,
+        )
+
+        response = self.client.get('/api/purchases/products/2110000003685/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['barcode'], '2110000003685')
+        self.assertEqual(response.data['supplier'], 'Поставщик 7')
 
     def test_products_sync_loads_umag_sales(self):
         self.install()
