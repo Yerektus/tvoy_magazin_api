@@ -7,12 +7,14 @@ from .views import (
     PurchasePlanDetailView,
     PurchasePlanListView,
     PurchasePlanView,
+    SalesAnalyticsView,
     StoreProductDetailView,
     StoreProductsView,
 )
 
 urlpatterns = [
     path('access/', PlanningAccessView.as_view(), name='planning-access'),
+    path('analytics/', SalesAnalyticsView.as_view(), name='purchase-analytics'),
     path('products/', StoreProductsView.as_view(), name='purchase-products'),
     path(
         'products/<str:barcode>/',

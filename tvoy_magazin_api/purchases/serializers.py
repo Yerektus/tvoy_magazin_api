@@ -182,6 +182,54 @@ class StoreProductDetailSerializer(serializers.Serializer):
     forecast = ProductForecastSerializer(allow_null=True)
 
 
+class AnalyticsQuerySerializer(serializers.Serializer):
+    """Длина окна сводки: как у карточки товара, не длиннее двух месяцев."""
+
+    days = serializers.IntegerField(
+        min_value=7,
+        max_value=MAX_DAYS,
+        required=False,
+        default=30,
+    )
+
+
+class AnalyticsDaySerializer(serializers.Serializer):
+    date = serializers.DateField()
+    sold = serializers.DecimalField(max_digits=14, decimal_places=3)
+
+
+class AnalyticsWeekdaySerializer(serializers.Serializer):
+    weekday = serializers.IntegerField()
+    sold = serializers.DecimalField(max_digits=14, decimal_places=3)
+
+
+class AnalyticsCategorySerializer(serializers.Serializer):
+    name = serializers.CharField()
+    sold = serializers.DecimalField(max_digits=14, decimal_places=3)
+    sku_count = serializers.IntegerField()
+
+
+class SalesAnalyticsSerializer(serializers.Serializer):
+    """Сводка продаж магазина: итоги периода, график и категории."""
+
+    status = serializers.CharField()
+    synced_at = serializers.DateTimeField(allow_null=True)
+    history_from = serializers.DateTimeField(allow_null=True)
+    error = serializers.CharField(allow_blank=True)
+    has_sales = serializers.BooleanField()
+    days = serializers.IntegerField()
+    start = serializers.DateField()
+    end = serializers.DateField()
+    sold = serializers.DecimalField(max_digits=14, decimal_places=3)
+    sku_count = serializers.IntegerField()
+    active_days = serializers.IntegerField()
+    promo_share = serializers.DecimalField(max_digits=8, decimal_places=3, allow_null=True)
+    trend = serializers.DecimalField(max_digits=8, decimal_places=3, allow_null=True)
+    history = AnalyticsDaySerializer(many=True)
+    weekdays = AnalyticsWeekdaySerializer(many=True)
+    categories = AnalyticsCategorySerializer(many=True)
+
+
 class ProductDetailQuerySerializer(serializers.Serializer):
     """Параметры карточки: горизонт прогноза и длина истории на графике."""
 

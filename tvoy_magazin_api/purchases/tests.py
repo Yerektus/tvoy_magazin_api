@@ -1111,3 +1111,86 @@ class PlanningApiTests(APITestCase):
 
         self.assertEqual(response.data['status'], PurchasePlan.Status.READY)
         sync.assert_not_called()
+
+    def test_sales_analytics_summarizes_the_period(self):
+        """Сводка за окно: товары, скидки, топ, категории и сравнение с прошлым."""
+
+        self.install()
+        organization = self.user.organization
+
+        def sell(barcode, name, quantity, days_ago, *, promo=False):
+            sale = UmagSale.objects.create(
+                organization=organization,
+                store_id=17795,
+                external_id=f'{barcode}-{days_ago}',
+                occurred_at=_noon(days_ago),
+            )
+            UmagSaleItem.objects.create(
+                sale=sale,
+                position=1,
+                barcode=barcode,
+                name=name,
+                measure='шт',
+                quantity=quantity,
+                on_promo=promo,
+            )
+
+        sell('111', 'Молоко', 10, 1)
+        sell('111', 'Молоко', 5, 2, promo=True)
+        sell('222', 'Хлеб', 2, 1)
+        sell('111', 'Молоко', 20, 10)
+
+        UmagProduct.objects.create(
+            store_id=17795,
+            barcode='111',
+            name='Молоко',
+            measure='шт',
+            category='Молочные',
+        )
+        UmagProduct.objects.create(
+            store_id=17795,
+            barcode='222',
+            name='Хлеб',
+            measure='шт',
+            category='Выпечка',
+        )
+        rebuild_store(organization, 17795)
+
+        response = self.client.get('/api/purchases/analytics/', {'days': 7})
+        data = response.data
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(data['has_sales'])
+        self.assertEqual(data['days'], 7)
+        self.assertEqual(data['sku_count'], 2)
+        self.assertEqual(data['sold'], '17.000')
+        self.assertEqual(data['promo_share'], '0.294')
+        self.assertEqual(data['trend'], '-0.150')
+        self.assertEqual(len(data['history']), 7)
+        self.assertEqual(len(data['weekdays']), 7)
+        self.assertEqual(
+            {row['name']: row['sold'] for row in data['categories']},
+            {'Молочные': '15.000', 'Выпечка': '2.000'},
+        )
+
+        empty = self.client.get('/api/purchases/analytics/', {'days': 3})
+        self.assertEqual(empty.status_code, 400)
+
+    def test_sales_analytics_is_empty_without_store(self):
+        response = self.client.get('/api/purchases/analytics/')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data['has_sales'])
+        self.assertEqual(response.data['sku_count'], 0)
+        self.assertEqual(len(response.data['history']), 30)
+        self.assertEqual(len(response.data['weekdays']), 7)
+
+
+def _noon(days_ago: int):
+    """Полдень выбранного дня в Алматы — продажа точно попадает в нужную дату."""
+
+    from zoneinfo import ZoneInfo
+
+    day = timezone.localdate() - timedelta(days=days_ago)
+    return datetime.combine(day, time(12, 0), tzinfo=ZoneInfo('Asia/Almaty'))
+

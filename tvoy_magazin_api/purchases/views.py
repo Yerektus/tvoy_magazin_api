@@ -12,9 +12,10 @@ from accounts.permissions import ManagesOrganization, UsesPurchases
 from extensions.models import Extension, ExtensionInstall
 from umag.models import UmagAccount, UmagSalesSync
 
-from . import products, tasks
+from . import analytics, products, tasks
 from .models import ApprovedPurchase, ApprovedPurchaseItem, PurchasePlan
 from .serializers import (
+    AnalyticsQuerySerializer,
     ApproveSupplierSerializer,
     ApprovedPurchaseSerializer,
     ProductDetailQuerySerializer,
@@ -23,6 +24,7 @@ from .serializers import (
     PurchasePlanListSerializer,
     PurchasePlanRequestSerializer,
     PurchasePlanSerializer,
+    SalesAnalyticsSerializer,
     StoreProductDetailSerializer,
 )
 
@@ -156,6 +158,21 @@ class StoreProductDetailView(APIView):
             return Response({'detail': 'Товар не найден'}, status=status.HTTP_404_NOT_FOUND)
 
         return Response(StoreProductDetailSerializer(detail).data)
+
+
+class SalesAnalyticsView(APIView):
+    """GET /api/purchases/analytics/ — продажи выбранного магазина за период."""
+
+    permission_classes = [IsAuthenticated, UsesPurchases]
+
+    def get(self, request):
+        query = AnalyticsQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        return Response(
+            SalesAnalyticsSerializer(
+                analytics.snapshot(_account(request.user), days=query.validated_data['days'])
+            ).data
+        )
 
 
 class PurchasePlanListView(APIView):
