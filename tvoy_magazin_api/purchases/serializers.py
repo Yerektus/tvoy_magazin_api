@@ -90,6 +90,11 @@ class StoreProductSerializer(serializers.Serializer):
     measure = serializers.CharField(allow_blank=True)
     sold = serializers.DecimalField(max_digits=14, decimal_places=3)
     last_sold = serializers.DateTimeField(allow_null=True)
+    forecast_error = serializers.DecimalField(
+        max_digits=8,
+        decimal_places=3,
+        allow_null=True,
+    )
 
 
 class ProductsQuerySerializer(serializers.Serializer):
@@ -105,7 +110,7 @@ class ProductsQuerySerializer(serializers.Serializer):
         default=50,
     )
     sort = serializers.ChoiceField(
-        choices=('name', 'barcode', 'sold', 'last'),
+        choices=('name', 'barcode', 'sold', 'last', 'accuracy'),
         required=False,
         default='sold',
     )
@@ -131,6 +136,12 @@ class ProductsQuerySerializer(serializers.Serializer):
         required=False,
         allow_null=True,
         default=None,
+    )
+    accuracy = serializers.ChoiceField(
+        choices=('', 'high', 'medium', 'low', 'none'),
+        required=False,
+        allow_blank=True,
+        default='',
     )
 
 

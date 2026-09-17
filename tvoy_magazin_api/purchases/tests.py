@@ -850,6 +850,7 @@ class PlanningApiTests(APITestCase):
         self.assertEqual(item['name'], 'Молоко')
         self.assertEqual(item['measure'], 'шт')
         self.assertEqual(item['sold'], '2.000')
+        self.assertIn('forecast_error', item)
         self.assertEqual(response.data['items_total'], 1)
         self.assertEqual(response.data['page'], 1)
         self.assertEqual(response.data['page_size'], 50)

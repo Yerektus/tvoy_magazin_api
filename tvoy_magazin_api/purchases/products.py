@@ -5,6 +5,7 @@
 """
 
 from datetime import timedelta
+from decimal import Decimal
 from math import ceil
 
 from django.db.models import Max, Min
@@ -28,6 +29,15 @@ SORT_FIELDS = {
     'sold': 'sold',
     'last': 'last_sold',
 }
+# Как на карточке: ошибка до 25% — высокая, до 50% — средняя.
+GOOD_ERROR = Decimal('0.25')
+FAIR_ERROR = Decimal('0.5')
+ACCURACY_RANK = {
+    'high': 0,
+    'medium': 1,
+    'low': 2,
+    'none': 3,
+}
 # Поток выгрузки мог умереть, не сняв `syncing`. Месяц чеков качается
 # дольше трёх минут — смотрим и heartbeat, и последние записи в копию.
 STALE_AFTER = timedelta(minutes=10)
@@ -46,6 +56,7 @@ def snapshot(
     last_to=None,
     sold_from=None,
     sold_to=None,
+    accuracy: str = '',
 ) -> dict:
     """Страница товаров выбранного магазина и состояние выгрузки чеков."""
 
@@ -75,6 +86,7 @@ def snapshot(
         last_to=last_to,
         sold_from=sold_from,
         sold_to=sold_to,
+        accuracy=accuracy,
     )
 
     return {
@@ -164,12 +176,14 @@ def catalog(
     last_to=None,
     sold_from=None,
     sold_to=None,
+    accuracy: str = '',
 ) -> tuple[list[dict], int, int]:
     """Страница уникальных штрихкодов: сколько продали и когда в последний раз."""
 
     rows = _grouped(organization, store_id)
     needle = q.strip()
     code = barcode.strip()
+    accuracy = (accuracy or '').strip()
 
     if needle:
         rows = rows.filter(name__icontains=needle)
@@ -191,11 +205,45 @@ def catalog(
 
     field = SORT_FIELDS.get(sort, 'sold')
     descending = order != 'asc'
+    by_accuracy = sort == 'accuracy' or bool(accuracy)
+
     if field == 'name':
         key = Lower('name')
         rows = rows.order_by(key.desc() if descending else key, 'barcode')
-    else:
+    elif sort != 'accuracy':
         rows = rows.order_by(f'-{field}' if descending else field, 'barcode')
+    else:
+        rows = rows.order_by('barcode')
+
+    if by_accuracy:
+        listed = list(rows)
+        errors = _errors_for(organization, store_id, {row.barcode for row in listed})
+
+        if accuracy:
+            listed = [
+                row
+                for row in listed
+                if _accuracy_level(errors.get(row.barcode)) == accuracy
+            ]
+
+        if sort == 'accuracy':
+            listed.sort(
+                key=lambda row: (
+                    ACCURACY_RANK[_accuracy_level(errors.get(row.barcode))],
+                    row.barcode,
+                ),
+                reverse=descending,
+            )
+
+        total = len(listed)
+        page_size = min(max(page_size, 1), MAX_PAGE_SIZE)
+        pages = max(1, ceil(total / page_size)) if total else 1
+        page = min(max(page, 1), pages)
+        offset = (page - 1) * page_size
+        page_rows = listed[offset : offset + page_size]
+        page_errors = {row.barcode: errors.get(row.barcode) for row in page_rows}
+
+        return _as_items(store_id, page_rows, page_errors), total, page
 
     total = rows.count()
     page_size = min(max(page_size, 1), MAX_PAGE_SIZE)
@@ -203,8 +251,9 @@ def catalog(
     page = min(max(page, 1), pages)
     offset = (page - 1) * page_size
     page_rows = list(rows[offset : offset + page_size])
+    errors = _errors_for(organization, store_id, {row.barcode for row in page_rows})
 
-    return _as_items(store_id, page_rows), total, page
+    return _as_items(store_id, page_rows, errors), total, page
 
 
 def find_item(organization, store_id: int, barcode: str) -> dict | None:
@@ -362,7 +411,7 @@ def _grouped(organization, store_id: int):
     ).exclude(barcode='')
 
 
-def _as_items(store_id: int, rows: list) -> list[dict]:
+def _as_items(store_id: int, rows: list, errors: dict | None = None) -> list[dict]:
     units = {
         barcode: unit_for(measure)
         for barcode, measure in UmagProduct.objects.filter(
@@ -370,6 +419,7 @@ def _as_items(store_id: int, rows: list) -> list[dict]:
             barcode__in=[row.barcode for row in rows],
         ).values_list('barcode', 'measure')
     }
+    errors = errors or {}
 
     return [
         {
@@ -378,6 +428,43 @@ def _as_items(store_id: int, rows: list) -> list[dict]:
             'measure': unit_for(row.measure) or units.get(row.barcode, ''),
             'sold': row.sold,
             'last_sold': row.last_sold,
+            'forecast_error': errors.get(row.barcode),
         }
         for row in rows
     ]
+
+
+def _errors_for(organization, store_id: int, barcodes: set[str]) -> dict:
+    """Ошибка прогноза для списка: та же быстрая модель, что у планировки."""
+
+    if not barcodes:
+        return {}
+
+    forecasts = demand_forecast.for_products(
+        organization,
+        store_id,
+        barcodes,
+        DEFAULT_HORIZON,
+        models=demand_forecast.PLAN_MODELS,
+        max_days=demand_forecast.PLAN_FIT_DAYS,
+    )
+
+    return {
+        barcode: forecasts[barcode].error if barcode in forecasts else None
+        for barcode in barcodes
+    }
+
+
+def _accuracy_level(error) -> str:
+    if error is None:
+        return 'none'
+
+    value = Decimal(error)
+
+    if value <= GOOD_ERROR:
+        return 'high'
+
+    if value <= FAIR_ERROR:
+        return 'medium'
+
+    return 'low'
