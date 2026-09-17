@@ -44,7 +44,16 @@ class ForecastModelTests(SimpleTestCase):
         values = ([12, 2, 2, 2, 2, 2, 2] * 20) + [12, 2, 2, 2, 2, 2, 2]
         result = forecast.predict(values, 14)
 
-        self.assertIn(result.model, {'holt_winters_weekly', 'auto_ets', 'auto_theta'})
+        self.assertIn(
+            result.model,
+            {
+                'holt_winters_weekly',
+                'auto_ets',
+                'auto_theta',
+                'weekly_average',
+                'seasonal_naive_week',
+            },
+        )
         self.assertGreater(result.daily[0], result.daily[1])
         self.assertGreater(result.quantity, 0)
 
@@ -73,7 +82,14 @@ class ForecastModelTests(SimpleTestCase):
 
         self.assertIn(
             result.model,
-            {'seasonal_naive_year', 'auto_ets', 'auto_theta', 'holt_winters_weekly'},
+            {
+                'seasonal_naive_year',
+                'auto_ets',
+                'auto_theta',
+                'holt_winters_weekly',
+                'weekly_average',
+                'seasonal_naive_week',
+            },
         )
         self.assertGreater(result.daily[0], result.daily[1])
         self.assertGreater(result.quantity, 0)
@@ -135,9 +151,14 @@ class ForecastModelTests(SimpleTestCase):
         values = [18.0] * 58 + [3.0, 4.0]
         store = [5000.0] * 60
         clipped = forecast.predict(
-            values, 7, dates=dates, store_dates=dates, store_values=store
+            values,
+            7,
+            dates=dates,
+            store_dates=dates,
+            store_values=store,
+            model='average',
         )
-        raw = forecast.predict(values, 7, dates=dates)
+        raw = forecast.predict(values, 7, dates=dates, model='average')
 
         self.assertGreater(clipped.per_day, raw.per_day)
         self.assertLess(abs(float(clipped.per_day) - 18.0), 2.0)
@@ -149,9 +170,14 @@ class ForecastModelTests(SimpleTestCase):
         values = [18.0] * 58 + [3.0, 4.0]
         store = [5000.0] * 58 + [100.0, 100.0]
         closure = forecast.predict(
-            values, 7, dates=dates, store_dates=dates, store_values=store
+            values,
+            7,
+            dates=dates,
+            store_dates=dates,
+            store_values=store,
+            model='average',
         )
-        raw = forecast.predict(values, 7, dates=dates)
+        raw = forecast.predict(values, 7, dates=dates, model='average')
 
         self.assertEqual(closure.quantity, raw.quantity)
 
@@ -162,11 +188,81 @@ class ForecastModelTests(SimpleTestCase):
         values = [8.0 if index % 12 == 0 else 0.0 for index in range(120)]
         store = [5000.0] * 120
         with_store = forecast.predict(
-            values, 7, dates=dates, store_dates=dates, store_values=store
+            values,
+            7,
+            dates=dates,
+            store_dates=dates,
+            store_values=store,
+            model='average',
         )
-        raw = forecast.predict(values, 7, dates=dates)
+        raw = forecast.predict(values, 7, dates=dates, model='average')
 
         self.assertEqual(with_store.quantity, raw.quantity)
+
+    def test_lumpy_daily_sales_use_weekly_accuracy(self):
+        """Скачки 0/24 в день при ровной неделе — не «низкая точность»."""
+
+        week = [12.0, 2.0, 8.0, 0.0, 4.0, 16.0, 2.0]
+        result = forecast.predict(week * 16, 7)
+
+        self.assertLessEqual(result.error, Decimal('0.5'))
+
+    def test_weekly_pattern_beats_flat_average_error(self):
+        """Низкая точность плоского среднего — недельная модель поднимает форму дней."""
+
+        values = ([12, 2, 2, 2, 2, 2, 2] * 20) + [12, 2, 2, 2, 2, 2, 2]
+        auto = forecast.predict(values, 14)
+        flat = forecast.predict(values, 14, model='average')
+
+        self.assertLessEqual(auto.error, flat.error)
+        self.assertGreater(auto.daily[0], auto.daily[1])
+        self.assertNotEqual(auto.model, 'average')
+
+    def test_intermittent_demand_uses_sparse_model(self):
+        values = [8.0 if index % 12 == 0 else 0.0 for index in range(120)]
+        auto = forecast.predict(values, 14)
+        flat = forecast.predict(values, 14, model='average')
+
+        self.assertIn(auto.model, set(forecast.MODELS))
+        self.assertLessEqual(auto.error, flat.error)
+
+    def test_offseason_uses_last_year_week(self):
+        """Недавно тишина, а год назад в эти дни продавали — берём прошлый сезон."""
+
+        values = [0.0] * (forecast.YEAR + 14)
+        values[-forecast.YEAR] = 15.0
+        values[-forecast.YEAR + 1] = 12.0
+        result = forecast.predict(values, 7)
+
+        self.assertEqual(result.model, 'seasonal_naive_year')
+        self.assertGreater(result.quantity, 0)
+
+    def test_plan_models_skip_heavy_ets(self):
+        self.assertNotIn('auto_ets', forecast.PLAN_MODELS)
+        self.assertIn('weekly_average', forecast.PLAN_MODELS)
+        self.assertIn('croston_sba', forecast.PLAN_MODELS)
+
+    def test_plan_models_match_auto_when_local_accuracy_is_low(self):
+        """Список не пишет «Низкая», если «Авто» уже нашёл среднюю точность."""
+
+        values = [1.1**index for index in range(80)]
+        auto = forecast.predict(values, 14)
+        listed = forecast.predict(values, 14, allowed=set(forecast.PLAN_MODELS))
+        local = forecast.predict(values, 14, model='average')
+
+        self.assertGreater(local.error, Decimal(str(forecast.FAIR_ERROR)))
+        self.assertEqual(listed.model, auto.model)
+        self.assertEqual(listed.error, auto.error)
+        self.assertNotIn(listed.model, forecast.PLAN_MODELS)
+
+    def test_plan_models_keep_local_when_accuracy_is_fair(self):
+        """Ровный ряд среднее уже угадывает — тяжёлый ETS не трогаем."""
+
+        values = [10.0] * 60
+        listed = forecast.predict(values, 14, allowed=set(forecast.PLAN_MODELS))
+
+        self.assertIn(listed.model, forecast.PLAN_MODELS)
+        self.assertLessEqual(listed.error, Decimal(str(forecast.FAIR_ERROR)))
 
 
 class ForecastHistoryTests(TestCase):
@@ -263,3 +359,69 @@ class ForecastHistoryTests(TestCase):
         self.assertEqual(set(result), {'999'})
         self.assertEqual(result['999'].model, 'seasonal_naive_year')
         self.assertEqual(result['999'].quantity, Decimal('20.000'))
+
+    def test_missing_recent_sales_use_longer_history(self):
+        """Нет продаж в 90 днях — берём тот же календарь год назад, не «нет данных»."""
+
+        user = make_user()
+        as_of = timezone.localdate()
+        sold_day = as_of - timedelta(days=forecast.YEAR)
+        sold_at = timezone.make_aware(datetime.combine(sold_day, time(12, 0)))
+        sale = UmagSale.objects.create(
+            organization=user.organization,
+            store_id=17795,
+            external_id='old-1',
+            occurred_at=sold_at,
+        )
+        UmagSaleItem.objects.create(
+            sale=sale,
+            position=1,
+            barcode='1200',
+            quantity=Decimal('6'),
+        )
+        rebuild_store(user.organization, 17795)
+
+        fitted = forecast.for_products(
+            user.organization,
+            17795,
+            {'1200'},
+            7,
+            as_of=as_of,
+            models=forecast.PLAN_MODELS,
+            max_days=forecast.PLAN_FIT_DAYS,
+        )
+
+        self.assertEqual(set(fitted), {'1200'})
+        self.assertGreater(fitted['1200'].quantity, 0)
+        self.assertEqual(fitted['1200'].model, 'seasonal_naive_year')
+
+    def test_today_only_sale_still_gets_forecast(self):
+        user = make_user()
+        as_of = timezone.localdate()
+        sold_at = timezone.make_aware(datetime.combine(as_of, time(12, 0)))
+        sale = UmagSale.objects.create(
+            organization=user.organization,
+            store_id=17795,
+            external_id='today-1',
+            occurred_at=sold_at,
+        )
+        UmagSaleItem.objects.create(
+            sale=sale,
+            position=1,
+            barcode='777',
+            quantity=Decimal('4'),
+        )
+        rebuild_store(user.organization, 17795)
+
+        fitted = forecast.for_products(
+            user.organization,
+            17795,
+            {'777'},
+            7,
+            as_of=as_of,
+            models=forecast.PLAN_MODELS,
+            max_days=forecast.PLAN_FIT_DAYS,
+        )
+
+        self.assertEqual(set(fitted), {'777'})
+        self.assertGreater(fitted['777'].quantity, 0)

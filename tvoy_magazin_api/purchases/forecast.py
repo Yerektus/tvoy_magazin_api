@@ -2,10 +2,12 @@
 
 Ряд считает StatsForecast: среднее, сглаживание, Хольт, Хольт–Винтерс, AutoETS,
 AutoTheta, Кростон и годовой сезонный naïve. Какие алгоритмы доступны, зависит
-от длины ряда, лучший выбирается по отложенному хвосту. Акционный всплеск не
-должен стать нормой — скидку снимаем с ряда до отбора модели, на графике
-оставляем факт. Пустую полку тоже снимаем: обвал продаж при открытом магазине —
-это дефицит, а не спрос, иначе прогноз занизит заказ и дефицит продлится.
+от длины ряда, лучший выбирается по отложенному хвосту. Если ошибка всё ещё
+высокая, дешёвые модели пробуют неделю, Кростона и усадку к обороту магазина,
+а короткую историю дополняют более длинной. Акционный всплеск не должен стать
+нормой — скидку снимаем с ряда до отбора модели, на графике оставляем факт.
+Пустую полку тоже снимаем: обвал продаж при открытом магазине — это дефицит, а
+не спрос, иначе прогноз занизит заказ и дефицит продлится.
 """
 
 from collections import defaultdict
@@ -41,17 +43,36 @@ MAX_FIT_DAYS = YEAR * 2
 MODELS = (
     'average',
     'weighted_average',
+    'weekly_average',
     'holt',
     'holt_winters_weekly',
     'auto_ets',
     'auto_theta',
     'croston_sba',
+    'seasonal_naive_week',
     'seasonal_naive_year',
+    'pooled_weekly',
 )
-# План считает тысячи рядов: StatsForecast на каждом — минуты. Берём среднее
-# по недавнему окну; на карточке товара сложные модели остаются.
-PLAN_MODELS = ('average',)
+# Без StatsForecast: план и список считают тысячи рядов, пакетный ETS — минуты.
+LOCAL_MODELS = (
+    'average',
+    'weighted_average',
+    'weekly_average',
+    'croston_sba',
+    'seasonal_naive_week',
+    'seasonal_naive_year',
+    'pooled_weekly',
+)
+PLAN_MODELS = LOCAL_MODELS
 PLAN_FIT_DAYS = 90
+# Как на карточке: ошибка до 25% — высокая, до 50% — средняя. Выше — пробуем
+# другую модель и более длинную историю.
+GOOD_ERROR = 0.25
+FAIR_ERROR = 0.5
+# Редкий товар: ноль в четыре дня из десяти. Дневной WAPE тогда врёт, смотрим
+# неделю — столько обычно заказывают.
+SPARSE_ZERO_SHARE = 0.4
+WEEK_BUCKET = 7
 # Пакет StatsForecast на всю номенклатуру собирает миллионы строк в DataFrame.
 SF_BATCH = 400
 
@@ -124,7 +145,7 @@ def for_products(
     )
     wanted = {barcode: rows for barcode, rows in sparse.items() if rows}
 
-    if not wanted:
+    if not wanted and not barcodes:
         return {}
 
     store_sparse = _store_daily_totals(organization, store_id, store_start, history_end)
@@ -132,24 +153,128 @@ def for_products(
     store_dates, store_values = _series(store_sparse, store_start, history_end)
     future_dates = [as_of + timedelta(days=offset) for offset in range(horizon)]
     store_factor_cache: dict[tuple[str, int], tuple[float, int]] = {}
+    prepared = _prepare_many(
+        wanted,
+        promos,
+        fit_start,
+        history_end,
+        as_of,
+        store_dates,
+        store_values,
+    )
+    forecasts = _forecast_prepared(
+        prepared,
+        horizon,
+        future_dates,
+        calendar,
+        store_dates,
+        store_values,
+        store_factor_cache,
+        models=models,
+    )
+
+    if barcodes:
+        forecasts = _improve_weak(
+            forecasts,
+            barcodes,
+            organization,
+            store_id,
+            horizon,
+            as_of,
+            history_end,
+            store_dates,
+            store_values,
+            calendar,
+            future_dates,
+            store_factor_cache,
+            models=models,
+            window=window,
+        )
+
+    return forecasts
+
+
+def _prepare_many(
+    sparse: dict[str, dict[date, float]],
+    promos: dict[str, dict[date, float]],
+    fit_start: date,
+    history_end: date,
+    as_of: date,
+    store_dates: list[date],
+    store_values: list[float],
+) -> dict[str, tuple[list[date], list[float]]]:
+    """Склеивает дни, снимает акцию и пустую полку — одинаково для всех проходов."""
+
     prepared: dict[str, tuple[list[date], list[float]]] = {}
 
-    for barcode, rows in wanted.items():
-        first_day = max(min(rows), fit_start)
-        dates, values = _series(rows, first_day, history_end)
+    for barcode, rows in sparse.items():
+        dates, values = _align_series(rows, fit_start, history_end, as_of)
 
         if not values:
             continue
 
-        _, promo_values = _series(promos.get(barcode, {}), first_day, history_end)
+        promo_rows = promos.get(barcode, {})
+        if promo_rows:
+            _, promo_values = _series(promo_rows, dates[0], dates[-1])
+            if len(promo_values) != len(values):
+                promo_values = [promo_rows.get(day, 0.0) for day in dates]
+        else:
+            promo_values = [0.0] * len(values)
+
         values = _clip_promos(dates, values, promo_values)
         values = _clip_stockouts(dates, values, store_dates, store_values)
         prepared[barcode] = (dates, values)
+
+    return prepared
+
+
+def _align_series(
+    rows: dict[date, float],
+    fit_start: date,
+    history_end: date,
+    as_of: date,
+) -> tuple[list[date], list[float]]:
+    """Ряд с первой продажи в окне. Только сегодня — берём сегодня, иначе пусто."""
+
+    if not rows:
+        return [], []
+
+    first_day = max(min(rows), fit_start)
+
+    if first_day <= history_end:
+        return _series(rows, first_day, history_end)
+
+    today = max(0.0, float(rows.get(as_of, 0.0)))
+    if today > 0:
+        return [as_of], [today]
+
+    return [], []
+
+
+def _forecast_prepared(
+    prepared: dict[str, tuple[list[date], list[float]]],
+    horizon: int,
+    future_dates: list[date],
+    calendar: dict[date, str],
+    store_dates: list[date],
+    store_values: list[float],
+    store_factor_cache: dict[tuple[str, int], tuple[float, int]],
+    *,
+    models: set[str] | tuple[str, ...] | None = None,
+) -> dict[str, Forecast]:
+    """Отбор модели по уже подготовленным рядам."""
+
+    if not prepared:
+        return {}
 
     selected = _select_many(
         {barcode: values for barcode, (_, values) in prepared.items()},
         horizon,
         allowed=set(models) if models else None,
+        dates_of={barcode: dates for barcode, (dates, _) in prepared.items()},
+        future_dates=future_dates,
+        store_dates=store_dates,
+        store_values=store_values,
     )
     forecasts = {}
 
@@ -173,6 +298,79 @@ def for_products(
     return forecasts
 
 
+def _improve_weak(
+    forecasts: dict[str, Forecast],
+    barcodes: set[str],
+    organization,
+    store_id: int,
+    horizon: int,
+    as_of: date,
+    history_end: date,
+    store_dates: list[date],
+    store_values: list[float],
+    calendar: dict[date, str],
+    future_dates: list[date],
+    store_factor_cache: dict[tuple[str, int], tuple[float, int]],
+    *,
+    models: set[str] | tuple[str, ...] | None,
+    window: int,
+) -> dict[str, Forecast]:
+    """Низкая точность или дырка в окне — считаем на более длинной истории.
+
+    План смотрит 90 дней, чтобы не тащить все ряды. У кого среднее врёт или
+    продаж в окне нет, берём до двух лет и сезонный хвост прошлых лет.
+    """
+
+    missing = barcodes - set(forecasts)
+    weak = {
+        barcode
+        for barcode, prediction in forecasts.items()
+        if float(prediction.error) > FAIR_ERROR
+    }
+    retry = missing | weak
+    long_start = history_end - timedelta(days=MAX_FIT_DAYS - 1)
+
+    if retry and window < MAX_FIT_DAYS:
+        extra_sparse, extra_promos = _daily_history(
+            organization,
+            store_id,
+            barcodes=retry,
+            since=long_start,
+        )
+        extra = _forecast_prepared(
+            _prepare_many(
+                extra_sparse,
+                extra_promos,
+                long_start,
+                history_end,
+                as_of,
+                store_dates,
+                store_values,
+            ),
+            horizon,
+            future_dates,
+            calendar,
+            store_dates,
+            store_values,
+            store_factor_cache,
+            models=models,
+        )
+
+        for barcode, prediction in extra.items():
+            current = forecasts.get(barcode)
+            if current is None:
+                if prediction.quantity > 0:
+                    forecasts[barcode] = prediction
+            elif prediction.error < current.error:
+                forecasts[barcode] = prediction
+
+    leftover = barcodes - set(forecasts)
+    if leftover:
+        forecasts.update(for_same_season(organization, store_id, leftover, horizon, as_of=as_of))
+
+    return forecasts
+
+
 def for_same_season(
     organization,
     store_id: int,
@@ -191,41 +389,54 @@ def for_same_season(
         return {}
 
     as_of = as_of or timezone.localdate()
-    leftover = set(barcodes)
-    daily: dict[str, dict[date, float]] = defaultdict(lambda: defaultdict(float))
+    by_year: dict[int, dict[str, dict[date, float]]] = {
+        1: defaultdict(lambda: defaultdict(float)),
+        2: defaultdict(lambda: defaultdict(float)),
+    }
 
     for years in (1, 2):
-        if not leftover:
-            break
-
         start = shift_years(as_of, years)
         end = start + timedelta(days=horizon - 1)
         for row in UmagDailyDemand.objects.filter(
             organization=organization,
             store_id=store_id,
-            barcode__in=leftover,
+            barcode__in=barcodes,
             day__gte=start,
             day__lte=end,
         ).values('barcode', 'day', 'quantity'):
             day = _as_date(row['day'])
             if day is None:
                 continue
-            daily[row['barcode']][day] += max(0.0, float(row['quantity'] or 0))
-
-        leftover -= set(daily)
+            by_year[years][row['barcode']][day] += max(0.0, float(row['quantity'] or 0))
 
     forecasts = {}
 
-    for barcode, rows in daily.items():
-        if not rows:
+    for barcode in set(by_year[1]) | set(by_year[2]):
+        primary = by_year[1].get(barcode) or by_year[2].get(barcode)
+        if not primary:
             continue
 
-        start = min(rows)
-        _, values = _series(rows, start, start + timedelta(days=horizon - 1))
+        start = min(primary)
+        _, values = _series(primary, start, start + timedelta(days=horizon - 1))
         demand = sum(values)
 
         if demand <= 0:
             continue
+
+        previous_rows = by_year[2].get(barcode) if barcode in by_year[1] else None
+        if previous_rows:
+            previous_start = min(previous_rows)
+            _, previous = _series(
+                previous_rows,
+                previous_start,
+                previous_start + timedelta(days=horizon - 1),
+            )
+            scored = _score(values, previous[: len(values)])
+            error = scored[0] if scored else FAIR_ERROR
+            daily_mae = scored[1] if scored else 0.0
+        else:
+            error = FAIR_ERROR
+            daily_mae = 0.0
 
         forecasts[barcode] = Forecast(
             model='seasonal_naive_year',
@@ -233,10 +444,10 @@ def for_same_season(
             per_day=_amount(demand / horizon),
             safety_stock=ZERO,
             holiday_factor=Decimal('1.000'),
-            error=ZERO,
+            error=_amount(min(99_999.0, max(0.0, error))),
             observations=len(values),
             daily=tuple(_amount(value) for value in values),
-            daily_error=ZERO,
+            daily_error=_amount(daily_mae),
         )
 
     return forecasts
@@ -358,7 +569,15 @@ def _build(
 
     values = _clip_promos(dates, values, promo_values)
     values = _clip_stockouts(dates, values, store_dates, store_values)
-    model, base, error, daily_mae = _select(values, horizon, model)
+    model, base, error, daily_mae = _select(
+        values,
+        horizon,
+        model,
+        dates=dates,
+        future_dates=future_dates,
+        store_dates=store_dates,
+        store_values=store_values,
+    )
     return _result(
         model,
         base,
@@ -431,6 +650,7 @@ def predict(
     store_dates: list[date] | None = None,
     promo_values: list[float] | None = None,
     model: str | None = None,
+    allowed: set[str] | None = None,
 ) -> Forecast:
     """Чистая точка входа для тестов и повторного использования без БД."""
 
@@ -442,11 +662,26 @@ def predict(
     clean = [max(0.0, float(value)) for value in values]
     dates = dates or [date(2000, 1, 1) + timedelta(days=index) for index in range(len(clean))]
     clean = _clip_promos(dates, clean, promo_values)
-    clean = _clip_stockouts(dates, clean, store_dates or dates, store_values or clean)
-    model, base, error, daily_mae = _select(clean, horizon, model)
+    given_store = store_values is not None and store_dates is not None
+    clean = _clip_stockouts(
+        dates,
+        clean,
+        store_dates or dates,
+        store_values or clean,
+    )
     future_dates = future_dates or [
         dates[-1] + timedelta(days=index + 1) for index in range(horizon)
     ]
+    model, base, error, daily_mae = _select(
+        clean,
+        horizon,
+        model,
+        dates=dates,
+        future_dates=future_dates,
+        store_dates=store_dates if given_store else None,
+        store_values=store_values if given_store else None,
+        allowed=allowed,
+    )
     return _result(
         model,
         base,
@@ -677,14 +912,352 @@ def _fit_window(values: list[float]) -> list[float]:
     return values[-MAX_FIT_DAYS:]
 
 
+def _fit_pair(dates: list[date] | None, values: list[float]) -> tuple[list[date], list[float]]:
+    values = _fit_window(values)
+    if not dates or len(dates) < len(values):
+        return _synthetic_dates(len(values)), values
+    if len(dates) > len(values):
+        dates = dates[-len(values) :]
+    return dates, values
+
+
+def _synthetic_dates(length: int) -> list[date]:
+    start = date(2000, 1, 1)
+    return [start + timedelta(days=index) for index in range(length)]
+
+
+def _future_of(dates: list[date], horizon: int) -> list[date]:
+    last = dates[-1] if dates else date(2000, 1, 1)
+    return [last + timedelta(days=index + 1) for index in range(horizon)]
+
+
+def _local_average(
+    values: list[float],
+    horizon: int,
+    cap: float | None = None,
+) -> list[float]:
+    window = values[-min(28, len(values)) :]
+    level = sum(window) / len(window)
+
+    if cap is not None:
+        level = min(level, cap)
+
+    return [max(0.0, level)] * horizon
+
+
+def _ses_level(values: list[float], alpha: float = 0.2) -> float:
+    if not values:
+        return 0.0
+
+    level = values[0]
+    for value in values[1:]:
+        level = alpha * value + (1 - alpha) * level
+    return max(0.0, level)
+
+
+def _sba_rate(values: list[float], alpha: float = 0.1) -> float:
+    size = None
+    interval = None
+    last = None
+
+    for index, value in enumerate(values):
+        if value <= 0:
+            continue
+        if last is None:
+            size = value
+            interval = float(index + 1)
+        else:
+            gap = index - last
+            size = size + alpha * (value - size)
+            interval = interval + alpha * (gap - interval)
+        last = index
+
+    if size is None or not interval:
+        return sum(values) / len(values) if values else 0.0
+
+    return max(0.0, (1 - alpha / 2) * size / interval)
+
+
+def _tsb_rate(values: list[float], alpha_p: float = 0.1, alpha_z: float = 0.1) -> float:
+    probability = 0.0
+    size = 0.0
+    started = False
+
+    for value in values:
+        occurred = 1.0 if value > 0 else 0.0
+        if not started:
+            if value <= 0:
+                continue
+            size = value
+            probability = 1.0
+            started = True
+            continue
+        probability = probability + alpha_p * (occurred - probability)
+        if value > 0:
+            size = size + alpha_z * (value - size)
+
+    return max(0.0, probability * size) if started else 0.0
+
+
+def _croston_rate(values: list[float]) -> float:
+    """SBA, а если товар затих — TSB, чтобы нули в хвосте гасили спрос."""
+
+    trailing = 0
+    for value in reversed(values):
+        if value > 0:
+            break
+        trailing += 1
+
+    return _tsb_rate(values) if trailing >= WEEK else _sba_rate(values)
+
+
+def _weekly_average(
+    values: list[float],
+    dates: list[date],
+    future_dates: list[date],
+    cap: float,
+) -> list[float]:
+    by_weekday: dict[int, list[float]] = defaultdict(list)
+    window = min(84, len(values))
+
+    for day, value in zip(dates[-window:], values[-window:]):
+        by_weekday[day.weekday()].append(value)
+
+    overall = sum(values[-min(28, len(values)) :]) / min(28, len(values) or 1)
+    daily = []
+
+    for day in future_dates:
+        bucket = by_weekday[day.weekday()]
+        level = sum(bucket) / len(bucket) if bucket else overall
+        daily.append(max(0.0, min(level, cap)))
+
+    return daily
+
+
+def _naive_week(values: list[float], horizon: int, cap: float) -> list[float]:
+    week = values[-min(WEEK, len(values)) :]
+    if not week:
+        return [0.0] * horizon
+    return [max(0.0, min(week[index % len(week)], cap)) for index in range(horizon)]
+
+
+def _naive_year(values: list[float], horizon: int, cap: float) -> list[float] | None:
+    if len(values) < YEAR:
+        return None
+
+    daily = []
+    for index in range(horizon):
+        source = -YEAR + index
+        if source >= len(values) or abs(source) > len(values):
+            return None
+        daily.append(max(0.0, min(values[source], cap)))
+
+    return daily
+
+
+def _pooled_weekly(
+    values: list[float],
+    dates: list[date],
+    future_dates: list[date],
+    store_dates: list[date] | None,
+    store_values: list[float] | None,
+    cap: float,
+) -> list[float]:
+    """Редкий SKU тянем к форме недели магазина, уровень — свой."""
+
+    if (
+        not store_dates
+        or not store_values
+        or len(store_dates) != len(store_values)
+        or store_values is values
+    ):
+        return _weekly_average(values, dates, future_dates, cap)
+
+    sku_by_weekday: dict[int, list[float]] = defaultdict(list)
+    window = min(84, len(values))
+    for day, value in zip(dates[-window:], values[-window:]):
+        sku_by_weekday[day.weekday()].append(value)
+
+    sku_mean = sum(values[-min(28, len(values)) :]) / min(28, len(values) or 1)
+    store_by_day = dict(zip(store_dates, store_values))
+    store_by_weekday: dict[int, list[float]] = defaultdict(list)
+
+    for day in dates[-window:]:
+        total = store_by_day.get(day)
+        if total is not None:
+            store_by_weekday[day.weekday()].append(total)
+
+    store_all = [value for bucket in store_by_weekday.values() for value in bucket]
+    store_mean = sum(store_all) / len(store_all) if store_all else 0.0
+    daily = []
+    prior_weight = 4
+
+    for day in future_dates:
+        weekday = day.weekday()
+        sku_bucket = sku_by_weekday[weekday]
+        sku_hat = sum(sku_bucket) / len(sku_bucket) if sku_bucket else sku_mean
+        store_bucket = store_by_weekday[weekday]
+        if store_mean > 0 and store_bucket:
+            prior = sku_mean * (sum(store_bucket) / len(store_bucket) / store_mean)
+        else:
+            prior = sku_mean
+        weight = len(sku_bucket) / (len(sku_bucket) + prior_weight)
+        daily.append(max(0.0, min(weight * sku_hat + (1 - weight) * prior, cap)))
+
+    return daily
+
+
+def _local_forecast(
+    name: str,
+    values: list[float],
+    dates: list[date],
+    horizon: int,
+    future_dates: list[date],
+    store_dates: list[date] | None,
+    store_values: list[float] | None,
+    cap: float,
+) -> list[float]:
+    if name == 'weighted_average':
+        daily = [min(_ses_level(values), cap)] * horizon
+    elif name == 'weekly_average':
+        daily = _weekly_average(values, dates, future_dates, cap)
+    elif name == 'seasonal_naive_week':
+        daily = _naive_week(values, horizon, cap)
+    elif name == 'seasonal_naive_year':
+        daily = _naive_year(values, horizon, cap) or _local_average(values, horizon, cap)
+    elif name == 'croston_sba':
+        daily = [min(_croston_rate(values), cap)] * horizon
+    elif name == 'pooled_weekly':
+        daily = _pooled_weekly(values, dates, future_dates, store_dates, store_values, cap)
+    else:
+        daily = _local_average(values, horizon, cap)
+
+    if len(daily) < horizon:
+        fill = daily[-1] if daily else 0.0
+        daily = daily + [fill] * (horizon - len(daily))
+
+    return [max(0.0, min(value, cap)) for value in daily[:horizon]]
+
+
+def _eligible_local(
+    values: list[float],
+    allowed: set[str] | None = None,
+    store_dates: list[date] | None = None,
+    store_values: list[float] | None = None,
+) -> list[str]:
+    length = len(values)
+    active = sum(value > 0 for value in values)
+    zero_share = 1 - active / length if length else 1
+    names = ['average']
+
+    if length >= 14:
+        names.extend(['weighted_average', 'weekly_average', 'seasonal_naive_week'])
+    if length >= 14 and active >= 3 and zero_share >= SPARSE_ZERO_SHARE:
+        names.append('croston_sba')
+    if length >= YEAR and sum(values[-YEAR : -YEAR + WEEK]) > 0:
+        names.append('seasonal_naive_year')
+    if (
+        store_dates
+        and store_values
+        and len(store_dates) == len(store_values)
+        and store_values is not values
+        and length >= 14
+    ):
+        names.append('pooled_weekly')
+
+    if allowed is not None:
+        names = [name for name in names if name in allowed]
+
+    return names or ['average']
+
+
+def _eligible_sf(values: list[float], allowed: set[str] | None = None) -> set[str]:
+    length = len(values)
+    active = sum(value > 0 for value in values)
+    names: set[str] = set()
+
+    if length >= 28 and active >= 14:
+        names.update({'auto_ets', 'auto_theta'})
+    if length >= 28 and active >= 6:
+        names.add('holt')
+    if length >= 56 and active >= 14:
+        names.add('holt_winters_weekly')
+
+    if allowed is not None:
+        names &= allowed
+
+    return names
+
+
+def _eligible(values: list[float], allowed: set[str] | None = None) -> set[str]:
+    return set(_eligible_local(values, allowed)) | _eligible_sf(values, allowed)
+
+
+def _sf_allowed(allowed: set[str] | None, local_error: float | None) -> set[str] | None:
+    """Какие модели StatsForecast можно гонять.
+
+    На карточке (`allowed` пустой) — все подходящие. В списке и плане сначала
+    только дешёвые; Holt/ETS подключаем, если локальная точность уже низкая,
+    иначе в таблице «Низкая», а на «Авто» — «Средняя».
+    """
+
+    if allowed is None:
+        return None
+    if set(allowed) <= set(LOCAL_MODELS) and (
+        local_error is None or local_error > FAIR_ERROR
+    ):
+        return None
+    return allowed
+
+
+def _error_bucket(values: list[float]) -> int:
+    """Точность смотрим неделей: закупают пачку дней, а не каждый чек.
+
+    Туалетная бумага может уйти 0 или 24 штуки за день — дневной WAPE тогда
+    всегда около 100%, хотя за неделю спрос ровный. Редкие нули больше не
+    условие: та же неделя нужна и плотному, но рваному ряду.
+    """
+
+    if len(values) < WEEK_BUCKET:
+        return 1
+
+    return WEEK_BUCKET
+
+
+def _bucket_sums(values: list[float], size: int) -> list[float]:
+    return [sum(values[index : index + size]) for index in range(0, len(values), size)]
+
+
+def _zero_demand_error(estimated: list[float]) -> float:
+    total = sum(max(0.0, value) for value in estimated)
+    if total <= 0:
+        return 0.0
+    return min(1.0, total / max(1.0, len(estimated)))
+
+
 def _select(
     values: list[float],
     horizon: int,
     model: str | None = None,
+    *,
+    dates: list[date] | None = None,
+    future_dates: list[date] | None = None,
+    store_dates: list[date] | None = None,
+    store_values: list[float] | None = None,
+    allowed: set[str] | None = None,
 ) -> tuple[str, list[float], float, float]:
     """Выбирает модель: явно запрошенную или лучшую на holdout."""
 
-    return _select_many({'_': values}, horizon, model)['_']
+    return _select_many(
+        {'_': values},
+        horizon,
+        model,
+        allowed,
+        dates_of={'_': dates} if dates is not None else None,
+        future_dates=future_dates,
+        store_dates=store_dates,
+        store_values=store_values,
+    )['_']
 
 
 def _select_many(
@@ -692,43 +1265,80 @@ def _select_many(
     horizon: int,
     model: str | None = None,
     allowed: set[str] | None = None,
+    dates_of: dict[str, list[date]] | None = None,
+    future_dates: list[date] | None = None,
+    store_dates: list[date] | None = None,
+    store_values: list[float] | None = None,
 ) -> dict[str, tuple[str, list[float], float, float]]:
-    """Отбирает модель по каждому ряду и строит дневной прогноз на горизонт."""
+    """Отбирает модель по каждому ряду и строит дневной прогноз на горизонт.
 
-    series = {str(uid): _fit_window(values) for uid, values in series.items() if values}
-    results: dict[str, tuple[str, list[float], float, float]] = {}
-    pending: dict[str, list[float]] = {}
+    Сначала дешёвые локальные модели. Если точность низкая — в списке и плане
+    тоже — к ним добавляются Holt/ETS. На карточке «Авто» они пробуются всегда:
+    побеждает меньшая ошибка на хвосте.
+    """
+
+    dates_of = dates_of or {}
+    fitted: dict[str, tuple[list[date], list[float]]] = {}
 
     for uid, values in series.items():
-        if model in MODELS:
-            pending[uid] = values
-        elif (allowed is not None and allowed <= {'average'}) or len(values) < 14:
-            daily = _local_average(values, horizon)
-            mae = _dispersion(values, daily[0] if daily else 0.0)
-            results[uid] = ('average', daily, _relative_error(mae, values), mae)
-        else:
-            pending[uid] = values
+        if not values:
+            continue
+        fitted[str(uid)] = _fit_pair(dates_of.get(uid) or dates_of.get(str(uid)), values)
 
-    if not pending:
+    results: dict[str, tuple[str, list[float], float, float]] = {}
+    pending_sf: dict[str, list[float]] = {}
+    sf_scope_of: dict[str, set[str] | None] = {}
+    forced_sf = model in MODELS and model not in LOCAL_MODELS
+    forced_local = model if model in LOCAL_MODELS else None
+
+    for uid, (dates, values) in fitted.items():
+        future = future_dates or _future_of(dates, horizon)
+
+        if not forced_sf:
+            local_allowed = {forced_local} if forced_local else allowed
+            if local_allowed is not None:
+                local_allowed = set(local_allowed) & set(LOCAL_MODELS)
+            results[uid] = _select_local(
+                values,
+                dates,
+                horizon,
+                future,
+                store_dates,
+                store_values,
+                allowed=local_allowed,
+                forced=forced_local,
+            )
+
+        local = results.get(uid)
+        scope = None if forced_sf else _sf_allowed(
+            allowed,
+            None if local is None else local[2],
+        )
+        if forced_sf or (model is None and _eligible_sf(values, scope)):
+            pending_sf[uid] = values
+            sf_scope_of[uid] = scope
+
+    if not pending_sf:
         return results
 
     chosen: dict[str, tuple[str, float, float]] = {}
 
-    if model in MODELS:
-        for uid, values in pending.items():
+    if forced_sf:
+        for uid, values in pending_sf.items():
             error, mae = _holdout_score(values, model)
             chosen[uid] = (model, error, mae)
     else:
         groups: dict[int, list[str]] = defaultdict(list)
 
-        for uid, values in pending.items():
+        for uid, values in pending_sf.items():
             groups[_holdout_size(len(values))].append(uid)
 
         for holdout, uids in groups.items():
-            train = {uid: pending[uid][:-holdout] for uid in uids}
-            actual = {uid: pending[uid][-holdout:] for uid in uids}
+            train = {uid: pending_sf[uid][:-holdout] for uid in uids}
+            actual = {uid: pending_sf[uid][-holdout:] for uid in uids}
             eligible_of = {
-                uid: _eligible(pending[uid], allowed) & _eligible(train[uid], allowed)
+                uid: _eligible_sf(pending_sf[uid], sf_scope_of[uid])
+                & _eligible_sf(train[uid], sf_scope_of[uid])
                 for uid in uids
             }
             predicted: dict[str, dict[str, list[float]]] = {uid: {} for uid in uids}
@@ -748,9 +1358,14 @@ def _select_many(
 
             for uid in uids:
                 best: tuple[float, float, str] | None = None
+                bucket = _error_bucket(pending_sf[uid])
 
                 for name in eligible_of[uid]:
-                    scored = _score(actual[uid], predicted.get(uid, {}).get(name, []))
+                    scored = _score(
+                        actual[uid],
+                        predicted.get(uid, {}).get(name, []),
+                        bucket=bucket,
+                    )
 
                     if scored is None:
                         continue
@@ -760,10 +1375,7 @@ def _select_many(
                     if best is None or candidate < best:
                         best = candidate
 
-                if best is None:
-                    mae = _dispersion(pending[uid], _local_average(pending[uid], 1)[0])
-                    chosen[uid] = ('average', _relative_error(mae, pending[uid]), mae)
-                else:
+                if best is not None:
                     chosen[uid] = (best[2], best[0], best[1])
 
     by_name: dict[str, list[str]] = defaultdict(list)
@@ -774,50 +1386,120 @@ def _select_many(
     finals: dict[str, list[float]] = {}
 
     for name, uids in by_name.items():
-        forecasted = _sf_batch({uid: pending[uid] for uid in uids}, horizon, (name,))
+        forecasted = _sf_batch({uid: pending_sf[uid] for uid in uids}, horizon, (name,))
 
         for uid in uids:
             finals[uid] = forecasted.get(uid, {}).get(name, [])
 
-    for uid, values in pending.items():
+    for uid, values in pending_sf.items():
+        if uid not in chosen:
+            continue
+
         name, error, mae = chosen[uid]
-        daily = finals.get(uid) or _local_average(values, horizon)
+        daily = finals.get(uid) or []
 
-        if not finals.get(uid):
-            name = 'average'
-            mae = _dispersion(values, daily[0] if daily else 0.0)
-            error = _relative_error(mae, values)
+        if not daily:
+            continue
 
-        results[uid] = (name, daily, error, mae)
+        current = results.get(uid)
+        if current is None or (error, mae) < (current[2], current[3]):
+            results[uid] = (name, daily, error, mae)
+
+    for uid, (dates, values) in fitted.items():
+        if uid not in results:
+            future = future_dates or _future_of(dates, horizon)
+            results[uid] = _select_local(
+                values,
+                dates,
+                horizon,
+                future,
+                store_dates,
+                store_values,
+            )
 
     return results
 
 
-def _eligible(values: list[float], allowed: set[str] | None = None) -> set[str]:
-    length = len(values)
-    active = sum(value > 0 for value in values)
-    zero_share = 1 - active / length if length else 1
-    names = {'average'}
+def _select_local(
+    values: list[float],
+    dates: list[date],
+    horizon: int,
+    future_dates: list[date],
+    store_dates: list[date] | None = None,
+    store_values: list[float] | None = None,
+    allowed: set[str] | None = None,
+    forced: str | None = None,
+) -> tuple[str, list[float], float, float]:
+    """Дешёвые модели без StatsForecast. На низкой точности пробуем все сразу."""
 
-    if length >= 14:
-        names.add('weighted_average')
-    # AutoETS/Theta на коротком или почти нулевом ряде только тратят время:
-    # побеждает среднее, а подбор параметров — секунды на товар.
-    if length >= 28 and active >= 14:
-        names.update({'auto_ets', 'auto_theta'})
-    if length >= 28 and active >= 6:
-        names.add('holt')
-    if length >= 28 and active >= 3 and zero_share >= 0.4:
-        names.add('croston_sba')
-    if length >= 56 and active >= 14:
-        names.add('holt_winters_weekly')
-    if length >= YEAR and active >= 24:
-        names.add('seasonal_naive_year')
+    cap = max(1.0, _percentile(values, 0.9)) * 4 if values else 1.0
+    names = [forced] if forced else _eligible_local(values, allowed, store_dates, store_values)
+    bucket = _error_bucket(values)
 
-    if allowed is not None:
-        names &= allowed
+    if len(values) < 14:
+        name = forced or 'average'
+        daily = _local_forecast(
+            name, values, dates, horizon, future_dates, store_dates, store_values, cap
+        )
+        in_sample = _local_forecast(
+            name, values, dates, len(values), dates, store_dates, store_values, cap
+        )
+        scored = _score(values, in_sample, bucket=bucket)
+        if scored is None:
+            mae = _dispersion(values, daily[0] if daily else 0.0)
+            return name, daily, _relative_error(mae, values), mae
+        return name, daily, scored[0], scored[1]
 
-    return names or {'average'}
+    holdout = _holdout_size(len(values))
+    train_values, actual = values[:-holdout], values[-holdout:]
+    train_dates, actual_dates = dates[:-holdout], dates[-holdout:]
+    best: tuple[float, float, str] | None = None
+
+    for name in names:
+        predicted = _local_forecast(
+            name,
+            train_values,
+            train_dates,
+            holdout,
+            actual_dates,
+            store_dates,
+            store_values,
+            cap,
+        )
+        scored = _score(actual, predicted, bucket=bucket)
+        if scored is None:
+            continue
+        candidate = (scored[0], scored[1], name)
+        if best is None or candidate < best:
+            best = candidate
+
+    if best is None:
+        name = 'average'
+        daily = _local_average(values, horizon, cap)
+        mae = _dispersion(values, daily[0] if daily else 0.0)
+        return name, daily, _relative_error(mae, values), mae
+
+    name = best[2]
+    daily = _local_forecast(
+        name, values, dates, horizon, future_dates, store_dates, store_values, cap
+    )
+
+    # Хвост нулевой, а год назад в эти дни продавали — это сезон, не мёртвый товар.
+    if sum(daily) <= 0 and name != 'seasonal_naive_year' and 'seasonal_naive_year' in names:
+        yearly = _local_forecast(
+            'seasonal_naive_year',
+            values,
+            dates,
+            horizon,
+            future_dates,
+            store_dates,
+            store_values,
+            cap,
+        )
+        if sum(yearly) > 0:
+            return 'seasonal_naive_year', yearly, best[0], best[1]
+
+    return name, daily, best[0], best[1]
 
 
 def _holdout_size(length: int) -> int:
@@ -832,7 +1514,7 @@ def _holdout_score(values: list[float], name: str) -> tuple[float, float]:
 
     holdout = _holdout_size(len(values))
     estimated = _predict_models(values[:-holdout], holdout, (name,)).get(name)
-    scored = _score(values[-holdout:], estimated or [])
+    scored = _score(values[-holdout:], estimated or [], bucket=_error_bucket(values))
 
     if scored is None:
         prediction = _local_average(values, 1)
@@ -842,7 +1524,12 @@ def _holdout_score(values: list[float], name: str) -> tuple[float, float]:
     return scored
 
 
-def _score(actual: list[float], estimated: list[float]) -> tuple[float, float] | None:
+def _score(
+    actual: list[float],
+    estimated: list[float],
+    *,
+    bucket: int = 1,
+) -> tuple[float, float] | None:
     if len(estimated) != len(actual) or not actual:
         return None
     if not all(isfinite(value) for value in estimated):
@@ -850,8 +1537,14 @@ def _score(actual: list[float], estimated: list[float]) -> tuple[float, float] |
 
     absolute = [abs(wanted - got) for wanted, got in zip(actual, estimated)]
     mae = sum(absolute) / len(absolute)
+
+    if bucket > 1:
+        actual = _bucket_sums(actual, bucket)
+        estimated = _bucket_sums(estimated, bucket)
+        absolute = [abs(wanted - got) for wanted, got in zip(actual, estimated)]
+
     denominator = sum(abs(value) for value in actual)
-    wape = sum(absolute) / denominator if denominator > 0 else mae
+    wape = sum(absolute) / denominator if denominator > 0 else _zero_demand_error(estimated)
     return wape, mae
 
 
@@ -860,21 +1553,21 @@ def _predict_models(
     horizon: int,
     names: tuple[str, ...],
 ) -> dict[str, list[float]]:
-    return _sf_batch({'_': values}, horizon, names).get('_', {})
+    local_names = tuple(name for name in names if name in LOCAL_MODELS)
+    sf_names = tuple(name for name in names if name not in LOCAL_MODELS)
+    out: dict[str, list[float]] = {}
 
+    if sf_names:
+        out.update(_sf_batch({'_': values}, horizon, sf_names).get('_', {}))
 
-def _local_average(
-    values: list[float],
-    horizon: int,
-    cap: float | None = None,
-) -> list[float]:
-    window = values[-min(28, len(values)) :]
-    level = sum(window) / len(window)
+    if local_names:
+        dates = _synthetic_dates(len(values))
+        future = _future_of(dates, horizon)
+        cap = max(1.0, _percentile(values, 0.9)) * 4
+        for name in local_names:
+            out[name] = _local_forecast(name, values, dates, horizon, future, None, None, cap)
 
-    if cap is not None:
-        level = min(level, cap)
-
-    return [max(0.0, level)] * horizon
+    return out
 
 
 def _sf_batch(

@@ -435,7 +435,11 @@ def _as_items(store_id: int, rows: list, errors: dict | None = None) -> list[dic
 
 
 def _errors_for(organization, store_id: int, barcodes: set[str]) -> dict:
-    """Ошибка прогноза для списка: та же быстрая модель, что у планировки."""
+    """Ошибка прогноза для списка — как у «Авто» на карточке.
+
+    Сначала те же быстрые модели, что у планировки. Если точность низкая,
+    Holt/ETS поднимают оценку, иначе в таблице «Низкая», а на карточке «Средняя».
+    """
 
     if not barcodes:
         return {}
