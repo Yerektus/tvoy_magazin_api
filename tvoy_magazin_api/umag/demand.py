@@ -292,6 +292,9 @@ def _refresh_products(
         product.last_sold = last_sold
         product.name = name
         product.measure = measure
+        # Спрос в окне пересчитан — точность списка должна посмотреть ряд заново.
+        product.forecast_error = None
+        product.forecast_on = None
         updated.append(product)
 
     if created:
@@ -299,7 +302,7 @@ def _refresh_products(
     if updated:
         UmagSoldProduct.objects.bulk_update(
             updated,
-            ('name', 'measure', 'sold', 'last_sold'),
+            ('name', 'measure', 'sold', 'last_sold', 'forecast_error', 'forecast_on'),
             batch_size=WRITE_BATCH,
         )
 

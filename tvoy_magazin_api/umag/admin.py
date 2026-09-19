@@ -166,7 +166,27 @@ class UmagDailyDemandAdmin(ReadOnlyAdmin):
 
 @admin.register(UmagSoldProduct)
 class UmagSoldProductAdmin(ReadOnlyAdmin):
-    list_display = ('name', 'barcode', 'organization', 'store_id', 'sold', 'measure', 'last_sold')
+    list_display = (
+        'name',
+        'barcode',
+        'organization',
+        'store_id',
+        'sold',
+        'measure',
+        'last_sold',
+        'forecast_error',
+        'forecast_on',
+    )
     list_filter = ('store_id',)
     search_fields = ('barcode', 'name', 'organization__name')
-    readonly_fields = ('organization', 'store_id', 'barcode', 'name', 'measure', 'sold', 'last_sold')
+    readonly_fields = (
+        'organization',
+        'store_id',
+        'barcode',
+        'name',
+        'measure',
+        'sold',
+        'last_sold',
+        'forecast_error',
+        'forecast_on',
+    )

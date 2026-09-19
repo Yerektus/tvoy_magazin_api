@@ -18,6 +18,7 @@ from umag.models import (
     UmagSale,
     UmagSaleItem,
     UmagSalesSync,
+    UmagSoldProduct,
 )
 from umag.test_sales import SalesApi
 
@@ -168,6 +169,25 @@ class PlanningApiTests(APITestCase):
     def install(self):
         self.connect_umag()
         return self.client.post('/api/purchases/access/', {}, format='json')
+
+    def _sold(self, barcode, name, quantity, *, external_id=None, days_ago=0):
+        """Один чек в выбранном магазине — чтобы собрать копию продаж."""
+
+        sale = UmagSale.objects.create(
+            organization=self.user.organization,
+            store_id=17795,
+            external_id=external_id or barcode,
+            occurred_at=timezone.now() - timedelta(days=days_ago),
+        )
+        UmagSaleItem.objects.create(
+            sale=sale,
+            position=1,
+            barcode=barcode,
+            name=name,
+            measure='шт',
+            quantity=quantity,
+        )
+        return sale
 
     def test_stock_can_be_left_out_of_the_count(self):
         """Перед праздником полку набивают заново, не глядя на остаток."""
@@ -934,6 +954,106 @@ class PlanningApiTests(APITestCase):
             [item['name'] for item in sold.data['items']],
             ['Молоко', 'Айран'],
         )
+
+    def test_product_forecast_error_is_cached(self):
+        """Ошибку прогноза считаем один раз в день — список не гоняет модели повторно."""
+
+        self.install()
+        self._sold('111', 'Молоко', 2)
+        rebuild_store(self.user.organization, 17795)
+
+        first = self.client.get('/api/purchases/products/')
+        stored = UmagSoldProduct.objects.get()
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(stored.forecast_on, timezone.localdate())
+        self.assertEqual(
+            first.data['items'][0]['forecast_error'],
+            None
+            if stored.forecast_error is None
+            else format(stored.forecast_error, 'f'),
+        )
+
+        with patch('purchases.products.demand_forecast.for_products') as mocked:
+            second = self.client.get('/api/purchases/products/')
+
+        mocked.assert_not_called()
+        self.assertEqual(
+            second.data['items'][0]['forecast_error'],
+            first.data['items'][0]['forecast_error'],
+        )
+
+    def test_product_forecast_error_is_recomputed_when_sales_change(self):
+        """Новые чеки сбрасывают копию — иначе точность смотрит вчерашний ряд."""
+
+        self.install()
+        self._sold('111', 'Молоко', 2)
+        rebuild_store(self.user.organization, 17795)
+        self.client.get('/api/purchases/products/')
+
+        stored = UmagSoldProduct.objects.get()
+        self.assertIsNotNone(stored.forecast_on)
+
+        self._sold('111', 'Молоко', 1, external_id='2', days_ago=1)
+        rebuild_store(self.user.organization, 17795)
+        stored.refresh_from_db()
+
+        self.assertIsNone(stored.forecast_on)
+
+        with patch(
+            'purchases.products.demand_forecast.for_products',
+            wraps=forecast.for_products,
+        ) as mocked:
+            self.client.get('/api/purchases/products/')
+
+        mocked.assert_called_once()
+        stored.refresh_from_db()
+        self.assertEqual(stored.forecast_on, timezone.localdate())
+
+    def test_product_forecast_error_is_recomputed_next_day(self):
+        """На новый день ряд другой — вчерашнюю ошибку не показываем."""
+
+        self.install()
+        self._sold('111', 'Молоко', 2)
+        rebuild_store(self.user.organization, 17795)
+        self.client.get('/api/purchases/products/')
+
+        stored = UmagSoldProduct.objects.get()
+        stored.forecast_on = timezone.localdate() - timedelta(days=1)
+        stored.save(update_fields=('forecast_on',))
+
+        with patch(
+            'purchases.products.demand_forecast.for_products',
+            wraps=forecast.for_products,
+        ) as mocked:
+            self.client.get('/api/purchases/products/')
+
+        mocked.assert_called_once()
+        stored.refresh_from_db()
+        self.assertEqual(stored.forecast_on, timezone.localdate())
+
+    def test_products_skip_forecast_while_sales_sync(self):
+        """Пока чеки качаются, список не считает точность — опрос и так частый."""
+
+        self.install()
+        self._sold('111', 'Молоко', 2)
+        rebuild_store(self.user.organization, 17795)
+        UmagSalesSync.objects.update_or_create(
+            organization=self.user.organization,
+            store_id=17795,
+            defaults={
+                'status': UmagSalesSync.Status.SYNCING,
+                'heartbeat_at': timezone.now(),
+                'error': '',
+            },
+        )
+
+        with patch('purchases.products.demand_forecast.for_products') as mocked:
+            response = self.client.get('/api/purchases/products/')
+
+        mocked.assert_not_called()
+        self.assertEqual(response.data['status'], 'syncing')
+        self.assertIsNone(response.data['items'][0]['forecast_error'])
 
     def test_products_take_measure_from_catalog_when_sale_lost_it(self):
         """В чеке ноль — штуки, а `0 or ''` его стирал. Берём единицу из номенклатуры."""

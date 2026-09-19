@@ -327,7 +327,7 @@ class UmagDailyDemand(models.Model):
 
 
 class UmagSoldProduct(models.Model):
-    """Товар, который продавался: сумма и последняя продажа для списка."""
+    """Товар, который продавался: сумма, последняя продажа и точность для списка."""
 
     organization = models.ForeignKey(
         'accounts.Organization',
@@ -341,6 +341,16 @@ class UmagSoldProduct(models.Model):
     measure = models.CharField('единица', max_length=32, blank=True)
     sold = models.DecimalField('продано', max_digits=14, decimal_places=3, default=0)
     last_sold = models.DateTimeField('последняя продажа', null=True, blank=True)
+    # Как у планировки: список не гоняет модели на каждый GET. Пустая дата —
+    # ещё не считали или спрос обновился; дата не сегодня — ряд устарел.
+    forecast_error = models.DecimalField(
+        'ошибка прогноза',
+        max_digits=8,
+        decimal_places=3,
+        null=True,
+        blank=True,
+    )
+    forecast_on = models.DateField('прогноз на дату', null=True, blank=True)
 
     class Meta:
         verbose_name = 'проданный товар UMAG'
