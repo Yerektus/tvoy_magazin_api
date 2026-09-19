@@ -75,7 +75,9 @@ class ChatView(ChatMixin, APIView):
         # Последние реплики берём с конца через обратный порядок: срез с
         # отрицательным индексом queryset не умеет.
         recent = reversed(list(chat.messages.order_by('-created_at', '-id')[:HISTORY]))
-        history = [{'role': message.role, 'content': message.text} for message in recent]
+        history = [
+            {'role': message.role, 'content': _spoken(message)} for message in recent
+        ]
 
         # Фото уходит только со своим вопросом. Слать его снова в каждом
         # следующем — платить за одну и ту же картинку весь разговор.
@@ -92,6 +94,7 @@ class ChatView(ChatMixin, APIView):
                 request.user,
                 history,
                 think=form.validated_data['think'],
+                page=form.validated_data.get('page'),
             )
         except OpenRouterError as error:
             # Вопрос из переписки убираем. Пока он в ней оставался, разговор
@@ -162,3 +165,16 @@ class ChatDetailView(ChatMixin, APIView):
         get_object_or_404(self.chats(), pk=pk).delete()
 
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def _spoken(message):
+    """Текст реплики, который уходит модели в следующем вопросе.
+
+    У ответа аналитика блок кнопок срезаем: это оформление экрана, а не часть
+    разговора. Оставить его — модель начнёт копировать прошлые вопросы.
+    """
+
+    if message.role != Message.Role.ASSISTANT:
+        return message.text
+
+    return agent.split_suggestions(message.text)[0]

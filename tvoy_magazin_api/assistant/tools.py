@@ -182,24 +182,43 @@ def invoice(user, id=None) -> dict:
     }
 
 
-def plan(user) -> dict:
-    """Последний план закупа: что заканчивается и сколько дозаказать."""
+def plan(user, id=None) -> dict:
+    """План закупа: что заканчивается и сколько дозаказать.
 
-    row = (
-        PurchasePlan.objects.filter(
-            user__organization=user.organization_id,
-            status=PurchasePlan.Status.READY,
-        )
-        .order_by('-built_at')
-        .first()
-    )
+    Без id — последняя готовая планировка организации. С id — та, которую
+    человек открыл, даже если она ещё считается.
+    """
 
-    if row is None:
-        return {'ошибка': 'План закупа ещё не считали'}
+    rows = PurchasePlan.objects.filter(user__organization=user.organization_id)
+
+    if id is not None:
+        try:
+            pk = int(id)
+        except (TypeError, ValueError):
+            return {'ошибка': 'Такой планировки нет'}
+
+        row = rows.filter(pk=pk).first() if pk > 0 else None
+
+        if row is None:
+            return {'ошибка': 'Такой планировки нет'}
+    else:
+        row = rows.filter(status=PurchasePlan.Status.READY).order_by('-built_at').first()
+
+        if row is None:
+            return {'ошибка': 'План закупа ещё не считали'}
+
+    if row.status != PurchasePlan.Status.READY:
+        return {
+            'id': row.pk,
+            'название': row.name or None,
+            'статус': row.get_status_display(),
+            'ошибка': row.error or None,
+        }
 
     items = row.items.order_by('position')[:MAX_ROWS]
 
     return {
+        'id': row.pk,
         'магазин': row.store_name or None,
         'посчитан': row.built_at.strftime('%d.%m.%Y') if row.built_at else None,
         'продажи_за_дней': row.days,
@@ -329,9 +348,18 @@ SCHEMAS = [
         'type': 'function',
         'function': {
             'name': 'plan',
-            'description': 'Последний план закупа: что заканчивается, сколько дозаказать '
-            'и на какую сумму.',
-            'parameters': {'type': 'object', 'properties': {}},
+            'description': 'План закупа: что заканчивается, сколько дозаказать '
+            'и на какую сумму. Без id — последняя готовая; id берут со страницы '
+            'планировки, которую человек открыл.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'id': {
+                        'type': 'integer',
+                        'description': 'id планировки, если человек на её странице',
+                    },
+                },
+            },
         },
     },
     {

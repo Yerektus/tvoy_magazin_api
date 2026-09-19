@@ -259,13 +259,12 @@ OPENROUTER_VISION_MODEL = os.environ.get(
     'OPENROUTER_VISION_MODEL',
     'openai/gpt-5.6-luna',
 )
-# Аналитик в чате. Нужна была не самая умная модель, а такая, которая умеет
-# всё сразу: звать функции, смотреть на фото и, когда попросят, думать перед
-# ответом. Дешевле неё среди умеющих это ничего нет — три цента за миллион
-# токенов на входе, тринадцать на выходе, миллион токенов контекста.
+# Аналитик в чате. Нужна модель, которая умеет всё сразу: звать функции,
+# смотреть на фото и, когда попросят, думать перед ответом. DeepSeek V4.1 Flash
+# это умеет и отвечает быстро — на OpenRouter это deepseek/deepseek-v4.1-flash.
 OPENROUTER_ASSISTANT_MODEL = os.environ.get(
     'OPENROUTER_ASSISTANT_MODEL',
-    'qwen/qwen3.7-flash',
+    'deepseek/deepseek-v4.1-flash',
 )
 
 OPENROUTER_TIMEOUT = int(os.environ.get('OPENROUTER_TIMEOUT', '120'))

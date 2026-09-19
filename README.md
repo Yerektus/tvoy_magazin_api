@@ -56,6 +56,7 @@ uv run python tvoy_magazin_api/manage.py parse_invoice ~/Downloads/nakladnaya.jp
 
 | `OPENROUTER_API_KEY` | — | Ключ OpenRouter, без него разбор падает с ошибкой |
 | `OPENROUTER_VISION_MODEL` | `openai/gpt-5.6-luna` | Модель распознавания накладной с фото |
+| `OPENROUTER_ASSISTANT_MODEL` | `deepseek/deepseek-v4.1-flash` | Модель аналитика в чате |
 | `OPENROUTER_MATCH_MODEL` | `deepseek/deepseek-v4-flash` | Модель сопоставления позиций и поставщиков |
 | `OPENROUTER_FALLBACK_MODELS` | — | Запасные модели через запятую, если основная занята |
 | `OPENROUTER_TIMEOUT` | `120` | Таймаут запроса к модели, секунды |

@@ -1,6 +1,7 @@
 from decimal import Decimal
 from unittest.mock import patch
 
+from django.conf import settings
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.utils import timezone
@@ -10,6 +11,7 @@ from accounts.tests import make_organization, make_user
 from invoices.models import Invoice, InvoiceLine
 from invoices.tests import sideways_jpeg
 from purchases import planner
+from purchases.models import PurchasePlan, PurchasePlanItem
 from purchases.tests import FakeReport, product as sold
 
 from umag.client import UmagError
@@ -115,6 +117,56 @@ class ToolsTests(APITestCase):
         self.assertLess(tools.since(0), now)
         self.assertLess(tools.since('вчера'), now)
 
+    def test_plan_by_id_is_own_organization_only(self):
+        """Даже зная id чужой планировки, аналитик её не покажет."""
+
+        now = timezone.now()
+        mine = PurchasePlan.objects.create(
+            user=self.user,
+            status=PurchasePlan.Status.READY,
+            built_at=now,
+            name='Мой план',
+            items_total=1,
+            total_cost=Decimal('100.00'),
+        )
+        PurchasePlanItem.objects.create(
+            plan=mine,
+            position=1,
+            name='Молоко',
+            sold=1,
+            stock=0,
+            per_day=1,
+            suggested=7,
+        )
+        theirs = PurchasePlan.objects.create(
+            user=self.stranger,
+            status=PurchasePlan.Status.READY,
+            built_at=now,
+            name='Чужой план',
+        )
+
+        found = tools.plan(self.user, id=mine.pk)
+
+        self.assertEqual(found['id'], mine.pk)
+        self.assertEqual(found['первые_позиции'][0]['товар'], 'Молоко')
+        self.assertEqual(
+            tools.plan(self.user, id=theirs.pk),
+            {'ошибка': 'Такой планировки нет'},
+        )
+
+    def test_unfinished_plan_by_id_says_it_is_not_ready(self):
+        row = PurchasePlan.objects.create(
+            user=self.user,
+            status=PurchasePlan.Status.BUILDING,
+            name='Считается',
+        )
+
+        found = tools.plan(self.user, id=row.pk)
+
+        self.assertEqual(found['id'], row.pk)
+        self.assertEqual(found['статус'], 'Считается')
+        self.assertNotIn('первые_позиции', found)
+
 
 class AgentTests(APITestCase):
     """Цикл вызова функций: что модель может, а чего не может."""
@@ -179,11 +231,82 @@ class AgentTests(APITestCase):
         self.assertEqual(post.call_count, agent.MAX_STEPS)
         self.assertIn('Спросите', text)
 
+    def test_describe_page_points_to_the_open_invoice(self):
+        text = agent.describe_page({'title': 'Накладная', 'path': '/documents/12'})
+
+        self.assertIn('«Накладная»', text)
+        self.assertIn('id=12', text)
+        self.assertIn('invoice', text)
+
+    def test_describe_page_points_to_the_open_plan(self):
+        text = agent.describe_page(
+            {'title': 'Планировка', 'path': '/purchases/8?tab=all'}
+        )
+
+        self.assertIn('/purchases/8', text)
+        self.assertIn('id=8', text)
+        self.assertIn('plan', text)
+
+    def test_describe_page_ignores_foreign_urls(self):
+        self.assertEqual(agent.describe_page({'path': 'https://evil.example'}), '')
+        self.assertEqual(agent.describe_page({'path': '/../../etc'}), '')
+        self.assertEqual(agent.describe_page(None), '')
+
+    def test_page_hint_is_sent_to_the_model(self):
+        with patch('assistant.agent._post', return_value=answer('Ок')) as asked:
+            agent.reply(
+                self.user,
+                [{'role': 'user', 'content': 'Что тут?'}],
+                page={'title': 'Планирование закупов', 'path': '/purchases'},
+            )
+
+        messages = asked.call_args.args[0]['messages']
+
+        self.assertEqual(messages[1]['role'], 'system')
+        self.assertIn('Планирование закупов', messages[1]['content'])
+        self.assertIn('plan', messages[1]['content'])
+        self.assertEqual(messages[-1], {'role': 'user', 'content': 'Что тут?'})
+
+    def test_suggestion_block_is_cut_from_the_answer(self):
+        text, questions = agent.split_suggestions(
+            'Заканчивается молоко.\n\n<<<вопросы\nЧто ещё кончается?\nСколько его заказать?\n>>>\n'
+        )
+
+        self.assertEqual(text, 'Заканчивается молоко.')
+        self.assertEqual(questions, ['Что ещё кончается?', 'Сколько его заказать?'])
+
+    def test_answer_without_suggestions_stays_as_is(self):
+        text, questions = agent.split_suggestions('Просто ответ.')
+
+        self.assertEqual(text, 'Просто ответ.')
+        self.assertEqual(questions, [])
+
+    def test_suggestion_numbering_is_stripped_and_capped(self):
+        text, questions = agent.split_suggestions(
+            'Ок\n<<<вопросы\n1. Один\n- Два\n• Три\n4. Четыре\n>>>'
+        )
+
+        self.assertEqual(text, 'Ок')
+        self.assertEqual(questions, ['Один', 'Два', 'Три'])
+
+    def test_duplicate_suggestions_are_dropped(self):
+        _, questions = agent.split_suggestions(
+            'Ок\n<<<вопросы\nЧто заказать?\nчто заказать?\nИ ещё?\n>>>'
+        )
+
+        self.assertEqual(questions, ['Что заказать?', 'И ещё?'])
+
 
 class ChatApiTests(APITestCase):
     def setUp(self):
         self.user = make_user()
         self.client.force_authenticate(self.user)
+
+    def test_question_goes_to_the_assistant_model(self):
+        with patch('assistant.agent._post', return_value=answer('Ок')) as asked:
+            self.client.post('/api/assistant/chat/', {'text': 'Привет'}, format='json')
+
+        self.assertEqual(asked.call_args.args[0]['model'], settings.OPENROUTER_ASSISTANT_MODEL)
 
     def test_question_and_answer_are_saved(self):
         with patch('assistant.agent._post', return_value=answer('Всё хорошо.')):
@@ -194,6 +317,42 @@ class ChatApiTests(APITestCase):
 
         history = self.client.get('/api/assistant/chat/')
         self.assertEqual(len(history.data['messages']), 2)
+
+    def test_suggestions_come_apart_from_the_answer(self):
+        """Блок вопросов не попадает в текст реплики — из него делают кнопки."""
+
+        raw = (
+            'Молоко кончится завтра.\n\n'
+            '<<<вопросы\nСколько заказать?\nЧто ещё кончается?\n>>>'
+        )
+
+        with patch('assistant.agent._post', return_value=answer(raw)):
+            response = self.client.post(
+                '/api/assistant/chat/', {'text': 'Молоко?'}, format='json'
+            )
+
+        reply = response.data['messages'][1]
+
+        self.assertEqual(reply['text'], 'Молоко кончится завтра.')
+        self.assertEqual(reply['suggestions'], ['Сколько заказать?', 'Что ещё кончается?'])
+        self.assertEqual(response.data['messages'][0]['suggestions'], [])
+
+    def test_previous_suggestions_are_not_sent_back_to_the_model(self):
+        raw = 'Ок\n\n<<<вопросы\nЕщё?\n>>>'
+
+        with patch('assistant.agent._post', return_value=answer(raw)):
+            self.client.post('/api/assistant/chat/', {'text': 'Первый'}, format='json')
+
+        with patch('assistant.agent._post', return_value=answer('Да.')) as asked:
+            self.client.post('/api/assistant/chat/', {'text': 'Второй'}, format='json')
+
+        spoken = [
+            message.get('content') or ''
+            for message in asked.call_args.args[0]['messages']
+            if message['role'] != 'system'
+        ]
+
+        self.assertTrue(all('<<<вопросы' not in part for part in spoken if isinstance(part, str)))
 
     def test_unanswered_question_does_not_stay_in_the_chat(self):
         """Модель недоступна — вопрос не остаётся висеть без ответа.
@@ -398,6 +557,44 @@ class ChatApiTests(APITestCase):
             asked.call_args.args[0]['reasoning'],
             {'enabled': True, 'exclude': True},
         )
+
+    def test_page_tells_the_model_where_the_person_is(self):
+        """Страница уходит подсказкой модели, а не текстом вопроса в переписке."""
+
+        with patch('assistant.agent._post', return_value=answer('Ок')) as asked:
+            response = self.client.post(
+                '/api/assistant/chat/',
+                {
+                    'text': 'Что тут?',
+                    'page': {'title': 'Планирование закупов', 'path': '/purchases'},
+                },
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Message.objects.filter(role='user').last().text, 'Что тут?')
+
+        messages = asked.call_args.args[0]['messages']
+        self.assertEqual(messages[1]['role'], 'system')
+        self.assertIn('Планирование закупов', messages[1]['content'])
+        self.assertIn('/purchases', messages[1]['content'])
+        self.assertEqual(messages[-1]['content'], 'Что тут?')
+
+    def test_unknown_page_path_does_not_break_the_question(self):
+        with patch('assistant.agent._post', return_value=answer('Ок')) as asked:
+            response = self.client.post(
+                '/api/assistant/chat/',
+                {
+                    'text': 'Привет',
+                    'page': {'title': '', 'path': 'https://evil.example'},
+                },
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 201)
+        messages = asked.call_args.args[0]['messages']
+        self.assertEqual(messages[0]['role'], 'system')
+        self.assertEqual(messages[1]['role'], 'user')
 
     def test_chat_needs_authentication(self):
         self.client.force_authenticate(None)
