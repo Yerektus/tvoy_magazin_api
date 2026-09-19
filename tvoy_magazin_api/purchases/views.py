@@ -170,7 +170,11 @@ class SalesAnalyticsView(APIView):
         query.is_valid(raise_exception=True)
         return Response(
             SalesAnalyticsSerializer(
-                analytics.snapshot(_account(request.user), days=query.validated_data['days'])
+                analytics.snapshot(
+                    _account(request.user),
+                    start=query.validated_data['start'],
+                    end=query.validated_data['end'],
+                )
             ).data
         )
 

@@ -3,6 +3,7 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.test import SimpleTestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APITestCase
@@ -22,7 +23,7 @@ from umag.models import (
 )
 from umag.test_sales import SalesApi
 
-from . import forecast, planner
+from . import analytics, forecast, planner
 from .models import PurchasePlan, PurchasePlanItem
 
 User = get_user_model()
@@ -149,6 +150,55 @@ class PlannerMathTests(SimpleTestCase):
 
     def test_leap_day_shifts_to_february_28(self):
         self.assertEqual(forecast.shift_years(date(2024, 2, 29), 1), date(2023, 2, 28))
+
+
+class AnalyticsTurnoverTests(SimpleTestCase):
+    @patch('purchases.analytics.UmagClient')
+    def test_turnover_reads_report_sum_and_receipt_count(self, client_cls):
+        """Выручка минус возвраты, прибыль из маржи, средний чек из числа чеков."""
+
+        client_cls.return_value.get.side_effect = [
+            {
+                'sum': {
+                    'saleSellingAmount': 1000,
+                    'saleArrivalAmount': 700,
+                    'refundSellingAmount': 100,
+                    'refundArrivalAmount': 70,
+                    'marginAmount': 270,
+                }
+            },
+            {'count': 8, 'sales': []},
+        ]
+        account = type('Account', (), {'ready': True, 'store_id': 17795})()
+        today = date(2026, 9, 17)
+        totals = analytics._fetch_turnover(account, today, today)
+
+        self.assertEqual(totals['revenue'], Decimal('900.00'))
+        self.assertEqual(totals['profit'], Decimal('270.00'))
+        self.assertEqual(totals['visitors'], 8)
+        self.assertEqual(totals['average_check'], Decimal('112.50'))
+
+    @patch('purchases.analytics.UmagClient')
+    def test_daily_revenue_reads_report_for_each_day(self, client_cls):
+        """Каждый день — свой запрос отчёта: в копии нет цен."""
+
+        cache.clear()
+        amounts = {
+            analytics._range_millis(date(2026, 9, 16), date(2026, 9, 16))[0]: (1000, 100),
+            analytics._range_millis(date(2026, 9, 17), date(2026, 9, 17))[0]: (400, 0),
+        }
+
+        def report(path, **params):
+            selling, refund = amounts[params['fromTime']]
+            return {'sum': {'saleSellingAmount': selling, 'refundSellingAmount': refund}}
+
+        client_cls.return_value.get.side_effect = report
+        account = type('Account', (), {'ready': True, 'store_id': 17795})()
+        days = analytics._daily_revenue(account, date(2026, 9, 16), date(2026, 9, 17))
+
+        self.assertEqual(days[date(2026, 9, 16)], Decimal('900.00'))
+        self.assertEqual(days[date(2026, 9, 17)], Decimal('400.00'))
+        self.assertEqual(client_cls.return_value.get.call_count, 2)
 
 
 @override_settings(INVOICE_PARSE_INLINE=True)
@@ -955,6 +1005,49 @@ class PlanningApiTests(APITestCase):
             ['Молоко', 'Айран'],
         )
 
+    def test_products_filter_by_several_accuracy_levels(self):
+        """Точность в фильтре можно сложить: высокая и «нет данных» сразу."""
+
+        self.install()
+        self._sold('111', 'Хлеб', 1)
+        self._sold('222', 'Молоко', 1)
+        self._sold('333', 'Айран', 1)
+        self._sold('444', 'Сок', 1)
+        rebuild_store(self.user.organization, 17795)
+
+        today = timezone.localdate()
+        UmagSoldProduct.objects.filter(barcode='111').update(
+            forecast_error=Decimal('0.10'),
+            forecast_on=today,
+        )
+        UmagSoldProduct.objects.filter(barcode='222').update(
+            forecast_error=Decimal('0.40'),
+            forecast_on=today,
+        )
+        UmagSoldProduct.objects.filter(barcode='333').update(
+            forecast_error=Decimal('0.80'),
+            forecast_on=today,
+        )
+        UmagSoldProduct.objects.filter(barcode='444').update(
+            forecast_error=None,
+            forecast_on=today,
+        )
+
+        high = self.client.get('/api/purchases/products/', {'accuracy': 'high'})
+        self.assertEqual([item['name'] for item in high.data['items']], ['Хлеб'])
+
+        mixed = self.client.get(
+            '/api/purchases/products/',
+            {'accuracy': 'high,none', 'sort': 'name', 'order': 'asc'},
+        )
+        self.assertEqual(
+            [item['name'] for item in mixed.data['items']],
+            ['Сок', 'Хлеб'],
+        )
+
+        bad = self.client.get('/api/purchases/products/', {'accuracy': 'high,unknown'})
+        self.assertEqual(bad.status_code, 400)
+
     def test_product_forecast_error_is_cached(self):
         """Ошибку прогноза считаем один раз в день — список не гоняет модели повторно."""
 
@@ -992,6 +1085,7 @@ class PlanningApiTests(APITestCase):
         self.client.get('/api/purchases/products/')
 
         stored = UmagSoldProduct.objects.get()
+        cached = stored.forecast_error
         self.assertIsNotNone(stored.forecast_on)
 
         self._sold('111', 'Молоко', 1, external_id='2', days_ago=1)
@@ -999,6 +1093,7 @@ class PlanningApiTests(APITestCase):
         stored.refresh_from_db()
 
         self.assertIsNone(stored.forecast_on)
+        self.assertEqual(stored.forecast_error, cached)
 
         with patch(
             'purchases.products.demand_forecast.for_products',
@@ -1033,11 +1128,13 @@ class PlanningApiTests(APITestCase):
         self.assertEqual(stored.forecast_on, timezone.localdate())
 
     def test_products_skip_forecast_while_sales_sync(self):
-        """Пока чеки качаются, список не считает точность — опрос и так частый."""
+        """Пока чеки качаются, модели не гоняем — но последнюю точность не прячем."""
 
         self.install()
         self._sold('111', 'Молоко', 2)
         rebuild_store(self.user.organization, 17795)
+        first = self.client.get('/api/purchases/products/')
+        stored = UmagSoldProduct.objects.get()
         UmagSalesSync.objects.update_or_create(
             organization=self.user.organization,
             store_id=17795,
@@ -1047,13 +1144,18 @@ class PlanningApiTests(APITestCase):
                 'error': '',
             },
         )
+        stored.forecast_on = None
+        stored.save(update_fields=('forecast_on',))
 
         with patch('purchases.products.demand_forecast.for_products') as mocked:
             response = self.client.get('/api/purchases/products/')
 
         mocked.assert_not_called()
         self.assertEqual(response.data['status'], 'syncing')
-        self.assertIsNone(response.data['items'][0]['forecast_error'])
+        self.assertEqual(
+            response.data['items'][0]['forecast_error'],
+            first.data['items'][0]['forecast_error'],
+        )
 
     def test_products_take_measure_from_catalog_when_sale_lost_it(self):
         """В чеке ноль — штуки, а `0 or ''` его стирал. Берём единицу из номенклатуры."""
@@ -1277,25 +1379,123 @@ class PlanningApiTests(APITestCase):
         )
         rebuild_store(organization, 17795)
 
-        response = self.client.get('/api/purchases/analytics/', {'days': 7})
-        data = response.data
+        totals = {
+            'revenue': Decimal('10000.00'),
+            'profit': Decimal('3000.00'),
+            'visitors': 40,
+            'average_check': Decimal('250.00'),
+        }
+
+        with (
+            patch('purchases.analytics._fetch_turnover', return_value=totals),
+            patch('purchases.analytics._daily_revenue', side_effect=_fixed_daily_revenue),
+        ):
+            response = self.client.get('/api/purchases/analytics/', {'days': 7})
+            data = response.data
+
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(data['has_sales'])
+            self.assertEqual(data['days'], 7)
+            self.assertEqual(data['sku_count'], 2)
+            self.assertEqual(data['sold'], '17.000')
+            self.assertEqual(data['promo_share'], '0.294')
+            self.assertEqual(data['trend'], '-0.150')
+            self.assertEqual(data['revenue'], '10000.00')
+            self.assertEqual(data['profit'], '3000.00')
+            self.assertEqual(data['visitors'], 40)
+            self.assertEqual(data['average_check'], '250.00')
+            self.assertEqual(len(data['history']), 7)
+            self.assertTrue(all(row['revenue'] == '100.00' for row in data['history']))
+            self.assertEqual(len(data['weekdays']), 7)
+            self.assertEqual(len(data['hours']), 24)
+            self.assertEqual(data['hours'][12]['sold'], '17.000')
+            self.assertEqual(
+                {row['name']: row['sold'] for row in data['categories']},
+                {'Молочные': '15.000', 'Выпечка': '2.000'},
+            )
+
+            empty = self.client.get('/api/purchases/analytics/', {'days': 400})
+            self.assertEqual(empty.status_code, 400)
+
+            today = timezone.localdate()
+            recent = self.client.get(
+                '/api/purchases/analytics/',
+                {
+                    'start': (today - timedelta(days=1)).isoformat(),
+                    'end': today.isoformat(),
+                },
+            )
+
+        self.assertEqual(recent.status_code, 200)
+        self.assertEqual(recent.data['days'], 2)
+        self.assertEqual(len(recent.data['history']), 2)
+        self.assertEqual(recent.data['sold'], '12.000')
+
+    def test_sales_analytics_groups_hours_from_receipts(self):
+        """Утренний и вечерний чек попадают в свой столбец, возврат снимает час продажи."""
+
+        self.install()
+        organization = self.user.organization
+        morning = UmagSale.objects.create(
+            organization=organization,
+            store_id=17795,
+            external_id='morning',
+            occurred_at=_at(1, 8),
+        )
+        UmagSaleItem.objects.create(
+            sale=morning,
+            position=1,
+            barcode='111',
+            name='Молоко',
+            measure='шт',
+            quantity=4,
+        )
+        evening = UmagSale.objects.create(
+            organization=organization,
+            store_id=17795,
+            external_id='evening',
+            occurred_at=_at(1, 21),
+        )
+        UmagSaleItem.objects.create(
+            sale=evening,
+            position=1,
+            barcode='111',
+            name='Молоко',
+            measure='шт',
+            quantity=6,
+        )
+        refund = UmagRefund.objects.create(
+            organization=organization,
+            store_id=17795,
+            external_id='morning-back',
+            sale=morning,
+            sale_occurred_at=morning.occurred_at,
+            occurred_at=_at(0, 10),
+        )
+        UmagRefundItem.objects.create(
+            refund=refund,
+            position=1,
+            barcode='111',
+            quantity=1,
+        )
+        rebuild_store(organization, 17795)
+
+        with patch(
+            'purchases.analytics._fetch_turnover',
+            return_value={
+                'revenue': None,
+                'profit': None,
+                'visitors': None,
+                'average_check': None,
+            },
+        ), patch('purchases.analytics._daily_revenue', side_effect=_fixed_daily_revenue):
+            response = self.client.get('/api/purchases/analytics/', {'days': 7})
 
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(data['has_sales'])
-        self.assertEqual(data['days'], 7)
-        self.assertEqual(data['sku_count'], 2)
-        self.assertEqual(data['sold'], '17.000')
-        self.assertEqual(data['promo_share'], '0.294')
-        self.assertEqual(data['trend'], '-0.150')
-        self.assertEqual(len(data['history']), 7)
-        self.assertEqual(len(data['weekdays']), 7)
-        self.assertEqual(
-            {row['name']: row['sold'] for row in data['categories']},
-            {'Молочные': '15.000', 'Выпечка': '2.000'},
-        )
-
-        empty = self.client.get('/api/purchases/analytics/', {'days': 3})
-        self.assertEqual(empty.status_code, 400)
+        hours = {row['hour']: row['sold'] for row in response.data['hours']}
+        self.assertEqual(hours[8], '3.000')
+        self.assertEqual(hours[21], '6.000')
+        self.assertEqual(hours[12], '0.000')
 
     def test_sales_analytics_is_empty_without_store(self):
         response = self.client.get('/api/purchases/analytics/')
@@ -1305,13 +1505,34 @@ class PlanningApiTests(APITestCase):
         self.assertEqual(response.data['sku_count'], 0)
         self.assertEqual(len(response.data['history']), 30)
         self.assertEqual(len(response.data['weekdays']), 7)
+        self.assertEqual(len(response.data['hours']), 24)
+        self.assertTrue(all(row['sold'] == '0.000' for row in response.data['hours']))
+
+
+def _fixed_daily_revenue(account, start, end):
+    """Заглушка выручки: по 100 ₸ на каждый день, без похода в UMAG."""
+
+    days = {}
+    day = start
+
+    while day <= end:
+        days[day] = Decimal('100.00')
+        day += timedelta(days=1)
+
+    return days
 
 
 def _noon(days_ago: int):
     """Полдень выбранного дня в Алматы — продажа точно попадает в нужную дату."""
 
+    return _at(days_ago, 12)
+
+
+def _at(days_ago: int, hour: int):
+    """Выбранный час в Алматы — чтобы столбец «по времени» не съезжал из‑за UTC."""
+
     from zoneinfo import ZoneInfo
 
     day = timezone.localdate() - timedelta(days=days_ago)
-    return datetime.combine(day, time(12, 0), tzinfo=ZoneInfo('Asia/Almaty'))
+    return datetime.combine(day, time(hour, 0), tzinfo=ZoneInfo('Asia/Almaty'))
 

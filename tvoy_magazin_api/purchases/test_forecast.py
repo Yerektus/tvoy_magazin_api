@@ -68,10 +68,33 @@ class ForecastModelTests(SimpleTestCase):
     def test_forced_average_stays_flat(self):
         values = ([12, 2, 2, 2, 2, 2, 2] * 20) + [12, 2, 2, 2, 2, 2, 2]
         result = forecast.predict(values, 14, model='average')
+        daily = [int(value) for value in result.daily]
 
         self.assertEqual(result.model, 'average')
-        self.assertEqual(len(set(result.daily)), 1)
+        self.assertLessEqual(max(daily) - min(daily), 1)
         self.assertGreater(result.quantity, 0)
+
+    def test_piece_forecast_uses_whole_units(self):
+        result = forecast.predict([1, 0, 0, 1, 0, 0, 0] * 8, 14, model='average')
+
+        for value in result.daily:
+            self.assertEqual(value, value.to_integral_value())
+        self.assertGreaterEqual(int(result.quantity), 1)
+
+    def test_weighted_forecast_keeps_fractions(self):
+        result = forecast.predict(
+            [0.25, 0.5, 0.25, 0.4, 0.3, 0.2, 0.35] * 4,
+            7,
+            model='average',
+        )
+
+        self.assertTrue(any(value != value.to_integral_value() for value in result.daily))
+
+    def test_whole_days_keeps_total(self):
+        daily = forecast._whole_days([0.08] * 14)
+
+        self.assertEqual(sum(daily), 2)
+        self.assertEqual(sorted(set(daily)), [0.0, 1.0])
 
     def test_full_year_history_can_select_annual_seasonality(self):
         values = [

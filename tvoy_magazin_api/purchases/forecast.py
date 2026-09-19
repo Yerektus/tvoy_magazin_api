@@ -14,7 +14,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from math import isfinite, sqrt
+from math import ceil, isfinite, sqrt
 from statistics import median
 
 import holidays
@@ -620,6 +620,9 @@ def _result(
         store_values,
         store_factor_cache,
     )
+    # Штуки не бывают «0,08 за день»: раскидываем спрос целыми по дням.
+    if _is_count(values):
+        adjusted = _whole_days(adjusted)
     demand = max(0.0, sum(adjusted))
     safety = min(
         SERVICE_LEVEL_Z * daily_mae * sqrt(horizon),
@@ -1876,3 +1879,38 @@ def _percentile(values: list[float], point: float) -> float:
 
 def _amount(value: float) -> Decimal:
     return Decimal(str(max(0.0, value))).quantize(THREE)
+
+
+def _is_count(values: list[float]) -> bool:
+    """История из целых — штучный товар, а не весовой."""
+
+    return bool(values) and all(abs(value - round(value)) < 1e-6 for value in values)
+
+
+def _whole_days(daily: list[float]) -> list[float]:
+    """Дробный спрос собираем в целые штуки, сумму округляем вверх."""
+
+    if not daily:
+        return daily
+
+    total = sum(max(0.0, value) for value in daily)
+    if total <= 0:
+        return [0.0 for _ in daily]
+
+    target = max(0, ceil(total - 1e-9))
+    whole = [max(0, int(value)) for value in daily]
+    leftover = target - sum(whole)
+    result = [float(value) for value in whole]
+    ranked = sorted(
+        range(len(daily)),
+        key=lambda index: (daily[index] - whole[index], daily[index]),
+        reverse=True,
+    )
+    step = 0
+
+    while leftover > 0 and ranked:
+        result[ranked[step % len(ranked)]] += 1.0
+        leftover -= 1
+        step += 1
+
+    return result

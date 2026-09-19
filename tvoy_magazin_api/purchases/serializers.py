@@ -1,3 +1,6 @@
+from datetime import timedelta
+
+from django.utils import timezone
 from rest_framework import serializers
 
 from .forecast import MODELS
@@ -6,6 +9,7 @@ from .models import ApprovedPurchase, ApprovedPurchaseItem, PurchasePlan, Purcha
 # Дольше двух месяцев считать бессмысленно: ассортимент за это время меняется.
 MAX_DAYS = 90
 MAX_HORIZON = 60
+ACCURACY_LEVELS = ('high', 'medium', 'low', 'none')
 
 
 class PurchasePlanItemSerializer(serializers.ModelSerializer):
@@ -137,12 +141,15 @@ class ProductsQuerySerializer(serializers.Serializer):
         allow_null=True,
         default=None,
     )
-    accuracy = serializers.ChoiceField(
-        choices=('', 'high', 'medium', 'low', 'none'),
-        required=False,
-        allow_blank=True,
-        default='',
-    )
+    accuracy = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate_accuracy(self, value: str) -> str:
+        parts = [part.strip() for part in value.split(',') if part.strip()]
+        unknown = [part for part in parts if part not in ACCURACY_LEVELS]
+        if unknown:
+            raise serializers.ValidationError('Выберите точность прогноза')
+
+        return ','.join(dict.fromkeys(parts))
 
 
 class ProductsSnapshotSerializer(serializers.Serializer):
@@ -194,23 +201,61 @@ class StoreProductDetailSerializer(serializers.Serializer):
 
 
 class AnalyticsQuerySerializer(serializers.Serializer):
-    """Длина окна сводки: как у карточки товара, не длиннее двух месяцев."""
+    """Период сводки: даты `start`/`end` или длина окна `days` от сегодня."""
 
+    start = serializers.DateField(required=False)
+    end = serializers.DateField(required=False)
     days = serializers.IntegerField(
-        min_value=7,
+        min_value=1,
         max_value=MAX_DAYS,
         required=False,
         default=30,
     )
 
+    def validate(self, attrs):
+        start = attrs.get('start')
+        end = attrs.get('end')
+        today = timezone.localdate()
+
+        if start is None and end is None:
+            days = attrs.get('days') or 30
+            attrs['start'] = today - timedelta(days=days - 1)
+            attrs['end'] = today
+            attrs['days'] = days
+            return attrs
+
+        if start is None or end is None:
+            raise serializers.ValidationError('Укажите начало и конец периода.')
+
+        if start > end:
+            start, end = end, start
+
+        if end > today:
+            raise serializers.ValidationError('Конец периода ещё не наступил.')
+
+        span = (end - start).days + 1
+        if span > MAX_DAYS:
+            raise serializers.ValidationError(f'Период не длиннее {MAX_DAYS} дней.')
+
+        attrs['start'] = start
+        attrs['end'] = end
+        attrs['days'] = span
+        return attrs
+
 
 class AnalyticsDaySerializer(serializers.Serializer):
     date = serializers.DateField()
     sold = serializers.DecimalField(max_digits=14, decimal_places=3)
+    revenue = serializers.DecimalField(max_digits=16, decimal_places=2, allow_null=True)
 
 
 class AnalyticsWeekdaySerializer(serializers.Serializer):
     weekday = serializers.IntegerField()
+    sold = serializers.DecimalField(max_digits=14, decimal_places=3)
+
+
+class AnalyticsHourSerializer(serializers.Serializer):
+    hour = serializers.IntegerField()
     sold = serializers.DecimalField(max_digits=14, decimal_places=3)
 
 
@@ -221,7 +266,7 @@ class AnalyticsCategorySerializer(serializers.Serializer):
 
 
 class SalesAnalyticsSerializer(serializers.Serializer):
-    """Сводка продаж магазина: итоги периода, график и категории."""
+    """Сводка продаж магазина: итоги периода, графики и категории."""
 
     status = serializers.CharField()
     synced_at = serializers.DateTimeField(allow_null=True)
@@ -236,8 +281,13 @@ class SalesAnalyticsSerializer(serializers.Serializer):
     active_days = serializers.IntegerField()
     promo_share = serializers.DecimalField(max_digits=8, decimal_places=3, allow_null=True)
     trend = serializers.DecimalField(max_digits=8, decimal_places=3, allow_null=True)
+    revenue = serializers.DecimalField(max_digits=16, decimal_places=2, allow_null=True)
+    profit = serializers.DecimalField(max_digits=16, decimal_places=2, allow_null=True)
+    visitors = serializers.IntegerField(allow_null=True)
+    average_check = serializers.DecimalField(max_digits=16, decimal_places=2, allow_null=True)
     history = AnalyticsDaySerializer(many=True)
     weekdays = AnalyticsWeekdaySerializer(many=True)
+    hours = AnalyticsHourSerializer(many=True)
     categories = AnalyticsCategorySerializer(many=True)
 
 

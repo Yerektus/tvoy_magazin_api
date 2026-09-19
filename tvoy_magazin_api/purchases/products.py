@@ -73,8 +73,8 @@ def snapshot(
     if state is not None:
         recover_stale_sync(state, organization, store_id)
         state.refresh_from_db()
-    # Пока чеки качаются, спрос ещё прыгает — точность после выгрузки
-    # пересчитается сама. Иначе опрос списка гоняет модели каждые две секунды.
+    # Пока чеки качаются, модели не гоняем: опрос каждые две секунды.
+    # Последнюю точность из копии всё равно отдаём — иначе колонка гаснет.
     forecast = state is None or state.status != UmagSalesSync.Status.SYNCING
     items, total, page = catalog(
         organization,
@@ -189,6 +189,7 @@ def catalog(
     needle = q.strip()
     code = barcode.strip()
     accuracy = (accuracy or '').strip()
+    levels = {part for part in accuracy.split(',') if part in ACCURACY_RANK}
 
     if needle:
         rows = rows.filter(name__icontains=needle)
@@ -210,7 +211,7 @@ def catalog(
 
     field = SORT_FIELDS.get(sort, 'sold')
     descending = order != 'asc'
-    by_accuracy = sort == 'accuracy' or bool(accuracy)
+    by_accuracy = sort == 'accuracy' or bool(levels)
 
     if field == 'name':
         key = Lower('name')
@@ -222,13 +223,13 @@ def catalog(
 
     if by_accuracy:
         listed = list(rows)
-        errors = _errors_for(organization, store_id, listed) if forecast else {}
+        errors = _errors_for(organization, store_id, listed, compute=forecast)
 
-        if accuracy:
+        if levels:
             listed = [
                 row
                 for row in listed
-                if _accuracy_level(errors.get(row.barcode)) == accuracy
+                if _accuracy_level(errors.get(row.barcode)) in levels
             ]
 
         if sort == 'accuracy':
@@ -256,7 +257,7 @@ def catalog(
     page = min(max(page, 1), pages)
     offset = (page - 1) * page_size
     page_rows = list(rows[offset : offset + page_size])
-    errors = _errors_for(organization, store_id, page_rows) if forecast else {}
+    errors = _errors_for(organization, store_id, page_rows, compute=forecast)
 
     return _as_items(store_id, page_rows, errors), total, page
 
@@ -439,18 +440,22 @@ def _as_items(store_id: int, rows: list, errors: dict | None = None) -> list[dic
     ]
 
 
-def _errors_for(organization, store_id: int, rows: list) -> dict:
+def _errors_for(organization, store_id: int, rows: list, *, compute: bool = True) -> dict:
     """Ошибка прогноза для списка — как у «Авто» на карточке.
 
     Сначала те же быстрые модели, что у планировки. Если точность низкая,
     Holt/ETS поднимают оценку, иначе в таблице «Низкая», а на карточке «Средняя».
 
     Готовый результат лежит на `UmagSoldProduct`: пока спрос не пересчитан
-    и календарный день тот же, модели второй раз не трогаем.
+    и календарный день тот же, модели второй раз не трогаем. Во время выгрузки
+    считаем только копию — без моделей, даже если дата уже сброшена.
     """
 
     if not rows:
         return {}
+
+    if not compute:
+        return {row.barcode: row.forecast_error for row in rows}
 
     today = timezone.localdate()
     errors = {}
