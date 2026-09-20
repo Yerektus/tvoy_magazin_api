@@ -1,3 +1,4 @@
+from django.core.files.base import ContentFile
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
@@ -90,11 +91,13 @@ class ChatView(ChatMixin, APIView):
             )
 
         try:
+            files = []
             text, cost = agent.reply(
                 request.user,
                 history,
                 think=form.validated_data['think'],
                 page=form.validated_data.get('page'),
+                files=files,
             )
         except OpenRouterError as error:
             # Вопрос из переписки убираем. Пока он в ней оставался, разговор
@@ -120,6 +123,11 @@ class ChatView(ChatMixin, APIView):
             text=text,
             cost=cost,
         )
+
+        if files:
+            attached = files[-1]
+            answer.file_name = attached.name[:120]
+            answer.file.save(attached.name, ContentFile(attached.content), save=True)
 
         # Переписка всплывает в истории наверх: `auto_now` считает время не по
         # репликам, а по сохранению самой переписки.

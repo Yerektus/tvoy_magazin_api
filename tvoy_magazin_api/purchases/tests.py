@@ -1225,6 +1225,7 @@ class PlanningApiTests(APITestCase):
         self.assertLessEqual(len(response.data['history']), 14)
         self.assertIsNotNone(response.data['forecast'])
         self.assertEqual(len(response.data['forecast']['series']), 7)
+        self.assertEqual(len(response.data['forecast']['fitted']), len(response.data['history']))
         self.assertGreater(Decimal(response.data['forecast']['quantity']), 0)
         self.assertGreater(
             max(Decimal(row['sold']) for row in response.data['history']),

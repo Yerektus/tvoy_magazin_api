@@ -1,10 +1,19 @@
+import uuid
+
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 
 #: Длина названия переписки в истории. Дальше строка всё равно не влезает в
 #: экран телефона и обрезается многоточием уже на нём.
 TITLE = 80
+
+
+def report_path(instance, filename):
+    """Кладём отчёт под случайным именем: ссылку на файл угадать нельзя."""
+
+    return f'assistant/files/{timezone.now():%Y/%m}/{uuid.uuid4().hex}.xlsx'
 
 
 class Conversation(models.Model):
@@ -79,6 +88,11 @@ class Message(models.Model):
     # один раз — в том запросе, где его прикрепили; дальше в переписке лежит
     # ради человека, чтобы он видел, о чём спрашивал.
     image = models.FileField('фото', upload_to='assistant/%Y/%m', blank=True)
+
+    # Excel-отчёт к ответу. Имя для экрана держим отдельно: на диске файл
+    # лежит под случайным именем, чтобы ссылку нельзя было угадать.
+    file = models.FileField('файл', upload_to=report_path, blank=True)
+    file_name = models.CharField('имя файла', max_length=120, blank=True)
 
     # Сколько стоил ответ. У реплик человека пусто.
     cost = models.DecimalField(

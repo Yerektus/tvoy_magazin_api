@@ -14,13 +14,15 @@
 
 from datetime import timedelta
 
+from django.conf import settings
 from django.db.models import Avg, Count, Q, Sum
 from django.utils import timezone
 
 from invoices.models import Invoice, InvoiceLine
+from invoices.openrouter import OpenRouterError, _post
 from purchases.models import PurchasePlan
 
-from . import cabinet
+from . import cabinet, export
 
 #: Больше строк за раз не отдаём никогда — ни по просьбе модели, ни случайно.
 MAX_ROWS = 50
@@ -262,6 +264,77 @@ def parsing(user, days=30) -> dict:
     }
 
 
+#: Длиннее не ищем: это название товара или короткий вопрос, не сочинение.
+WEB_QUERY = 200
+
+
+def search_web(user, query='') -> dict:
+    """Публичный поиск: состав, бренд, что это за товар. Не цифры магазина."""
+
+    del user
+    text = str(query or '').strip()[:WEB_QUERY]
+
+    if not text:
+        return {'ошибка': 'Пустой запрос'}
+
+    if not settings.OPENROUTER_API_KEY:
+        return {'ошибка': 'Поиск в интернете не настроен'}
+
+    payload = {
+        'model': settings.OPENROUTER_ASSISTANT_MODEL,
+        'temperature': 0,
+        'max_tokens': 500,
+        'plugins': [{'id': 'web', 'max_results': 5}],
+        'messages': [
+            {
+                'role': 'user',
+                'content': (
+                    'Найди в интернете факты по запросу и перескажи коротко. '
+                    'Если ничего нет — так и скажи. Запрос: '
+                    + text
+                ),
+            }
+        ],
+    }
+
+    try:
+        body = _post(payload, settings.OPENROUTER_API_KEY)
+    except OpenRouterError as error:
+        return {'ошибка': f'Поиск недоступен: {error}'}
+
+    try:
+        message = body['choices'][0]['message']
+    except (KeyError, IndexError, TypeError):
+        return {'ошибка': 'Поиск ничего не вернул'}
+
+    found = (message.get('content') or '').strip()
+    sources = _web_sources(message)
+
+    if not found and not sources:
+        return {'запрос': text, 'результаты': [], 'комментарий': 'Ничего не нашлось'}
+
+    return {'запрос': text, 'найдено': found, 'источники': sources}
+
+
+def _web_sources(message: dict) -> list[dict]:
+    """Ссылки, которые OpenRouter приложил к ответу поиска."""
+
+    sources = []
+
+    for item in message.get('annotations') or []:
+        if not isinstance(item, dict):
+            continue
+
+        citation = item.get('url_citation') if isinstance(item.get('url_citation'), dict) else item
+        url = str(citation.get('url') or '')[:300]
+        title = str(citation.get('title') or '')[:160]
+
+        if url:
+            sources.append({'название': title or url, 'url': url})
+
+    return sources[:8]
+
+
 def _money(value):
     return None if value is None else round(float(value), 2)
 
@@ -374,6 +447,49 @@ SCHEMAS = [
             },
         },
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'make_report',
+            'description': 'Собрать Excel-отчёт и положить файл в чат. Звать, когда '
+            'просят отчёт, выгрузку, Excel или файл. kind: sales — продажи '
+            'и остатки, invoices — накладные, plan — план закупа. Таблицу в '
+            'чат не пиши — файл уйдёт сам.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'kind': {
+                        'type': 'string',
+                        'enum': ['sales', 'invoices', 'plan'],
+                        'description': 'Какой отчёт. По умолчанию продажи.',
+                    },
+                    'days': {
+                        'type': 'integer',
+                        'description': 'За сколько дней, 1–365. Для плана не нужен.',
+                    },
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'search_web',
+            'description': 'Поиск в интернете: состав, бренд, что это за товар, '
+            'похожие названия, сайт производителя. Не продажи и не остатки '
+            'магазина — их смотри своими функциями.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'query': {
+                        'type': 'string',
+                        'description': 'Что искать, как в поисковой строке',
+                    },
+                },
+                'required': ['query'],
+            },
+        },
+    },
 ]
 
 #: Имя из ответа модели → функция. Ничего, кроме этого словаря, не вызывается:
@@ -387,4 +503,6 @@ HANDLERS = {
     'invoice': invoice,
     'plan': plan,
     'parsing': parsing,
+    'make_report': export.make_report,
+    'search_web': search_web,
 }

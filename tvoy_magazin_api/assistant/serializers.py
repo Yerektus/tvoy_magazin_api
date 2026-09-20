@@ -52,7 +52,16 @@ class MessageSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Message
-        fields = ('id', 'role', 'text', 'image', 'created_at', 'suggestions')
+        fields = (
+            'id',
+            'role',
+            'text',
+            'image',
+            'file',
+            'file_name',
+            'created_at',
+            'suggestions',
+        )
 
     def get_suggestions(self, message):
         if message.role != Message.Role.ASSISTANT:
@@ -65,6 +74,10 @@ class MessageSerializer(serializers.ModelSerializer):
 
         if instance.role == Message.Role.ASSISTANT:
             data['text'] = split_suggestions(instance.text)[0]
+
+        if not instance.file:
+            data['file'] = None
+            data['file_name'] = None
 
         return data
 

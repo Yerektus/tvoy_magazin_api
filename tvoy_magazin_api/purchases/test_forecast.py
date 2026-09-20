@@ -74,6 +74,30 @@ class ForecastModelTests(SimpleTestCase):
         self.assertLessEqual(max(daily) - min(daily), 1)
         self.assertGreater(result.quantity, 0)
 
+    def test_in_sample_weekly_follows_weekday(self):
+        dates = [date(2024, 1, 1) + timedelta(days=offset) for offset in range(28)]
+        values = [12.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0] * 4
+        fitted = forecast._in_sample(
+            'weekly_average',
+            values,
+            dates,
+            dates,
+            None,
+            None,
+        )
+
+        self.assertEqual(len(fitted), 28)
+        self.assertGreater(fitted[0], fitted[1])
+        self.assertAlmostEqual(fitted[0], fitted[7])
+
+    def test_in_sample_average_is_flat(self):
+        dates = [date(2024, 1, 1) + timedelta(days=offset) for offset in range(14)]
+        values = [2.0, 4.0, 6.0, 8.0] * 3 + [2.0, 4.0]
+        fitted = forecast._in_sample('average', values, dates, dates[-7:], None, None)
+
+        self.assertEqual(len(fitted), 7)
+        self.assertLessEqual(max(fitted) - min(fitted), 1e-9)
+
     def test_piece_forecast_uses_whole_units(self):
         result = forecast.predict([1, 0, 0, 1, 0, 0, 0] * 8, 14, model='average')
 

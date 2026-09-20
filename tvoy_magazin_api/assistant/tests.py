@@ -1,9 +1,13 @@
 from decimal import Decimal
+from io import BytesIO
+import tempfile
+import zipfile
 from unittest.mock import patch
 
 from django.conf import settings
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
@@ -18,7 +22,7 @@ from umag.client import UmagError
 from umag.models import UmagAccount, UmagProduct
 from umag.tests import FakeUmag
 
-from . import agent, cabinet, tools
+from . import agent, cabinet, export, tools, xlsx
 from .models import Conversation, Message
 
 
@@ -167,6 +171,42 @@ class ToolsTests(APITestCase):
         self.assertEqual(found['статус'], 'Считается')
         self.assertNotIn('первые_позиции', found)
 
+    def test_search_web_rejects_empty_query(self):
+        self.assertEqual(tools.search_web(self.user, query='  '), {'ошибка': 'Пустой запрос'})
+
+    @override_settings(OPENROUTER_API_KEY='test-key')
+    def test_search_web_returns_snippets(self):
+        body = {
+            'choices': [
+                {
+                    'message': {
+                        'content': 'Это йогурт.',
+                        'annotations': [
+                            {
+                                'url_citation': {
+                                    'title': 'Сайт',
+                                    'url': 'https://example.test/yogurt',
+                                }
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+
+        with patch('assistant.tools._post', return_value=body):
+            found = tools.search_web(self.user, query='чудо шоколад')
+
+        self.assertEqual(found['запрос'], 'чудо шоколад')
+        self.assertEqual(found['найдено'], 'Это йогурт.')
+        self.assertEqual(found['источники'][0]['url'], 'https://example.test/yogurt')
+
+    def test_search_web_is_in_the_tool_list(self):
+        names = [item['function']['name'] for item in tools.SCHEMAS]
+
+        self.assertIn('search_web', names)
+        self.assertIs(tools.HANDLERS['search_web'], tools.search_web)
+
 
 class AgentTests(APITestCase):
     """Цикл вызова функций: что модель может, а чего не может."""
@@ -219,6 +259,33 @@ class AgentTests(APITestCase):
         sent = post.call_args.args[0]['messages']
         self.assertEqual(sent[-1]['role'], 'tool')
 
+    def test_excel_stays_out_of_the_model_and_lands_in_files(self):
+        """Книга уходит в чат файлом, а модели — только сводка."""
+
+        attached = export.Attachment(
+            'Продажи за 30 дн.xlsx',
+            b'PK-fake',
+            {'готово': True, 'файл': 'Продажи за 30 дн.xlsx', 'строк': 1},
+        )
+        replies = [
+            answer(calls=[('make_report', '{"kind": "sales"}')]),
+            answer('Продажи за 30 дней — 1 позиция.'),
+        ]
+        files = []
+
+        with patch.dict(tools.HANDLERS, {'make_report': lambda user, **_: attached}):
+            with patch('assistant.agent._post', side_effect=replies) as post:
+                text, _ = agent.reply(
+                    self.user,
+                    [{'role': 'user', 'content': 'Сформируй отчёт'}],
+                    files=files,
+                )
+
+        self.assertEqual(text, 'Продажи за 30 дней — 1 позиция.')
+        self.assertEqual(files[0].name, 'Продажи за 30 дн.xlsx')
+        self.assertNotIn('PK-fake', post.call_args.args[0]['messages'][-1]['content'])
+        self.assertIn('Продажи за 30 дн.xlsx', post.call_args.args[0]['messages'][-1]['content'])
+
     def test_loop_gives_up_instead_of_spinning(self):
         """Модель просит данные по кругу — не даём ей крутиться вечно."""
 
@@ -246,6 +313,22 @@ class AgentTests(APITestCase):
         self.assertIn('/purchases/8', text)
         self.assertIn('id=8', text)
         self.assertIn('plan', text)
+
+    def test_describe_page_points_to_sales(self):
+        text = agent.describe_page({'title': 'Аналитика продаж', 'path': '/sales'})
+
+        self.assertIn('umag_sales', text)
+        self.assertIn('make_report', text)
+        self.assertNotIn('Это аналитика продаж', text)
+
+    def test_prompt_answers_only_the_asked_question(self):
+        """Иначе модель сваливает в ответ и лидеров, и остатки, и откуда данные."""
+
+        self.assertIn('только на заданный вопрос', agent.SYSTEM_PROMPT)
+        self.assertIn('полный отчёт не вываливай', agent.SYSTEM_PROMPT)
+        self.assertIn('на всякий случай', agent.SYSTEM_PROMPT)
+        self.assertIn('make_report', agent.SYSTEM_PROMPT)
+        self.assertIn('search_web', agent.SYSTEM_PROMPT)
 
     def test_describe_page_ignores_foreign_urls(self):
         self.assertEqual(agent.describe_page({'path': 'https://evil.example'}), '')
@@ -336,6 +419,38 @@ class ChatApiTests(APITestCase):
         self.assertEqual(reply['text'], 'Молоко кончится завтра.')
         self.assertEqual(reply['suggestions'], ['Сколько заказать?', 'Что ещё кончается?'])
         self.assertEqual(response.data['messages'][0]['suggestions'], [])
+        self.assertIsNone(reply['file'])
+
+    def test_excel_report_is_attached_to_the_answer(self):
+        """Просят отчёт — в чат уходит файл, а не таблица."""
+
+        attached = export.Attachment(
+            'Продажи за 30 дн.xlsx',
+            xlsx.book('Продажи', ['Товар'], [['Пепси']]),
+            {'готово': True, 'файл': 'Продажи за 30 дн.xlsx', 'строк': 1},
+        )
+        replies = [
+            answer(calls=[('make_report', '{"kind": "sales"}')]),
+            answer('Продажи за 30 дней — 1 позиция.'),
+        ]
+        media = tempfile.TemporaryDirectory()
+        self.addCleanup(media.cleanup)
+
+        with override_settings(MEDIA_ROOT=media.name):
+            with patch.dict(tools.HANDLERS, {'make_report': lambda user, **_: attached}):
+                with patch('assistant.agent._post', side_effect=replies):
+                    response = self.client.post(
+                        '/api/assistant/chat/',
+                        {'text': 'Можешь сформировать отчет'},
+                        format='json',
+                    )
+
+        reply = response.data['messages'][1]
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(reply['file_name'], 'Продажи за 30 дн.xlsx')
+        self.assertTrue(reply['file'].endswith('.xlsx'))
+        self.assertEqual(Message.objects.get(role='assistant').file_name, 'Продажи за 30 дн.xlsx')
 
     def test_previous_suggestions_are_not_sent_back_to_the_model(self):
         raw = 'Ок\n\n<<<вопросы\nЕщё?\n>>>'
@@ -834,4 +949,84 @@ class CabinetTests(APITestCase):
         with patch('umag.client._request', new=report):
             self.assertEqual(cabinet.sales(self.user, days=99999)['период_дней'], 365)
             self.assertEqual(cabinet.sales(self.user, days='за всё время')['период_дней'], 30)
+
+
+def sheet_xml(content: bytes) -> str:
+    """Текст первой страницы книги — чтобы проверить, что товары на месте."""
+
+    with zipfile.ZipFile(BytesIO(content)) as archive:
+        return archive.read('xl/worksheets/sheet1.xml').decode()
+
+
+class ReportTests(APITestCase):
+    """Excel-отчёт: свои данные, чужих нет, книга открывается."""
+
+    def setUp(self):
+        cache.clear()
+        self.user = make_user()
+        self.account = UmagAccount.objects.create(
+            user=self.user,
+            phone='7474419654',
+            token='u33577.token',
+            store_id=17795,
+            store_name='Каратал Ерентал',
+        )
+
+    def test_sales_report_is_an_excel_of_what_the_shop_sold(self):
+        report = FakeReport(
+            [
+                sold(
+                    productName='Пепси 1 л',
+                    saleQuantity=60,
+                    saleSellingAmount=24000,
+                    stockQuantity=10,
+                ),
+            ]
+        )
+
+        with patch('umag.client._request', new=report):
+            attached = export.make_report(self.user)
+
+        self.assertEqual(attached.name, 'Продажи за 30 дн.xlsx')
+        self.assertEqual(attached.summary['строк'], 1)
+        xml = sheet_xml(attached.content)
+        self.assertIn('Пепси 1 л', xml)
+        self.assertIn('24000', xml)
+
+    def test_invoices_report_hides_another_shop(self):
+        Invoice.objects.create(
+            organization=self.user.organization,
+            created_by=self.user,
+            supplier='Мой',
+            total=Decimal('100.00'),
+            status=Invoice.Status.DONE,
+        )
+        stranger = make_user(
+            email='чужой-отчёт@tvoymagazin.kz',
+            organization=make_organization('Чужой магазин'),
+        )
+        Invoice.objects.create(
+            organization=stranger.organization,
+            created_by=stranger,
+            supplier='Чужой',
+            total=Decimal('999999.00'),
+            status=Invoice.Status.DONE,
+        )
+
+        xml = sheet_xml(export.make_report(self.user, kind='invoices').content)
+
+        self.assertIn('Мой', xml)
+        self.assertNotIn('Чужой', xml)
+
+    def test_sales_report_needs_a_cabinet(self):
+        stranger = make_user(email='без-умага-отчёт@tvoymagazin.kz')
+
+        self.assertEqual(export.make_report(stranger), {'ошибка': 'UMAG не подключён'})
+
+    def test_xlsx_book_opens_as_a_zip_with_a_sheet(self):
+        content = xlsx.book('Продажи', ['Товар', 'Выручка'], [['Пепси', 100]])
+
+        self.assertTrue(content.startswith(b'PK'))
+        self.assertIn('Пепси', sheet_xml(content))
+        self.assertIn('100', sheet_xml(content))
 

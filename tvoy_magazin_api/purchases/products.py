@@ -357,6 +357,7 @@ def detail(
             'error': prediction.error,
             'observations': prediction.observations,
             'series': outlook['series'],
+            'fitted': outlook.get('fitted', []),
         },
     }
 

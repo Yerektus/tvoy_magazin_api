@@ -183,6 +183,7 @@ class ProductForecastSerializer(serializers.Serializer):
     error = serializers.DecimalField(max_digits=14, decimal_places=3)
     observations = serializers.IntegerField()
     series = DailySoldSerializer(many=True)
+    fitted = DailySoldSerializer(many=True)
 
 
 class StoreProductDetailSerializer(serializers.Serializer):

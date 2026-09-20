@@ -513,6 +513,7 @@ def for_barcode(
         return {
             'history': history,
             'forecast': None,
+            'fitted': [],
             'series': [],
             'as_of': as_of,
             'history_end': history_end,
@@ -528,6 +529,8 @@ def for_barcode(
     store_dates, store_values = _series(store_sparse, first_store_day, history_end)
     future_dates = [as_of + timedelta(days=offset) for offset in range(horizon)]
     _, promo_values = _series(promos.get(barcode, {}), first_day, history_end)
+    values = _clip_promos(dates, values, promo_values)
+    values = _clip_stockouts(dates, values, store_dates, store_values)
     prediction = _build(
         values,
         dates,
@@ -537,13 +540,26 @@ def for_barcode(
         store_dates,
         store_values,
         {},
-        promo_values,
+        None,
         model,
+        clipped=True,
+    )
+    fitted = _in_sample(
+        prediction.model,
+        values,
+        dates,
+        chart_dates,
+        store_dates,
+        store_values,
     )
 
     return {
         'history': history,
         'forecast': prediction,
+        'fitted': [
+            {'date': day, 'sold': _amount(quantity)}
+            for day, quantity in zip(chart_dates, fitted)
+        ],
         'series': [
             {'date': day, 'sold': quantity}
             for day, quantity in zip(future_dates, prediction.daily)
@@ -564,11 +580,14 @@ def _build(
     store_factor_cache: dict[tuple[str, int], tuple[float, int]],
     promo_values: list[float] | None = None,
     model: str | None = None,
+    *,
+    clipped: bool = False,
 ) -> Forecast:
     """Одна модель: отбор, скидки, праздники и страховой запас."""
 
-    values = _clip_promos(dates, values, promo_values)
-    values = _clip_stockouts(dates, values, store_dates, store_values)
+    if not clipped:
+        values = _clip_promos(dates, values, promo_values)
+        values = _clip_stockouts(dates, values, store_dates, store_values)
     model, base, error, daily_mae = _select(
         values,
         horizon,
@@ -1140,6 +1159,104 @@ def _local_forecast(
         daily = daily + [fill] * (horizon - len(daily))
 
     return [max(0.0, min(value, cap)) for value in daily[:horizon]]
+
+
+def _in_sample(
+    name: str,
+    values: list[float],
+    dates: list[date],
+    target_dates: list[date],
+    store_dates: list[date] | None,
+    store_values: list[float] | None,
+) -> list[float]:
+    """Ожидание выбранной модели на истории — линия поверх факта."""
+
+    if not values or not target_dates:
+        return [0.0] * len(target_dates)
+
+    cap = max(1.0, _percentile(values, 0.9)) * 4
+
+    if name not in LOCAL_MODELS:
+        fitted = _sf_in_sample(name, values, cap)
+        if fitted is not None:
+            by_date = dict(zip(dates, fitted))
+            return [max(0.0, by_date.get(day, 0.0)) for day in target_dates]
+        name = 'weighted_average' if name == 'holt' else 'weekly_average'
+
+    if name in {'average', 'weighted_average', 'croston_sba'}:
+        if name == 'weighted_average':
+            level = min(_ses_level(values), cap)
+        elif name == 'croston_sba':
+            level = min(_croston_rate(values), cap)
+        else:
+            level = _local_average(values, 1, cap)[0]
+        return [max(0.0, level)] * len(target_dates)
+
+    if name in {'weekly_average', 'pooled_weekly'}:
+        return _local_forecast(
+            name,
+            values,
+            dates,
+            len(target_dates),
+            target_dates,
+            store_dates,
+            store_values,
+            cap,
+        )
+
+    by_date = dict(zip(dates, values))
+    by_weekday: dict[int, list[float]] = defaultdict(list)
+    for day, value in zip(dates, values):
+        by_weekday[day.weekday()].append(value)
+
+    lag = YEAR if name == 'seasonal_naive_year' else WEEK
+    daily = []
+
+    for day in target_dates:
+        source = by_date.get(shift_years(day, 1) if lag == YEAR else day - timedelta(days=lag))
+        if source is None:
+            bucket = by_weekday[day.weekday()]
+            source = sum(bucket) / len(bucket) if bucket else 0.0
+        daily.append(max(0.0, min(source, cap)))
+
+    return daily
+
+
+def _sf_in_sample(name: str, values: list[float], cap: float) -> list[float] | None:
+    """Внутривыборочные значения StatsForecast — та же модель, что на горизонте."""
+
+    if not values:
+        return None
+
+    import warnings
+
+    import numpy as np
+
+    y = np.asarray(values, dtype=np.float64)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore')
+        try:
+            engine = _engine(name, len(values))
+            engine.fit(y=y)
+            raw = engine.predict_in_sample()
+        except Exception:
+            return None
+
+    mean = (raw or {}).get('fitted') if isinstance(raw, dict) else None
+
+    if mean is None:
+        return None
+
+    fitted = [float(value) for value in mean]
+
+    if len(fitted) != len(values):
+        return None
+
+    return [
+        0.0 if not isfinite(value) else max(0.0, min(value, cap))
+        for value in fitted
+    ]
 
 
 def _eligible_local(
