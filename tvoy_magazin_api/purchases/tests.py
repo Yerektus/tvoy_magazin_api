@@ -178,6 +178,43 @@ class AnalyticsTurnoverTests(SimpleTestCase):
         self.assertEqual(totals['visitors'], 8)
         self.assertEqual(totals['average_check'], Decimal('112.50'))
 
+    def test_category_report_renames_unsorted_and_ranks_the_rest(self):
+        """«Незаданные» — основная куча продаж, на графике это «Без категории»."""
+
+        ranked = analytics._parse_category_report(
+            {
+                'data': [
+                    {
+                        'categoryName': 'Незаданные',
+                        'saleQuantity': 45000,
+                        'refundQuantity': 0,
+                        'children': [1, 2, 3],
+                    },
+                    {
+                        'categoryName': 'соки',
+                        'saleQuantity': 10,
+                        'refundQuantity': 1,
+                        'children': [{'categoryName': 'Незаданные'}],
+                    },
+                    {
+                        'categoryName': 'посуда',
+                        'saleQuantity': 21,
+                        'refundQuantity': 0,
+                        'children': [{}, {}],
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(
+            [(row['name'], row['sold'], row['sku_count']) for row in ranked],
+            [
+                ('Без категории', Decimal('45000.000'), 3),
+                ('посуда', Decimal('21.000'), 2),
+                ('соки', Decimal('9.000'), 1),
+            ],
+        )
+
     @patch('purchases.analytics.UmagClient')
     def test_daily_revenue_reads_report_for_each_day(self, client_cls):
         """Каждый день — свой запрос отчёта: в копии нет цен."""
@@ -1045,8 +1082,58 @@ class PlanningApiTests(APITestCase):
             ['Сок', 'Хлеб'],
         )
 
+        page = self.client.get(
+            '/api/purchases/products/',
+            {
+                'accuracy': 'high,none',
+                'sort': 'name',
+                'order': 'asc',
+                'page_size': 1,
+            },
+        )
+        self.assertEqual(page.data['items_total'], 2)
+        self.assertEqual(page.data['items'][0]['name'], 'Сок')
+
+        ranked = self.client.get(
+            '/api/purchases/products/',
+            {'sort': 'accuracy', 'order': 'asc'},
+        )
+        self.assertEqual(
+            [item['name'] for item in ranked.data['items']],
+            ['Хлеб', 'Молоко', 'Айран', 'Сок'],
+        )
+
         bad = self.client.get('/api/purchases/products/', {'accuracy': 'high,unknown'})
         self.assertEqual(bad.status_code, 400)
+
+    def test_products_filter_accuracy_does_not_forecast_whole_catalog(self):
+        """Фильтр точности режет копию в базе — модели только для страницы."""
+
+        self.install()
+        self._sold('111', 'Хлеб', 1)
+        self._sold('222', 'Молоко', 1)
+        self._sold('333', 'Айран', 1)
+        rebuild_store(self.user.organization, 17795)
+        UmagSoldProduct.objects.filter(barcode='111').update(forecast_error=Decimal('0.10'))
+        UmagSoldProduct.objects.filter(barcode='222').update(forecast_error=Decimal('0.40'))
+        UmagSoldProduct.objects.filter(barcode='333').update(forecast_error=Decimal('0.10'))
+        UmagSoldProduct.objects.update(forecast_on=None)
+
+        with patch('purchases.products.demand_forecast.for_products', return_value={}) as mocked:
+            page = self.client.get(
+                '/api/purchases/products/',
+                {
+                    'accuracy': 'high',
+                    'page_size': 1,
+                    'sort': 'name',
+                    'order': 'asc',
+                },
+            )
+
+        mocked.assert_called_once()
+        self.assertEqual(mocked.call_args.args[2], {'333'})
+        self.assertEqual(page.data['items_total'], 2)
+        self.assertEqual(page.data['items'][0]['name'], 'Айран')
 
     def test_product_forecast_error_is_cached(self):
         """Ошибку прогноза считаем один раз в день — список не гоняет модели повторно."""
@@ -1380,16 +1467,26 @@ class PlanningApiTests(APITestCase):
         )
         rebuild_store(organization, 17795)
 
-        totals = {
+        now = {
             'revenue': Decimal('10000.00'),
             'profit': Decimal('3000.00'),
             'visitors': 40,
             'average_check': Decimal('250.00'),
         }
+        previous = {
+            'revenue': Decimal('8000.00'),
+            'profit': Decimal('3750.00'),
+            'visitors': 40,
+            'average_check': Decimal('200.00'),
+        }
+
+        def fake_turnover(account, start, end):
+            return now if end == timezone.localdate() else previous
 
         with (
-            patch('purchases.analytics._fetch_turnover', return_value=totals),
+            patch('purchases.analytics._fetch_turnover', side_effect=fake_turnover),
             patch('purchases.analytics._daily_revenue', side_effect=_fixed_daily_revenue),
+            patch('purchases.analytics._fetch_category_sales', return_value=[]),
         ):
             response = self.client.get('/api/purchases/analytics/', {'days': 7})
             data = response.data
@@ -1405,6 +1502,10 @@ class PlanningApiTests(APITestCase):
             self.assertEqual(data['profit'], '3000.00')
             self.assertEqual(data['visitors'], 40)
             self.assertEqual(data['average_check'], '250.00')
+            self.assertEqual(data['revenue_trend'], '0.250')
+            self.assertEqual(data['profit_trend'], '-0.200')
+            self.assertEqual(data['visitors_trend'], '0.000')
+            self.assertEqual(data['average_check_trend'], '0.250')
             self.assertEqual(len(data['history']), 7)
             self.assertTrue(all(row['revenue'] == '100.00' for row in data['history']))
             self.assertEqual(len(data['weekdays']), 7)
@@ -1489,7 +1590,10 @@ class PlanningApiTests(APITestCase):
                 'visitors': None,
                 'average_check': None,
             },
-        ), patch('purchases.analytics._daily_revenue', side_effect=_fixed_daily_revenue):
+        ), patch('purchases.analytics._daily_revenue', side_effect=_fixed_daily_revenue), patch(
+            'purchases.analytics._fetch_category_sales',
+            return_value=[],
+        ):
             response = self.client.get('/api/purchases/analytics/', {'days': 7})
 
         self.assertEqual(response.status_code, 200)

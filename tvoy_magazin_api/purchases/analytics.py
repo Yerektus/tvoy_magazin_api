@@ -34,11 +34,13 @@ logger = logging.getLogger(__name__)
 ZERO = Decimal('0')
 THREE = Decimal('0.001')
 MONEY = Decimal('0.01')
-CATEGORY_LIMIT = 8
+CATEGORY_LIMIT = 12
 REPORT = 'report/list-product-report'
+CATEGORY_REPORT = 'report/list-category-report'
 SALES = 'opr/sale/list'
 TURNOVER_TTL = 120
 REVENUE_THREADS = 6
+UNTITLED_CATEGORY = 'Без категории'
 _UNSET = object()
 
 
@@ -62,6 +64,8 @@ def snapshot(account, *, start: date, end: date) -> dict:
 
     previous_end = start - timedelta(days=1)
     previous_start = previous_end - timedelta(days=days - 1)
+    money = _turnover(account, start, end)
+    previous_money = _turnover(account, previous_start, previous_end)
 
     return {
         'status': state.status if state else products.IDLE,
@@ -77,7 +81,8 @@ def snapshot(account, *, start: date, end: date) -> dict:
         'days': days,
         'start': start,
         'end': end,
-        **_turnover(account, start, end),
+        **money,
+        **_money_trends(money, previous_money),
         **_period(
             organization,
             store_id,
@@ -86,6 +91,7 @@ def snapshot(account, *, start: date, end: date) -> dict:
             previous_start,
             previous_end,
             _daily_revenue(account, start, end),
+            account,
         ),
     }
 
@@ -98,6 +104,7 @@ def _period(
     previous_start: date,
     previous_end: date,
     revenue_by_day: dict | None = None,
+    account=None,
 ) -> dict:
     """Агрегаты текущего окна и сравнение с таким же предыдущим."""
 
@@ -137,7 +144,7 @@ def _period(
         'history': daily,
         'weekdays': _weekdays(daily),
         'hours': _hours(organization, store_id, start, end),
-        'categories': _categories(store_id, by_barcode),
+        'categories': _categories(account, store_id, by_barcode, start, end),
     }
 
 
@@ -240,20 +247,83 @@ def _local_hour(moment: datetime) -> int:
     return _as_local(moment).hour
 
 
-def _categories(store_id: int, rows: list[dict]) -> list[dict]:
+def _categories(account, store_id: int, rows: list[dict], start: date, end: date) -> list[dict]:
+    """Сначала отчёт кабинета за период — в копии номенклатуры категории часто пустые."""
+
+    if account is not None:
+        try:
+            live = _fetch_category_sales(account, start, end)
+        except UmagError as error:
+            logger.warning('UMAG не отдал продажи по категориям: %s', error)
+            live = []
+        if live:
+            return live
+
+    return _categories_from_catalog(store_id, rows)
+
+
+def _fetch_category_sales(account, start: date, end: date) -> list[dict]:
+    key = f'analytics-categories:{account.store_id}:{start.isoformat()}:{end.isoformat()}'
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+
+    if account is None or not account.ready:
+        return []
+
+    client = UmagClient(account, account.store_id)
+    from_time, to_time = _range_millis(start, end)
+    report = client.get(
+        CATEGORY_REPORT,
+        fromTime=from_time,
+        toTime=to_time,
+        first=0,
+        pageSize=100,
+    )
+    ranked = _parse_category_report(report)
+    cache.set(key, ranked, TURNOVER_TTL)
+    return ranked
+
+
+def _parse_category_report(report) -> list[dict]:
+    """Верхний уровень отчёта кабинета. «Незаданные» показываем как «Без категории»."""
+
+    rows = report.get('data') if isinstance(report, dict) else report
+    if not isinstance(rows, list):
+        return []
+
+    grouped: list[dict] = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw = (row.get('categoryName') or row.get('name') or '').strip()
+        if not raw:
+            continue
+        name = UNTITLED_CATEGORY if raw.casefold() == 'незаданные' else raw
+        sold = _amount(row.get('saleQuantity')) - _amount(row.get('refundQuantity'))
+        if sold <= 0:
+            continue
+        children = row.get('children') if isinstance(row.get('children'), list) else []
+        grouped.append({'name': name, 'sold': sold, 'sku_count': len(children)})
+
+    grouped.sort(key=lambda row: row['sold'], reverse=True)
+    return grouped[:CATEGORY_LIMIT]
+
+
+def _categories_from_catalog(store_id: int, rows: list[dict]) -> list[dict]:
     """Категории из номенклатуры. Без названия не показываем: это просто дырка в карточке."""
 
     if not rows:
         return []
 
-    titles = dict(
-        UmagProduct.objects.filter(
-            store_id=store_id,
-            barcode__in=[row['barcode'] for row in rows],
-        )
-        .exclude(category='')
-        .values_list('barcode', 'category')
-    )
+    titles = {}
+    for barcode, category, subcategory in UmagProduct.objects.filter(
+        store_id=store_id,
+        barcode__in=[row['barcode'] for row in rows],
+    ).values_list('barcode', 'category', 'subcategory'):
+        titles[barcode] = (category or subcategory or '').strip()
+
     grouped: dict[str, dict] = {}
 
     for row in rows:
@@ -284,6 +354,10 @@ def _empty(start: date, end: date) -> dict:
         'profit': None,
         'visitors': None,
         'average_check': None,
+        'revenue_trend': None,
+        'profit_trend': None,
+        'visitors_trend': None,
+        'average_check_trend': None,
         'sold': ZERO,
         'sku_count': 0,
         'active_days': 0,
@@ -312,10 +386,26 @@ def _ratio(part, whole) -> Decimal | None:
 
 
 def _trend(current, previous) -> Decimal | None:
+    if current is None or previous is None:
+        return None
     previous = _amount(previous)
     if previous <= 0:
         return None
     return (_amount(current) / previous - 1).quantize(THREE)
+
+
+def _money_trends(current: dict, previous: dict) -> dict:
+    """Насколько итоги отличаются от такого же окна перед выбранным."""
+
+    return {
+        'revenue_trend': _trend(current.get('revenue'), previous.get('revenue')),
+        'profit_trend': _trend(current.get('profit'), previous.get('profit')),
+        'visitors_trend': _trend(current.get('visitors'), previous.get('visitors')),
+        'average_check_trend': _trend(
+            current.get('average_check'),
+            previous.get('average_check'),
+        ),
+    }
 
 
 def _turnover(account, start: date, end: date) -> dict:

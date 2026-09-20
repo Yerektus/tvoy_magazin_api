@@ -8,7 +8,7 @@ from datetime import timedelta
 from decimal import Decimal
 from math import ceil
 
-from django.db.models import Max, Min
+from django.db.models import Case, IntegerField, Max, Min, Q, Value, When
 from django.db.models.functions import Lower
 from django.utils import timezone
 
@@ -209,47 +209,23 @@ def catalog(
     if sold_to is not None:
         rows = rows.filter(sold__lte=sold_to)
 
+    # Точность уже лежит на копии: режем в базе, а не считаем модели по всем.
+    if levels:
+        rows = rows.filter(_accuracy_filter(levels))
+
     field = SORT_FIELDS.get(sort, 'sold')
     descending = order != 'asc'
-    by_accuracy = sort == 'accuracy' or bool(levels)
 
-    if field == 'name':
+    if sort == 'accuracy':
+        rows = rows.annotate(accuracy_rank=_accuracy_rank()).order_by(
+            '-accuracy_rank' if descending else 'accuracy_rank',
+            'barcode',
+        )
+    elif field == 'name':
         key = Lower('name')
         rows = rows.order_by(key.desc() if descending else key, 'barcode')
-    elif sort != 'accuracy':
-        rows = rows.order_by(f'-{field}' if descending else field, 'barcode')
     else:
-        rows = rows.order_by('barcode')
-
-    if by_accuracy:
-        listed = list(rows)
-        errors = _errors_for(organization, store_id, listed, compute=forecast)
-
-        if levels:
-            listed = [
-                row
-                for row in listed
-                if _accuracy_level(errors.get(row.barcode)) in levels
-            ]
-
-        if sort == 'accuracy':
-            listed.sort(
-                key=lambda row: (
-                    ACCURACY_RANK[_accuracy_level(errors.get(row.barcode))],
-                    row.barcode,
-                ),
-                reverse=descending,
-            )
-
-        total = len(listed)
-        page_size = min(max(page_size, 1), MAX_PAGE_SIZE)
-        pages = max(1, ceil(total / page_size)) if total else 1
-        page = min(max(page, 1), pages)
-        offset = (page - 1) * page_size
-        page_rows = listed[offset : offset + page_size]
-        page_errors = {row.barcode: errors.get(row.barcode) for row in page_rows}
-
-        return _as_items(store_id, page_rows, page_errors), total, page
+        rows = rows.order_by(f'-{field}' if descending else field, 'barcode')
 
     total = rows.count()
     page_size = min(max(page_size, 1), MAX_PAGE_SIZE)
@@ -495,16 +471,36 @@ def _errors_for(organization, store_id: int, rows: list, *, compute: bool = True
     return errors
 
 
-def _accuracy_level(error) -> str:
-    if error is None:
-        return 'none'
+def _accuracy_filter(levels: set[str]):
+    """Те же пороги, что у колонки: высокая / средняя / низкая / нет данных."""
 
-    value = Decimal(error)
+    clauses = []
 
-    if value <= GOOD_ERROR:
-        return 'high'
+    if 'none' in levels:
+        clauses.append(Q(forecast_error__isnull=True))
 
-    if value <= FAIR_ERROR:
-        return 'medium'
+    if 'high' in levels:
+        clauses.append(Q(forecast_error__lte=GOOD_ERROR))
 
-    return 'low'
+    if 'medium' in levels:
+        clauses.append(Q(forecast_error__gt=GOOD_ERROR, forecast_error__lte=FAIR_ERROR))
+
+    if 'low' in levels:
+        clauses.append(Q(forecast_error__gt=FAIR_ERROR))
+
+    query = clauses[0]
+    for clause in clauses[1:]:
+        query |= clause
+    return query
+
+
+def _accuracy_rank():
+    """Порядок колонки: высокая, средняя, низкая, нет данных."""
+
+    return Case(
+        When(forecast_error__isnull=True, then=Value(ACCURACY_RANK['none'])),
+        When(forecast_error__lte=GOOD_ERROR, then=Value(ACCURACY_RANK['high'])),
+        When(forecast_error__lte=FAIR_ERROR, then=Value(ACCURACY_RANK['medium'])),
+        default=Value(ACCURACY_RANK['low']),
+        output_field=IntegerField(),
+    )
