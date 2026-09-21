@@ -14,11 +14,7 @@ class OrganizationSerializer(serializers.ModelSerializer):
 
 class UserSerializer(serializers.ModelSerializer):
     organization = OrganizationSerializer(read_only=True)
-    # По ней фронт решает, показывать ли расширения: у менеджера их нет.
     manages_organization = serializers.BooleanField(read_only=True)
-
-    # Какие разделы показывать. Не роль: менеджеру доступ выдают поштучно, и
-    # приложению незачем знать правило — только результат.
     uses_purchases = serializers.BooleanField(read_only=True)
     uses_assistant = serializers.BooleanField(read_only=True)
 
@@ -48,17 +44,12 @@ class LoginSerializer(serializers.Serializer):
         )
 
         if user is None:
-            # Один и тот же текст для неизвестной почты и неверного пароля,
-            # чтобы по ответу нельзя было перебирать существующие адреса.
             raise serializers.ValidationError('Неверная почта или пароль')
 
         if not user.is_active:
             raise serializers.ValidationError('Учётная запись отключена')
 
         if user.organization_id is None:
-            # Заходят в организацию, а не «просто в кабинет»: без неё непонятно,
-            # чьи накладные показывать и куда складывать новые. Так выглядит
-            # суперпользователь, заведённый из консоли, — ему в админку Django.
             raise serializers.ValidationError('Учётная запись не привязана к организации')
 
         attrs['user'] = user
@@ -66,8 +57,6 @@ class LoginSerializer(serializers.Serializer):
 
     def to_representation(self, instance):
         user = instance['user']
-        # Refresh порождает access сам — так у пары один общий срок жизни и
-        # один идентификатор в чёрном списке.
         refresh = RefreshToken.for_user(user)
 
         return {
@@ -78,13 +67,6 @@ class LoginSerializer(serializers.Serializer):
 
 
 class LogoutSerializer(serializers.Serializer):
-    """Гасит refresh-токен, чтобы выход из аккаунта был настоящим.
-
-    Access живёт своим сроком и досрочно не отзывается — час он ещё поработает.
-    Чтобы отзывался и он, пришлось бы ходить в базу на каждый запрос, а это как
-    раз то, ради чего JWT и берут.
-    """
-
     refresh = serializers.CharField()
 
     def validate_refresh(self, value):

@@ -7,8 +7,6 @@ from .serializers import LoginSerializer, LogoutSerializer, UserSerializer
 
 
 class LoginView(APIView):
-    """POST /api/auth/login/ — почта и пароль в обмен на пару токенов."""
-
     permission_classes = [AllowAny]
     authentication_classes = []
 
@@ -19,13 +17,6 @@ class LoginView(APIView):
 
 
 class LogoutView(APIView):
-    """POST /api/auth/logout/ — погасить refresh-токен.
-
-    Аутентификации не требует намеренно: выходят обычно как раз тогда, когда
-    access уже протух, и требовать живой access значило бы не дать выйти.
-    Владение самим refresh-токеном тут и есть право его погасить.
-    """
-
     permission_classes = [AllowAny]
     authentication_classes = []
 
@@ -38,8 +29,6 @@ class LogoutView(APIView):
 
 
 class MeView(APIView):
-    """GET /api/auth/me/ — кто пришёл с этим токеном."""
-
     permission_classes = [IsAuthenticated]
 
     def get(self, request):

@@ -32,7 +32,6 @@ class UserAdmin(BaseUserAdmin):
     fieldsets = (
         (None, {'fields': ('email', 'password')}),
         ('Профиль', {'fields': ('name',)}),
-        # Пока людей заводят отсюда: своего экрана для приглашений ещё нет.
         ('Организация', {'fields': ('organization', 'role')}),
         (
             'Разделы приложения',

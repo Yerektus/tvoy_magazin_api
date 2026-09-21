@@ -5,9 +5,11 @@ import zipfile
 from unittest.mock import patch
 
 from django.conf import settings
+from django.contrib.admin.sites import site
 from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import override_settings
+from django.test import TestCase, override_settings
+from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
@@ -23,6 +25,7 @@ from umag.models import UmagAccount, UmagProduct
 from umag.tests import FakeUmag
 
 from . import agent, cabinet, export, tools, xlsx
+from .admin import ConversationAdmin, MessageAdmin
 from .models import Conversation, Message
 
 
@@ -1029,4 +1032,55 @@ class ReportTests(APITestCase):
         self.assertTrue(content.startswith(b'PK'))
         self.assertIn('Пепси', sheet_xml(content))
         self.assertIn('100', sheet_xml(content))
+
+
+class AssistantAdminTests(TestCase):
+    def setUp(self):
+        self.staff = make_user(
+            email='admin@tvoymagazin.kz',
+            is_staff=True,
+            is_superuser=True,
+        )
+        self.client.force_login(self.staff)
+
+    def test_conversation_opens_with_replies_and_cost(self):
+        chat = Conversation.objects.create(user=self.staff, title='Что заказать?')
+        Message.objects.create(
+            conversation=chat,
+            role=Message.Role.USER,
+            text='Что заказать?',
+        )
+        Message.objects.create(
+            conversation=chat,
+            role=Message.Role.ASSISTANT,
+            text='Молоко.',
+            cost=Decimal('0.001200'),
+        )
+
+        listing = self.client.get(reverse('admin:assistant_conversation_changelist'))
+
+        self.assertEqual(listing.status_code, 200)
+        self.assertContains(listing, 'Что заказать?')
+        # В русской админке дробная часть через запятую.
+        self.assertContains(listing, '0,001200')
+
+        opened = self.client.get(
+            reverse('admin:assistant_conversation_change', args=[chat.pk]),
+        )
+        self.assertEqual(opened.status_code, 200)
+        self.assertContains(opened, 'Молоко.')
+
+        messages = self.client.get(reverse('admin:assistant_message_changelist'))
+        self.assertEqual(messages.status_code, 200)
+        self.assertContains(messages, 'Молоко.')
+
+    def test_chat_cannot_be_created_from_admin(self):
+        self.assertFalse(ConversationAdmin(Conversation, site).has_add_permission(None))
+
+    def test_empty_reply_preview_is_a_photo(self):
+        preview = MessageAdmin(Message, site).preview(
+            Message(role=Message.Role.USER, text='', image='assistant/x.jpg'),
+        )
+
+        self.assertEqual(preview, 'Фото')
 

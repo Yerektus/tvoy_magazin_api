@@ -3,8 +3,6 @@ from django.db import models
 
 
 class UserManager(BaseUserManager):
-    """Пользователи заводятся по почте, поля username нет."""
-
     use_in_migrations = True
 
     def _create_user(self, email, password, **extra_fields):
@@ -34,12 +32,6 @@ class UserManager(BaseUserManager):
 
 
 class Organization(models.Model):
-    """Магазин как юридическое лицо: всё, что заводят сотрудники, принадлежит ему.
-
-    Накладные видит вся организация, а не тот один человек, который их загрузил:
-    товар принимает сменщик, а сверяет и отправляет в приёмку хозяин.
-    """
-
     name = models.CharField('название', max_length=255)
     created_at = models.DateTimeField('создана', auto_now_add=True)
 
@@ -62,8 +54,6 @@ class User(AbstractUser):
     email = models.EmailField('почта', unique=True)
     name = models.CharField('имя', max_length=150, blank=True)
 
-    # Пусто только у суперпользователя из консоли: он заходит в админку Django,
-    # а не в кабинет, и организации у него нет. Через API без неё не пускаем.
     organization = models.ForeignKey(
         Organization,
         verbose_name='организация',
@@ -78,11 +68,6 @@ class User(AbstractUser):
         choices=Role.choices,
         default=Role.MANAGER,
     )
-
-    # Разделы, которые менеджеру по умолчанию не нужны: он принимает товар, а
-    # не считает закуп и не спрашивает аналитику. Кому нужны — доступ выдают
-    # руками отсюда, из админки. Владельцу и администратору они открыты всегда,
-    # эти галочки их не касаются.
     purchases_access = models.BooleanField('доступ к закупкам', default=False)
     assistant_access = models.BooleanField('доступ к помощнику', default=False)
 
@@ -100,23 +85,12 @@ class User(AbstractUser):
 
     @property
     def manages_organization(self) -> bool:
-        """Владелец и администратор ведут организацию, менеджер — только работает.
-
-        Пока эта разница видна на расширениях: менеджеру их не показываем, и
-        подключать их он не может. Роли людей и настройки организации, когда
-        появятся, встанут сюда же.
-        """
-
         return self.role in (self.Role.OWNER, self.Role.ADMIN)
 
     @property
     def uses_purchases(self) -> bool:
-        """Открыт ли раздел закупок. Ведущим организацию — всегда."""
-
         return self.manages_organization or self.purchases_access
 
     @property
     def uses_assistant(self) -> bool:
-        """Открыт ли помощник. Ведущим организацию — всегда."""
-
         return self.manages_organization or self.assistant_access
