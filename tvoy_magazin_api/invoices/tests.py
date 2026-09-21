@@ -1011,6 +1011,53 @@ class InvoiceTests(APITestCase):
         self.assertEqual(ids('checked'), {checked.data['id']})
         self.assertEqual(ids('deleted'), {removed.data['id']})
 
+    def test_list_filters_and_sorts_like_products(self):
+        """Шапка колонок: поиск, статус, число позиций, даты и сортировка."""
+
+        with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
+            first = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+            second = self.client.post('/api/invoices/', {'image': photo()}, format='multipart')
+
+        Invoice.objects.filter(pk=first.data['id']).update(
+            supplier='ТОО Ромашка',
+            supplier_bin='123456789012',
+            number='A-100',
+        )
+        Invoice.objects.filter(pk=second.data['id']).update(
+            supplier='ИП Василёк',
+            number='B-200',
+            status=Invoice.Status.CHECKED,
+        )
+
+        by_supplier = self.client.get('/api/invoices/', {'supplier': 'ромашка'})
+        self.assertEqual([row['id'] for row in by_supplier.data['results']], [first.data['id']])
+
+        by_number = self.client.get('/api/invoices/', {'number': 'B-2'})
+        self.assertEqual([row['id'] for row in by_number.data['results']], [second.data['id']])
+
+        by_status = self.client.get('/api/invoices/', {'status': 'checked'})
+        self.assertEqual([row['id'] for row in by_status.data['results']], [second.data['id']])
+
+        InvoiceLine.objects.filter(invoice_id=second.data['id']).delete()
+
+        by_lines = self.client.get('/api/invoices/', {'lines_from': '1'})
+        self.assertEqual([row['id'] for row in by_lines.data['results']], [first.data['id']])
+
+        by_lines_to = self.client.get('/api/invoices/', {'lines_to': '0'})
+        self.assertEqual([row['id'] for row in by_lines_to.data['results']], [second.data['id']])
+
+        sorted_asc = self.client.get('/api/invoices/', {'sort': 'number', 'order': 'asc'})
+        self.assertEqual(
+            [row['id'] for row in sorted_asc.data['results']],
+            [first.data['id'], second.data['id']],
+        )
+
+        sorted_lines = self.client.get('/api/invoices/', {'sort': 'lines', 'order': 'asc'})
+        self.assertEqual(
+            [row['id'] for row in sorted_lines.data['results']],
+            [second.data['id'], first.data['id']],
+        )
+
     def test_counts_tell_how_many_are_waiting(self):
         with patch('invoices.tasks.parse_invoice', return_value=PARSE_RESULT):
             self.client.post('/api/invoices/', {'image': photo()}, format='multipart')

@@ -1,6 +1,7 @@
 from decimal import ROUND_HALF_UP, Decimal
 
-from django.db.models import Q, Sum
+from django.db.models import Count, Q, Sum
+from django.utils.dateparse import parse_date
 from rest_framework import generics, status
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
@@ -24,6 +25,15 @@ from .serializers import (
 
 # Код расширения в каталоге.
 SLUG = 'recognition'
+
+#: Колонки списка, которые можно отсортировать. Ключ — параметр `sort`.
+LIST_SORTS = {
+    'supplier': 'supplier',
+    'number': 'number',
+    'lines': 'lines_total',
+    'status': 'status',
+    'created': 'created_at',
+}
 
 
 class InvoiceQuerysetMixin:
@@ -52,6 +62,9 @@ class InvoiceListCreateView(InvoiceQuerysetMixin, generics.ListCreateAPIView):
     Вкладки списка: `pending` — ещё не проверенные, `checked` — проверенные,
     `deleted` — удалённые (они лежат в базе, просто скрыты). Без параметра —
     все живые.
+
+    Шапка колонок, как у товаров: `supplier`, `number`, `status`, `from`/`to`
+    по дате загрузки, `lines_from`/`lines_to` по числу позиций, `sort`/`order`.
     """
 
     parser_classes = [MultiPartParser, FormParser]
@@ -63,23 +76,22 @@ class InvoiceListCreateView(InvoiceQuerysetMixin, generics.ListCreateAPIView):
         tab = self.request.query_params.get('tab')
 
         if tab == 'deleted':
-            return _of_store(
+            queryset = _of_store(
                 Invoice.all_objects.filter(
                     organization=self.request.user.organization_id,
                     deleted_at__isnull=False,
                 ),
                 self.request.user,
             )
+        else:
+            queryset = _of_store(super().get_queryset(), self.request.user)
 
-        queryset = _of_store(super().get_queryset(), self.request.user)
+            if tab == 'pending':
+                queryset = queryset.exclude(status=Invoice.Status.CHECKED)
+            elif tab == 'checked':
+                queryset = queryset.filter(status=Invoice.Status.CHECKED)
 
-        if tab == 'pending':
-            return queryset.exclude(status=Invoice.Status.CHECKED)
-
-        if tab == 'checked':
-            return queryset.filter(status=Invoice.Status.CHECKED)
-
-        return queryset
+        return _filter_list(queryset, self.request.query_params)
 
     #: Больше листов у накладной не бывает — это защита от случайной пачки, а
     #: не ограничение по смыслу: разбор всех листов идёт одним запросом к
@@ -273,6 +285,64 @@ def _of_store(queryset, user):
         return queryset
 
     return queryset.filter(Q(umag_store_id=account.store_id) | Q(umag_store_id__isnull=True))
+
+
+def _filter_list(queryset, params):
+    """Фильтры и сортировка таблицы списка — как у товаров.
+
+    Параметры приходят из шапки колонок: поставщик, номер, статус, даты
+    загрузки, число позиций. Чужое и кривое отбрасываем — список просто
+    не сужается.
+    """
+
+    supplier = (params.get('supplier') or '').strip()
+    if supplier:
+        queryset = queryset.filter(
+            Q(supplier__icontains=supplier) | Q(supplier_bin__icontains=supplier)
+        )
+
+    number = (params.get('number') or '').strip()
+    if number:
+        queryset = queryset.filter(number__icontains=number)
+
+    status_value = (params.get('status') or '').strip()
+    if status_value in Invoice.Status.values:
+        queryset = queryset.filter(status=status_value)
+
+    date_from = parse_date((params.get('from') or '').strip())
+    if date_from:
+        queryset = queryset.filter(created_at__date__gte=date_from)
+
+    date_to = parse_date((params.get('to') or '').strip())
+    if date_to:
+        queryset = queryset.filter(created_at__date__lte=date_to)
+
+    lines_from = _count_bound(params.get('lines_from'))
+    lines_to = _count_bound(params.get('lines_to'))
+    sort_name = (params.get('sort') or '').strip()
+
+    if lines_from is not None or lines_to is not None or sort_name == 'lines':
+        queryset = queryset.annotate(lines_total=Count('lines'))
+        if lines_from is not None:
+            queryset = queryset.filter(lines_total__gte=lines_from)
+        if lines_to is not None:
+            queryset = queryset.filter(lines_total__lte=lines_to)
+
+    field = LIST_SORTS.get(sort_name, 'created_at')
+    descending = (params.get('order') or 'desc').strip() != 'asc'
+    prefix = '-' if descending else ''
+
+    return queryset.order_by(f'{prefix}{field}', f'{prefix}id')
+
+
+def _count_bound(value) -> int | None:
+    """Граница фильтра по числу позиций. Не целое — как будто не задавали."""
+
+    text = (value or '').strip()
+    if not text.isdigit():
+        return None
+
+    return int(text)
 
 
 def _account(user):
