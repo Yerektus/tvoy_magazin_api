@@ -6,7 +6,9 @@
 
 Отсюда три правила, которые нельзя нарушать:
 
-1. Только чтение. Ни одна ручка ничего не меняет и не удаляет.
+1. Только чтение. Ни одна ручка ничего не меняет в магазине и не удаляет.
+   `set_filters` тоже ничего не пишет: она только говорит кабинету, какие
+   поля показать.
 2. Отбор по организации ставится здесь, а не приходит из ответа модели.
 3. У каждой ручки есть потолок по числу строк: миллион токенов контекста не
    повод отдавать всю базу, а счёт за это платим мы.
@@ -22,7 +24,7 @@ from invoices.models import Invoice, InvoiceLine
 from invoices.openrouter import OpenRouterError, _post
 from purchases.models import PurchasePlan
 
-from . import cabinet, export
+from . import cabinet, export, screen
 
 #: Больше строк за раз не отдаём никогда — ни по просьбе модели, ни случайно.
 MAX_ROWS = 50
@@ -450,6 +452,63 @@ SCHEMAS = [
     {
         'type': 'function',
         'function': {
+            'name': 'set_filters',
+            'description': 'Выставить фильтры на странице кабинета. Звать, когда '
+            'просят поставить фильтр, показать за период, отсеять по количеству '
+            'продаж или сбросить фильтры. Товары — page=products: дата последней '
+            'продажи и сколько продано. График продаж — page=sales: только период. '
+            'Кабинет применит сам, путь в ответ писать не надо.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'page': {
+                        'type': 'string',
+                        'enum': ['products', 'sales'],
+                        'description': 'Таблица товаров или график продаж',
+                    },
+                    'date_from': {
+                        'type': 'string',
+                        'description': 'Начало периода, YYYY-MM-DD',
+                    },
+                    'date_to': {
+                        'type': 'string',
+                        'description': 'Конец периода, YYYY-MM-DD',
+                    },
+                    'days': {
+                        'type': 'integer',
+                        'description': 'Последние N дней, если точных дат нет',
+                    },
+                    'sold_from': {
+                        'type': 'number',
+                        'description': 'Минимум проданного количества',
+                    },
+                    'sold_to': {
+                        'type': 'number',
+                        'description': 'Максимум проданного количества',
+                    },
+                    'only_sold': {
+                        'type': 'boolean',
+                        'description': 'Только то, что продавалось — минимум 1',
+                    },
+                    'query': {
+                        'type': 'string',
+                        'description': 'Часть названия товара',
+                    },
+                    'barcode': {
+                        'type': 'string',
+                        'description': 'Часть штрихкода',
+                    },
+                    'accuracy': {
+                        'type': 'string',
+                        'description': 'Точность прогноза: high, medium, low, none — через запятую',
+                    },
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
             'name': 'make_report',
             'description': 'Собрать Excel-отчёт и положить файл в чат. Звать, когда '
             'просят отчёт, выгрузку, Excel или файл. kind: sales — продажи '
@@ -504,5 +563,6 @@ HANDLERS = {
     'plan': plan,
     'parsing': parsing,
     'make_report': export.make_report,
+    'set_filters': screen.set_filters,
     'search_web': search_web,
 }

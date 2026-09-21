@@ -11,6 +11,7 @@ from invoices.openrouter import OpenRouterError
 from . import agent
 from .models import Conversation, Message
 from .serializers import AskSerializer, ConversationSerializer, MessageSerializer
+from .screen import split_screen
 
 #: Сколько прошлых реплик уходит в модель. Дальше разговор всё равно про другое,
 #: а контекст стоит денег — пусть и небольших.
@@ -185,4 +186,5 @@ def _spoken(message):
     if message.role != Message.Role.ASSISTANT:
         return message.text
 
-    return agent.split_suggestions(message.text)[0]
+    text, _ = agent.split_suggestions(message.text)
+    return split_screen(text)[0]

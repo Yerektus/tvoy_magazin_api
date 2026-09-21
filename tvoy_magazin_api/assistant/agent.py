@@ -5,9 +5,11 @@ import re
 
 from django.conf import settings
 
+from django.utils import timezone
+
 from invoices.openrouter import OpenRouterError, _cost, _post
 
-from . import export, tools
+from . import export, screen, tools
 from .prompts import SYSTEM_PROMPT
 
 logger = logging.getLogger(__name__)
@@ -19,20 +21,24 @@ def describe_page(page) -> str:
     if not isinstance(page, dict):
         return ''
 
-    path = str(page.get('path') or '').split('?', 1)[0].split('#', 1)[0].strip()
+    raw = str(page.get('path') or '').strip()
+    path = raw.split('?', 1)[0].split('#', 1)[0].strip()
+    query = raw.split('?', 1)[1].split('#', 1)[0] if '?' in raw else ''
     title = str(page.get('title') or '').strip()[:80]
 
     if not re.fullmatch(r'/[a-z0-9_/-]*', path):
         path = ''
+        query = ''
 
+    shown = f'{path}?{query}' if path and query else path
     parts = [part for part in path.split('/') if part]
     hint = _page_tool_hint(parts)
 
     if not title and not hint:
         return ''
 
-    where = f'«{title}»' if title else path
-    extra = f' ({path})' if path and title else ''
+    where = f'«{title}»' if title else shown
+    extra = f' ({shown})' if shown and title else ''
 
     lines = [
         f'Человек сейчас на странице {where}{extra}.',
@@ -90,6 +96,19 @@ def split_suggestions(text: str) -> tuple[str, list[str]]:
     return clean, questions
 
 
+def attach_screen(text: str, path: str) -> str:
+    """Прячет путь в ответ. Блок модели выбрасываем — ей адреса писать нельзя."""
+
+    text, questions = split_suggestions(text)
+    text, _ = screen.split_screen(text)
+    text = f'{text}\n\n<<<{screen.SCREEN_MARK}\n{path}\n>>>'
+
+    if questions:
+        text = f'{text}\n<<<вопросы\n' + '\n'.join(questions) + '\n>>>'
+
+    return text
+
+
 def _page_tool_hint(parts: list[str]) -> str:
     if not parts:
         return ''
@@ -110,10 +129,18 @@ def _page_tool_hint(parts: list[str]) -> str:
                 'Сначала позови umag_product с этим штрихкодом.'
             )
 
-        return 'Это каталог товаров магазина. Для остатков и цен зови umag_catalog и umag_product. Просят отчёт или Excel — make_report kind=sales.'
+        return (
+            'Это каталог товаров магазина. Для остатков и цен зови umag_catalog и umag_product. '
+            'Просят отчёт или Excel — make_report kind=sales. '
+            'Просят поставить фильтр — set_filters page=products.'
+        )
 
     if section == 'sales':
-        return 'Продажи смотри через umag_sales, не через накладные. Просят отчёт или Excel — make_report kind=sales.'
+        return (
+            'Продажи смотри через umag_sales, не через накладные. '
+            'Просят отчёт или Excel — make_report kind=sales. '
+            'Просят сменить период на графике — set_filters page=sales.'
+        )
 
     if section == 'purchases':
         if ident.isdigit():
@@ -133,8 +160,15 @@ def reply(
     if not settings.OPENROUTER_API_KEY:
         raise OpenRouterError('Не задан OPENROUTER_API_KEY')
 
-    messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
+    today = timezone.localdate().isoformat()
+    messages = [
+        {
+            'role': 'system',
+            'content': f'{SYSTEM_PROMPT}\n\nСегодня {today}. Даты в фильтрах пиши YYYY-MM-DD.',
+        }
+    ]
     hint = describe_page(page)
+    screens: list[screen.Screen] = []
 
     if hint:
         messages.append({'role': 'system', 'content': hint})
@@ -168,7 +202,12 @@ def reply(
 
         if not calls:
             text = (answer.get('content') or '').strip()
-            return text or 'Не получилось собрать ответ. Спросите иначе.', spent or None
+            text = text or 'Не получилось собрать ответ. Спросите иначе.'
+
+            if screens:
+                text = attach_screen(text, screens[-1].path)
+
+            return text, spent or None
         
         messages.append(answer)
 
@@ -177,11 +216,19 @@ def reply(
                 {
                     'role': 'tool',
                     'tool_call_id': call.get('id'),
-                    'content': json.dumps(_run(user, call, collected), ensure_ascii=False),
+                    'content': json.dumps(
+                        _run(user, call, collected, screens),
+                        ensure_ascii=False,
+                    ),
                 }
             )
 
-    return 'Слишком долго ищу ответ. Спросите про что-то одно.', spent or None
+    text = 'Слишком долго ищу ответ. Спросите про что-то одно.'
+
+    if screens:
+        text = attach_screen(text, screens[-1].path)
+
+    return text, spent or None
 
 
 def with_image(text: str, image, content_type: str = 'image/jpeg') -> list[dict]:
@@ -200,7 +247,7 @@ def with_image(text: str, image, content_type: str = 'image/jpeg') -> list[dict]
     return parts
 
 
-def _run(user, call: dict, files=None) -> dict:
+def _run(user, call: dict, files=None, screens=None) -> dict:
     """Зовёт одну ручку. Что бы модель ни попросила, дальше словаря не уйдёт."""
 
     name = (call.get('function') or {}).get('name')
@@ -233,6 +280,12 @@ def _run(user, call: dict, files=None) -> dict:
     if isinstance(result, export.Attachment):
         if files is not None:
             files.append(result)
+
+        return result.summary
+
+    if isinstance(result, screen.Screen):
+        if screens is not None:
+            screens.append(result)
 
         return result.summary
 

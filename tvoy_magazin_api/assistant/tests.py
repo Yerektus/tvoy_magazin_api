@@ -24,7 +24,7 @@ from umag.client import UmagError
 from umag.models import UmagAccount, UmagProduct
 from umag.tests import FakeUmag
 
-from . import agent, cabinet, export, tools, xlsx
+from . import agent, cabinet, export, screen, tools, xlsx
 from .admin import ConversationAdmin, MessageAdmin
 from .models import Conversation, Message
 
@@ -210,6 +210,106 @@ class ToolsTests(APITestCase):
         self.assertIn('search_web', names)
         self.assertIs(tools.HANDLERS['search_web'], tools.search_web)
 
+    def test_set_filters_is_in_the_tool_list(self):
+        names = [item['function']['name'] for item in tools.SCHEMAS]
+
+        self.assertIn('set_filters', names)
+        self.assertIs(tools.HANDLERS['set_filters'], screen.set_filters)
+
+
+class ScreenTests(TestCase):
+    """Аналитик выставляет фильтры кабинета, а не пишет путь руками."""
+
+    def test_date_and_sold_quantity_go_to_products(self):
+        found = screen.set_filters(
+            make_user(),
+            date_from='2026-09-01',
+            date_to='2026-09-15',
+            only_sold=True,
+        )
+
+        self.assertEqual(
+            found.path,
+            '/products?last_from=2026-09-01&last_to=2026-09-15&sold_from=1',
+        )
+        self.assertTrue(found.summary['готово'])
+
+    def test_days_become_a_date_span(self):
+        today = timezone.localdate()
+        start = today - timezone.timedelta(days=6)
+        found = screen.set_filters(make_user(), days=7)
+
+        self.assertEqual(
+            found.path,
+            f'/products?last_from={start.isoformat()}&last_to={today.isoformat()}',
+        )
+
+    def test_sales_page_gets_from_and_to(self):
+        found = screen.set_filters(
+            make_user(),
+            page='sales',
+            date_from='2026-09-01',
+            date_to='2026-09-10',
+        )
+
+        self.assertEqual(found.path, '/sales?from=2026-09-01&to=2026-09-10')
+
+    def test_quantity_opens_products_even_if_asked_sales(self):
+        found = screen.set_filters(make_user(), page='sales', sold_from=10)
+
+        self.assertTrue(found.path.startswith('/products?'))
+        self.assertIn('sold_from=10', found.path)
+
+    def test_swapped_dates_are_ordered(self):
+        found = screen.set_filters(
+            make_user(),
+            date_from='2026-09-15',
+            date_to='2026-09-01',
+        )
+
+        self.assertIn('last_from=2026-09-01', found.path)
+        self.assertIn('last_to=2026-09-15', found.path)
+
+    def test_future_dates_are_clamped_to_today(self):
+        today = timezone.localdate()
+        found = screen.set_filters(
+            make_user(),
+            date_from='2099-01-01',
+            date_to='2099-12-31',
+        )
+
+        self.assertEqual(
+            found.path,
+            f'/products?last_from={today.isoformat()}&last_to={today.isoformat()}',
+        )
+
+    def test_empty_call_clears_products(self):
+        found = screen.set_filters(make_user())
+
+        self.assertEqual(found.path, '/products')
+
+    def test_unsafe_paths_are_rejected(self):
+        self.assertFalse(screen.is_safe('/settings'))
+        self.assertFalse(screen.is_safe('https://evil.example'))
+        self.assertFalse(screen.is_safe('/products?hack=1'))
+        self.assertFalse(screen.is_safe('/products?last_from=2026-09-01&last_from=2026-09-02'))
+        self.assertTrue(screen.is_safe('/products?last_from=2026-09-01&sold_from=1'))
+        self.assertTrue(screen.is_safe('/sales?from=2026-09-01&to=2026-09-15'))
+
+    def test_model_written_screen_is_dropped_if_unsafe(self):
+        text, path = screen.split_screen('Ок\n<<<экран\n/settings\n>>>')
+
+        self.assertEqual(text, 'Ок')
+        self.assertIsNone(path)
+
+    def test_screen_block_is_cut_from_the_answer(self):
+        text, path = screen.split_screen(
+            'Поставил фильтр.\n\n<<<экран\n/products?sold_from=1\n>>>\n'
+        )
+
+        self.assertEqual(text, 'Поставил фильтр.')
+        self.assertEqual(path, '/products?sold_from=1')
+
 
 class AgentTests(APITestCase):
     """Цикл вызова функций: что модель может, а чего не может."""
@@ -289,6 +389,33 @@ class AgentTests(APITestCase):
         self.assertNotIn('PK-fake', post.call_args.args[0]['messages'][-1]['content'])
         self.assertIn('Продажи за 30 дн.xlsx', post.call_args.args[0]['messages'][-1]['content'])
 
+    def test_reply_hides_filters_in_the_answer(self):
+        """Путь фильтров уходит в чат блоком, модели — только сводка."""
+
+        replies = [
+            answer(
+                calls=[
+                    (
+                        'set_filters',
+                        '{"date_from": "2026-09-01", "date_to": "2026-09-15", "only_sold": true}',
+                    )
+                ]
+            ),
+            answer('Поставил с 1 по 15 сентября, только продажи.'),
+        ]
+
+        with patch('assistant.agent._post', side_effect=replies) as post:
+            text, _ = agent.reply(
+                self.user,
+                [{'role': 'user', 'content': 'Поставь фильтр с 1 по 15 сентября'}],
+            )
+
+        self.assertIn('Поставил с 1 по 15 сентября', text)
+        self.assertIn('<<<экран', text)
+        self.assertIn('/products?last_from=2026-09-01&last_to=2026-09-15&sold_from=1', text)
+        self.assertIn('готово', post.call_args.args[0]['messages'][-1]['content'])
+        self.assertNotIn('<<<экран', post.call_args.args[0]['messages'][-1]['content'])
+
     def test_loop_gives_up_instead_of_spinning(self):
         """Модель просит данные по кругу — не даём ей крутиться вечно."""
 
@@ -322,16 +449,36 @@ class AgentTests(APITestCase):
 
         self.assertIn('umag_sales', text)
         self.assertIn('make_report', text)
+        self.assertIn('set_filters', text)
         self.assertNotIn('Это аналитика продаж', text)
+
+    def test_describe_page_keeps_product_filters(self):
+        text = agent.describe_page(
+            {
+                'title': 'Товары',
+                'path': '/products?last_from=2026-09-01&sold_from=1',
+            }
+        )
+
+        self.assertIn('/products?last_from=2026-09-01&sold_from=1', text)
+        self.assertIn('set_filters', text)
 
     def test_prompt_answers_only_the_asked_question(self):
         """Иначе модель сваливает в ответ и лидеров, и остатки, и откуда данные."""
 
         self.assertIn('только на заданный вопрос', agent.SYSTEM_PROMPT)
-        self.assertIn('полный отчёт не вываливай', agent.SYSTEM_PROMPT)
-        self.assertIn('на всякий случай', agent.SYSTEM_PROMPT)
         self.assertIn('make_report', agent.SYSTEM_PROMPT)
         self.assertIn('search_web', agent.SYSTEM_PROMPT)
+        self.assertIn('set_filters', agent.SYSTEM_PROMPT)
+
+    def test_today_is_sent_to_the_model(self):
+        with patch('assistant.agent._post', return_value=answer('Ок')) as asked:
+            agent.reply(self.user, [{'role': 'user', 'content': 'Привет'}])
+
+        self.assertIn(
+            f'Сегодня {timezone.localdate().isoformat()}',
+            asked.call_args.args[0]['messages'][0]['content'],
+        )
 
     def test_describe_page_ignores_foreign_urls(self):
         self.assertEqual(agent.describe_page({'path': 'https://evil.example'}), '')
@@ -423,6 +570,7 @@ class ChatApiTests(APITestCase):
         self.assertEqual(reply['suggestions'], ['Сколько заказать?', 'Что ещё кончается?'])
         self.assertEqual(response.data['messages'][0]['suggestions'], [])
         self.assertIsNone(reply['file'])
+        self.assertIsNone(reply['screen'])
 
     def test_excel_report_is_attached_to_the_answer(self):
         """Просят отчёт — в чат уходит файл, а не таблица."""
@@ -455,6 +603,43 @@ class ChatApiTests(APITestCase):
         self.assertTrue(reply['file'].endswith('.xlsx'))
         self.assertEqual(Message.objects.get(role='assistant').file_name, 'Продажи за 30 дн.xlsx')
 
+    def test_filters_come_apart_from_the_answer(self):
+        """Блок экрана не попадает в текст реплики — из него открывают страницу."""
+
+        replies = [
+            answer(
+                calls=[
+                    (
+                        'set_filters',
+                        '{"date_from": "2026-09-01", "date_to": "2026-09-15", "only_sold": true}',
+                    )
+                ]
+            ),
+            answer(
+                'Поставил с 1 по 15 сентября.\n\n'
+                '<<<вопросы\nЧто продалось лучше всего?\n>>>'
+            ),
+        ]
+
+        with patch('assistant.agent._post', side_effect=replies):
+            response = self.client.post(
+                '/api/assistant/chat/',
+                {'text': 'Поставь фильтр с 1 по 15 сентября, только продажи'},
+                format='json',
+            )
+
+        reply = response.data['messages'][1]
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(reply['text'], 'Поставил с 1 по 15 сентября.')
+        self.assertEqual(
+            reply['screen'],
+            '/products?last_from=2026-09-01&last_to=2026-09-15&sold_from=1',
+        )
+        self.assertEqual(reply['suggestions'], ['Что продалось лучше всего?'])
+        self.assertNotIn('<<<экран', reply['text'])
+        self.assertIsNone(response.data['messages'][0]['screen'])
+
     def test_previous_suggestions_are_not_sent_back_to_the_model(self):
         raw = 'Ок\n\n<<<вопросы\nЕщё?\n>>>'
 
@@ -471,6 +656,7 @@ class ChatApiTests(APITestCase):
         ]
 
         self.assertTrue(all('<<<вопросы' not in part for part in spoken if isinstance(part, str)))
+        self.assertTrue(all('<<<экран' not in part for part in spoken if isinstance(part, str)))
 
     def test_unanswered_question_does_not_stay_in_the_chat(self):
         """Модель недоступна — вопрос не остаётся висеть без ответа.

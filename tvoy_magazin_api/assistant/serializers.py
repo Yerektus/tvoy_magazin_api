@@ -4,6 +4,7 @@ from rest_framework import serializers
 
 from .agent import split_suggestions
 from .models import Conversation, Message
+from .screen import split_screen
 
 MAX_QUESTION = 2000
 
@@ -30,21 +31,28 @@ class PageSerializer(serializers.Serializer):
     )
 
     def validate_path(self, value):
-        value = (value or '').split('?', 1)[0].split('#', 1)[0].strip()
+        value = (value or '').strip()
+        path, _, query = value.partition('?')
+        path = path.split('#', 1)[0].strip()
+        query = query.split('#', 1)[0]
 
-        if not value:
+        if not path:
             return ''
 
-        if not re.fullmatch(r'/[a-z0-9_/-]*', value):
+        if not re.fullmatch(r'/[a-z0-9_/-]*', path):
             return ''
 
-        return value
+        if not query or not re.fullmatch(r'[A-Za-z0-9._~&=%+-]*', query):
+            return path
+
+        return f'{path}?{query[:200]}'
 
 
 class MessageSerializer(serializers.ModelSerializer):
     """Реплика для приложения: у ответа аналитика вопросы вынесены в кнопки."""
 
     suggestions = serializers.SerializerMethodField()
+    screen = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
@@ -57,6 +65,7 @@ class MessageSerializer(serializers.ModelSerializer):
             'file_name',
             'created_at',
             'suggestions',
+            'screen',
         )
 
     def get_suggestions(self, message):
@@ -65,11 +74,18 @@ class MessageSerializer(serializers.ModelSerializer):
 
         return split_suggestions(message.text)[1]
 
+    def get_screen(self, message):
+        if message.role != Message.Role.ASSISTANT:
+            return None
+
+        text, _ = split_suggestions(message.text)
+        return split_screen(text)[1]
+
     def to_representation(self, instance):
         data = super().to_representation(instance)
 
         if instance.role == Message.Role.ASSISTANT:
-            data['text'] = split_suggestions(instance.text)[0]
+            data['text'] = split_screen(split_suggestions(instance.text)[0])[0]
 
         if not instance.file:
             data['file'] = None
